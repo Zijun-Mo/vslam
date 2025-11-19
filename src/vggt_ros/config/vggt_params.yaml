@@ -1,0 +1,8 @@
+vggt_node:
+  ros__parameters:
+    model_name: "facebook/VGGT-1B"
+    device: "cuda"
+    window_size: 8
+    image_topic: "/camera/image_raw"
+    min_parallax: 10.0
+

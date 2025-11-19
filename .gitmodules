@@ -1,0 +1,6 @@
+[submodule "vggt"]
+	path = vggt
+	url = https://github.com/facebookresearch/vggt.git
+[submodule "src/ros2_orb_slam3"]
+	path = src/ros2_orb_slam3
+	url = https://github.com/Mechazo11/ros2_orb_slam3.git
