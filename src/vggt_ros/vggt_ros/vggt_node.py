@@ -1,7 +1,7 @@
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import PointCloud2, PointField, Image, CameraInfo
-from geometry_msgs.msg import PoseArray, Pose
+from sensor_msgs.msg import PointCloud2, PointField, Image, CameraInfo, PointCloud, ChannelFloat32
+from geometry_msgs.msg import PoseArray, Pose, Point32
 from visualization_msgs.msg import MarkerArray, Marker
 from std_msgs.msg import Header
 from cv_bridge import CvBridge
@@ -82,8 +82,6 @@ class VGGTNode(Node):
             is_keyframe = self.keyframe_selector.process_frame(cv_image, msg.header)
             
             if is_keyframe:
-                self.get_logger().info(f'New keyframe added. Window size: {len(self.keyframe_selector.keyframes)}')
-                
                 # Trigger inference if window is full
                 if self.keyframe_selector.is_full():
                     self.run_inference_and_publish()
@@ -99,6 +97,14 @@ class VGGTNode(Node):
         target_size = 518
         width, height = img.size
         
+        transform_info = {
+            'scale_x': 1.0,
+            'scale_y': 1.0,
+            'pad_left': 0,
+            'pad_top': 0,
+            'start_y': 0
+        }
+        
         if mode == "pad":
             if width >= height:
                 new_width = target_size
@@ -110,12 +116,16 @@ class VGGTNode(Node):
             new_width = target_size
             new_height = round(height * (new_width / width) / 14) * 14
             
+        transform_info['scale_x'] = new_width / width
+        transform_info['scale_y'] = new_height / height
+            
         img = img.resize((new_width, new_height), PILImage.Resampling.BICUBIC)
         img_tensor = self.to_tensor(img)
         
         if mode == "crop" and new_height > target_size:
             start_y = (new_height - target_size) // 2
             img_tensor = img_tensor[:, start_y : start_y + target_size, :]
+            transform_info['start_y'] = start_y
             
         if mode == "pad":
             h_padding = target_size - img_tensor.shape[1]
@@ -128,8 +138,10 @@ class VGGTNode(Node):
                 img_tensor = torch.nn.functional.pad(
                     img_tensor, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=1.0
                 )
+                transform_info['pad_left'] = pad_left
+                transform_info['pad_top'] = pad_top
                 
-        return img_tensor
+        return img_tensor, transform_info
 
     def run_inference_and_publish(self):
         if self.model is None:
@@ -146,8 +158,11 @@ class VGGTNode(Node):
             current_images, current_headers = self.keyframe_selector.get_window()
             
             processed_images = []
+            transforms = []
             for img in current_images:
-                processed_images.append(self.preprocess_image(img))
+                img_tensor, transform = self.preprocess_image(img)
+                processed_images.append(img_tensor)
+                transforms.append(transform)
             
             # Stack
             images_tensor = torch.stack(processed_images).to(self.device)
@@ -157,39 +172,39 @@ class VGGTNode(Node):
             with torch.no_grad():
                 with torch.cuda.amp.autocast(dtype=dtype):
                     images_batch = images_tensor[None] # Add batch dim (1, S, 3, H, W)
-                    aggregated_tokens_list, ps_idx = self.model.aggregator(images_batch)
                     
-                    # Predict Cameras
-                    pose_enc = self.model.camera_head(aggregated_tokens_list)[-1]
-                    extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images_batch.shape[-2:])
-                    
-                    # Predict Depth Maps
-                    depth_map, depth_conf = self.model.depth_head(aggregated_tokens_list, images_batch, ps_idx)
-                    
-                    # Predict Tracks (Optional)
                     # Using fixed query points for demo
                     query_points = torch.FloatTensor([[100.0, 200.0], [60.72, 259.94]]).to(self.device)
-                    track_list, vis_score, conf_score = self.model.track_head(aggregated_tokens_list, images_batch, ps_idx, query_points=query_points[None])
+                    
+                    # Call model forward
+                    predictions = self.model(images_batch, query_points=query_points[None])
+                    
+                    # Extract results
+                    pose_enc = predictions["pose_enc"]
+                    extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images_batch.shape[-2:])
+                    
+                    depth_map = predictions["depth"]
+                    
+                    track_list = predictions["track"]
                     
                     # Unproject points
                     point_map_by_unprojection = unproject_depth_map_to_point_map(depth_map.squeeze(0), 
                                                                                 extrinsic.squeeze(0), 
-                                                                                intrinsic.squeeze(0))
-            
-            # Publish results
+                                                                                intrinsic.squeeze(0))            # Publish results
             self.publish_results(
-                point_map_by_unprojection.cpu().numpy(),
+                point_map_by_unprojection,
                 extrinsic.squeeze(0).cpu().numpy(),
                 intrinsic.squeeze(0).cpu().numpy(),
                 depth_map.squeeze(0).cpu().numpy(),
                 track_list[-1].squeeze(0).cpu().numpy(),
-                current_headers
+                current_headers,
+                transforms
             )
             
         except Exception as e:
             self.get_logger().error(f'Inference failed: {e}')
 
-    def publish_results(self, points, extrinsic, intrinsic, depth, tracks, headers):
+    def publish_results(self, points, extrinsic, intrinsic, depth, tracks, headers, transforms):
         # Use the header of the last frame for the point cloud and poses?
         # Or use the map frame.
         # Usually SLAM systems publish in a fixed frame (e.g. "map" or "odom").
@@ -220,8 +235,7 @@ class VGGTNode(Node):
         pose_array_msg = PoseArray()
         pose_array_msg.header = common_header
         
-        extrinsic_torch = torch.from_numpy(extrinsic).unsqueeze(0)
-        cam_to_world = closed_form_inverse_se3(extrinsic_torch).squeeze(0).numpy()
+        cam_to_world = closed_form_inverse_se3(extrinsic)
         
         for i in range(len(cam_to_world)):
             pose = Pose()
@@ -252,20 +266,38 @@ class VGGTNode(Node):
         # For now, let's just stick to MarkerArray and let the frontend parse it if possible,
         # OR better, let's add a Float32MultiArray publisher for raw tracks.
         
-        from std_msgs.msg import Float32MultiArray, MultiArrayDimension
         if not hasattr(self, 'raw_tracks_pub'):
-             self.raw_tracks_pub = self.create_publisher(Float32MultiArray, 'vggt/raw_tracks_2d', 1)
+             self.raw_tracks_pub = self.create_publisher(PointCloud, 'vggt/raw_tracks_2d', 1)
              
-        raw_tracks_msg = Float32MultiArray()
+        raw_tracks_msg = PointCloud()
+        raw_tracks_msg.header = common_header
+        
         # Layout: dim[0]=num_tracks, dim[1]=3 (u, v, id)
         # Wait, tracks tensor doesn't have IDs explicitly, the index is the ID.
         # So we just publish (u, v).
         
         latest_tracks = tracks[-1] # (N, 2)
+        latest_transform = transforms[-1]
         
-        raw_tracks_msg.layout.dim.append(MultiArrayDimension(label="tracks", size=num_tracks, stride=num_tracks*2))
-        raw_tracks_msg.layout.dim.append(MultiArrayDimension(label="uv", size=2, stride=2))
-        raw_tracks_msg.data = latest_tracks.flatten().tolist()
+        # Create channel for IDs (indices)
+        id_channel = ChannelFloat32()
+        id_channel.name = "ids"
+        
+        for i in range(num_tracks):
+            u, v = latest_tracks[i]
+            
+            # Restore to original coordinates
+            u_orig = (u - latest_transform['pad_left']) / latest_transform['scale_x']
+            v_orig = (v - latest_transform['pad_top'] + latest_transform['start_y']) / latest_transform['scale_y']
+            
+            p = Point32()
+            p.x = float(u_orig)
+            p.y = float(v_orig)
+            p.z = 0.0
+            raw_tracks_msg.points.append(p)
+            id_channel.values.append(float(i))
+            
+        raw_tracks_msg.channels.append(id_channel)
         
         self.raw_tracks_pub.publish(raw_tracks_msg)
 

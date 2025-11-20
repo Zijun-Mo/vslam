@@ -37,9 +37,10 @@ include_directories(
   ${GLEW_INCLUDE_DIRS}
 )
 
-# Create the node executable
-add_executable(vggt_frontend_node src/vggt_frontend_node.cpp)
-ament_target_dependencies(vggt_frontend_node
+# Create the node component
+add_library(vggt_frontend_component SHARED src/vggt_frontend_node.cpp)
+target_compile_definitions(vggt_frontend_component PRIVATE "COMPOSITION_BUILD")
+ament_target_dependencies(vggt_frontend_component
   rclcpp
   rclcpp_components
   sensor_msgs
@@ -52,16 +53,24 @@ ament_target_dependencies(vggt_frontend_node
 )
 
 # Link against ORB_SLAM3 library
-target_link_libraries(vggt_frontend_node
+target_link_libraries(vggt_frontend_component
   ${OpenCV_LIBS}
   ${Pangolin_LIBRARIES}
   ${GLEW_LIBRARIES}
   ${orb_slam3_lib_LIBRARIES}
 )
 
+# Register the component
+rclcpp_components_register_node(vggt_frontend_component
+  PLUGIN orb_slam3_vggt_frontend::VggtFrontendNode
+  EXECUTABLE vggt_frontend_node
+)
+
 # Install
-install(TARGETS vggt_frontend_node
-  DESTINATION lib/${PROJECT_NAME}
+install(TARGETS vggt_frontend_component
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin
 )
 
 install(DIRECTORY launch

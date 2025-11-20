@@ -3,7 +3,7 @@
 #include <cv_bridge/cv_bridge.h>
 #include <sensor_msgs/msg/image.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
-#include <std_msgs/msg/float32_multi_array.hpp>
+#include <sensor_msgs/msg/point_cloud.hpp>
 #include <message_filters/subscriber.h>
 #include <message_filters/sync_policies/approximate_time.h>
 #include <message_filters/synchronizer.h>
@@ -41,7 +41,9 @@ public:
         mpSystem = new ORB_SLAM3::System(voc_file, settings_file, ORB_SLAM3::System::MONOCULAR, use_viewer, 0, "", false);
 
         // Publisher for SystemPtr (to initialize Mapping Node)
-        sys_pub_ = create_publisher<orb_slam3_msgs::msg::SystemPtr>("system_ptr", rclcpp::QoS(1).transient_local());
+        rclcpp::PublisherOptions pub_opts;
+        pub_opts.use_intra_process_comm = rclcpp::IntraProcessSetting::Disable;
+        sys_pub_ = create_publisher<orb_slam3_msgs::msg::SystemPtr>("system_ptr", rclcpp::QoS(1).transient_local(), pub_opts);
 
         // Timer to publish SystemPtr periodically until picked up
         sys_pub_timer_ = create_wall_timer(
@@ -55,7 +57,7 @@ public:
             });
 
         // Publisher for KeyFramePtr (to send KFs to Mapping Node)
-        kf_pub_ = create_publisher<orb_slam3_msgs::msg::KeyFramePtr>("keyframe_data", 100);
+        kf_pub_ = create_publisher<orb_slam3_msgs::msg::KeyFramePtr>("keyframe_data", 100, pub_opts);
 
         // Set callback to intercept KeyFrame insertion
         // This is crucial: When Tracking creates a KF, it calls LocalMapper->InsertKeyFrame.
@@ -71,12 +73,21 @@ public:
 
         // Subscribers
         // We need synchronized Image and Tracks
-        img_sub_.subscribe(this, "camera/image_raw");
+        // Use rmw_qos_profile_sensor_data for image subscription to match video_reader's QoS if needed
+        // But message_filters usually works with default QoS. 
+        // However, for intra-process comms, we need to be careful.
+        // Let's try to use default QoS for now, but ensure durability is volatile for intra-process.
+        
+        auto qos = rclcpp::QoS(10);
+        qos.durability(rclcpp::DurabilityPolicy::Volatile);
+        qos.reliability(rclcpp::ReliabilityPolicy::BestEffort); // Match sensor data QoS
+
+        img_sub_.subscribe(this, "camera/image_raw", qos.get_rmw_qos_profile());
         // tracks_sub_.subscribe(this, "vggt/tracks"); // Old MarkerArray topic
-        tracks_sub_.subscribe(this, "vggt/raw_tracks_2d"); // New raw topic
+        tracks_sub_.subscribe(this, "vggt/raw_tracks_2d", qos.get_rmw_qos_profile()); // New raw topic
 
         // Approximate time sync policy
-        typedef message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::Image, std_msgs::msg::Float32MultiArray> SyncPolicy;
+        typedef message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::Image, sensor_msgs::msg::PointCloud> SyncPolicy;
         sync_.reset(new message_filters::Synchronizer<SyncPolicy>(SyncPolicy(10), img_sub_, tracks_sub_));
         sync_->registerCallback(std::bind(&VggtFrontendNode::SyncCallback, this, std::placeholders::_1, std::placeholders::_2));
 
@@ -85,7 +96,7 @@ public:
 
 private:
     void SyncCallback(const sensor_msgs::msg::Image::ConstSharedPtr& img_msg, 
-                      const std_msgs::msg::Float32MultiArray::ConstSharedPtr& tracks_msg)
+                      const sensor_msgs::msg::PointCloud::ConstSharedPtr& tracks_msg)
     {
         if (!mpSystem) return;
 
@@ -98,27 +109,31 @@ private:
             return;
         }
 
-        // 2. Parse Tracks from Float32MultiArray
-        // Layout: (N, 2) -> u, v. Index is ID.
+        // 2. Parse Tracks from PointCloud
         std::vector<cv::KeyPoint> vKeys;
         std::vector<long> vTrackIds;
         
-        int num_tracks = tracks_msg->layout.dim[0].size;
-        // int stride = tracks_msg->layout.dim[1].stride; // Should be 2
+        int num_tracks = tracks_msg->points.size();
         
-        const auto& data = tracks_msg->data;
+        // Find "ids" channel
+        const std::vector<float>* ids = nullptr;
+        for(const auto& channel : tracks_msg->channels) {
+            if(channel.name == "ids") {
+                ids = &channel.values;
+                break;
+            }
+        }
         
         for(int i=0; i<num_tracks; ++i)
         {
-            float u = data[i*2];
-            float v = data[i*2+1];
+            float u = tracks_msg->points[i].x;
+            float v = tracks_msg->points[i].y;
+            long id = (ids && i < ids->size()) ? static_cast<long>((*ids)[i]) : i;
             
-            // Filter out invalid points if any (e.g. -1, -1)
-            // Assuming VGGT outputs valid pixel coords or we need to check bounds
             if(u >= 0 && v >= 0 && u < cv_ptr->image.cols && v < cv_ptr->image.rows)
             {
                 vKeys.push_back(cv::KeyPoint(u, v, 1.0f));
-                vTrackIds.push_back(i); // Use index as ID for now
+                vTrackIds.push_back(id);
             }
         }
 
@@ -134,14 +149,15 @@ private:
     rclcpp::Publisher<orb_slam3_msgs::msg::KeyFramePtr>::SharedPtr kf_pub_;
     
     message_filters::Subscriber<sensor_msgs::msg::Image> img_sub_;
-    message_filters::Subscriber<std_msgs::msg::Float32MultiArray> tracks_sub_;
-    std::shared_ptr<message_filters::Synchronizer<message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::Image, std_msgs::msg::Float32MultiArray>>> sync_;
+    message_filters::Subscriber<sensor_msgs::msg::PointCloud> tracks_sub_;
+    std::shared_ptr<message_filters::Synchronizer<message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::Image, sensor_msgs::msg::PointCloud>>> sync_;
 };
 
 } // namespace orb_slam3_vggt_frontend
 
 RCLCPP_COMPONENTS_REGISTER_NODE(orb_slam3_vggt_frontend::VggtFrontendNode)
 
+#ifndef COMPOSITION_BUILD
 int main(int argc, char * argv[])
 {
   rclcpp::init(argc, argv);
@@ -149,3 +165,4 @@ int main(int argc, char * argv[])
   rclcpp::shutdown();
   return 0;
 }
+#endif

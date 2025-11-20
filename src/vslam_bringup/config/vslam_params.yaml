@@ -1,0 +1,19 @@
+/**:
+  ros__parameters:
+    # VGGT Tracker Parameters
+    model_name: "facebook/VGGT-1B"
+    device: "cuda"
+    window_size: 8
+    image_topic: "/camera/image_raw"
+    min_parallax: 10.0
+
+    # ORB-SLAM3 Frontend Parameters
+    voc_file: "/home/jun/vslam/src/orb_slam3_lib/orb_slam3/Vocabulary/ORBvoc.txt.bin"
+    settings_file: "/home/jun/vslam/src/orb_slam3_lib/orb_slam3/config/Monocular/EuRoC.yaml"
+    use_viewer: false
+
+    # Video Reader Parameters
+    video_path: "/docs/kitchen.mp4"
+    camera_name: "camera"
+    use_sensor_data_qos: false
+    camera_info_url: "package://video_reader/config/camera_info.yaml"
