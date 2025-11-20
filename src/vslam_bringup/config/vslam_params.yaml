@@ -3,7 +3,7 @@
     # VGGT Tracker Parameters
     model_name: "facebook/VGGT-1B"
     device: "cuda"
-    window_size: 8
+    window_size: 2
     image_topic: "/camera/image_raw"
     min_parallax: 10.0
 

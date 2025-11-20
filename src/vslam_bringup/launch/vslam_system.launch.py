@@ -1,3 +1,5 @@
+import yaml
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
@@ -9,10 +11,25 @@ import os
 
 def generate_launch_description():
     
+    # Load launch configuration from yaml to set default values
+    vslam_bringup_dir = get_package_share_directory('vslam_bringup')
+    launch_config_path = os.path.join(vslam_bringup_dir, 'config', 'launch_params.yaml')
+    
+    use_video_default = 'false'
+    
+    if os.path.exists(launch_config_path):
+        with open(launch_config_path, 'r') as f:
+            try:
+                launch_params = yaml.safe_load(f)
+                if launch_params and 'use_video' in launch_params:
+                    use_video_default = str(launch_params['use_video']).lower()
+            except yaml.YAMLError as e:
+                print(f"Error reading launch_params.yaml: {e}")
+
     # Arguments
     use_video_arg = DeclareLaunchArgument(
         'use_video',
-        default_value='false',
+        default_value=use_video_default,
         description='Launch video_reader node'
     )
 

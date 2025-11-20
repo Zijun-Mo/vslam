@@ -1634,6 +1634,7 @@ Sophus::SE3f System::TrackVGGT(const cv::Mat &im, const double &timestamp,
                                const std::vector<long> &vTrackIds,
                                string filename)
 {
+    // std::cout << "[DEBUG] System::TrackVGGT called. Timestamp: " << timestamp << ", Keys: " << vKeys.size() << std::endl;
     if(mSensor != MONOCULAR)
     {
         cerr << "ERROR: System::TrackVGGT only supports MONOCULAR sensor for now." << endl;

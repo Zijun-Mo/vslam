@@ -56,7 +56,7 @@ Frame::Frame(const Frame &frame)
     :mpcpi(frame.mpcpi),mpORBvocabulary(frame.mpORBvocabulary), mpORBextractorLeft(frame.mpORBextractorLeft), mpORBextractorRight(frame.mpORBextractorRight),
      mTimeStamp(frame.mTimeStamp), mK(frame.mK.clone()), mK_(Converter::toMatrix3f(frame.mK)), mDistCoef(frame.mDistCoef.clone()),
      mbf(frame.mbf), mb(frame.mb), mThDepth(frame.mThDepth), N(frame.N), mvKeys(frame.mvKeys),
-     mvKeysRight(frame.mvKeysRight), mvKeysUn(frame.mvKeysUn), mvuRight(frame.mvuRight),
+     mvTrackIds(frame.mvTrackIds), mvKeysRight(frame.mvKeysRight), mvKeysUn(frame.mvKeysUn), mvuRight(frame.mvuRight),
      mvDepth(frame.mvDepth), mBowVec(frame.mBowVec), mFeatVec(frame.mFeatVec),
      mDescriptors(frame.mDescriptors.clone()), mDescriptorsRight(frame.mDescriptorsRight.clone()),
      mvpMapPoints(frame.mvpMapPoints), mvbOutlier(frame.mvbOutlier), mImuCalib(frame.mImuCalib), mnCloseMPs(frame.mnCloseMPs),
@@ -1257,10 +1257,17 @@ Frame::Frame(const cv::Mat &imGray, const double &timeStamp,
       mTimeStamp(timeStamp), mK(pCamera->toK()), mDistCoef(distCoef), mbf(bf), mb(0), mThDepth(thDepth),
       mpCamera(pCamera), mpCamera2(nullptr), 
       mpImuPreintegrated(NULL), mpPrevFrame(pPrevF), mpImuPreintegratedFrame(NULL), mpReferenceKF(static_cast<KeyFrame*>(NULL)),
-      mbIsSet(false), mbImuPreintegrated(false), mpMutexImu(new std::mutex), mnDataset(0)
+      mbIsSet(false), mbImuPreintegrated(false), mpMutexImu(new std::mutex), mnDataset(0), N(0)
 {
+    // std::cout << "[DEBUG] Frame VGGT Constructor start. ID: " << mnId << std::endl;
     // Frame ID
     mnId = nNextId++;
+
+    if(!mpORBextractorLeft)
+    {
+        std::cout << "ERROR: Frame VGGT Constructor: extractor is NULL!" << std::endl;
+        return;
+    }
 
     // Scale Level Info
     mnScaleLevels = mpORBextractorLeft->GetLevels();
@@ -1273,31 +1280,50 @@ Frame::Frame(const cv::Mat &imGray, const double &timeStamp,
 
     // ORB extraction
     // For VGGT, we use provided keys and IDs
-    mvKeys = vKeys;
-    mvTrackIds = vTrackIds;
-    N = mvKeys.size();
-
-    if(mvKeys.empty())
+    // We need to handle the case where descriptor computation removes keypoints
+    
+    if(vKeys.empty())
+    {
+        std::cout << "WARN: Frame VGGT Constructor: vKeys is empty!" << std::endl;
         return;
+    }
 
     // Compute Descriptors (Required for LoopClosing)
-    // We need to compute descriptors at the provided keypoint locations
-    // Note: This assumes the extractor is configured correctly for the image size
-    // We might need to adapt ComputeDescriptors to take specific keypoints, 
-    // but standard ORBextractor computes for the whole image usually.
-    // Here we force computation on our specific points.
-    // Since ORBextractor::operator() does detection AND description, we need a way to just describe.
-    // Standard ORB-SLAM3 ORBextractor doesn't expose "compute descriptors for these points" easily 
-    // without modifying it. 
-    // WORKAROUND: We will use OpenCV's ORB to compute descriptors for these points if possible, 
-    // or we rely on the fact that we might not need descriptors for pure tracking if we use IDs,
-    // BUT LoopClosing needs them.
-    // Let's try to use the extractor if it has a method, otherwise use OpenCV directly for now to avoid modifying ORBextractor.h
-    
     // Using OpenCV directly for descriptors to avoid modifying ORBextractor
-    // This requires the extractor parameters to match somewhat
-    cv::Ptr<cv::ORB> orb = cv::ORB::create(N, mfScaleFactor, mnScaleLevels, 31, 0, 2, cv::ORB::HARRIS_SCORE, 31, 20);
-    orb->compute(imGray, mvKeys, mDescriptors);
+    // std::cout << "[DEBUG] Frame VGGT: Computing descriptors..." << std::endl;
+    cv::Ptr<cv::ORB> orb = cv::ORB::create(vKeys.size(), mfScaleFactor, mnScaleLevels, 31, 0, 2, cv::ORB::HARRIS_SCORE, 31, 20);
+    
+    std::vector<cv::KeyPoint> validKeys = vKeys;
+    // Use class_id to store original index to recover TrackIds after filtering
+    for(size_t i=0; i<validKeys.size(); ++i)
+    {
+        validKeys[i].class_id = static_cast<int>(i);
+    }
+
+    orb->compute(imGray, validKeys, mDescriptors);
+    // std::cout << "[DEBUG] Frame VGGT: Descriptors computed. Valid keys: " << validKeys.size() << std::endl;
+
+    // Filter Track IDs to match valid keys (orb->compute may remove keys)
+    std::vector<long> validTrackIds;
+    validTrackIds.reserve(validKeys.size());
+    
+    for(const auto& k : validKeys)
+    {
+        int originalIdx = k.class_id;
+        if(originalIdx >= 0 && originalIdx < (int)vTrackIds.size())
+        {
+            validTrackIds.push_back(vTrackIds[originalIdx]);
+        }
+        else
+        {
+            // Should not happen, but keep size consistent
+            validTrackIds.push_back(-1);
+        }
+    }
+
+    mvKeys = validKeys;
+    mvTrackIds = validTrackIds;
+    N = mvKeys.size();
 
     // MapPoints
     mvpMapPoints = vector<MapPoint*>(N,static_cast<MapPoint*>(NULL));
@@ -1311,12 +1337,82 @@ Frame::Frame(const cv::Mat &imGray, const double &timeStamp,
     mvDepth = vector<float>(N,-1);
     mnCloseMPs = 0;
 
+    // Initialize Grid parameters if needed (Crucial for AssignFeaturesToGrid)
+    if(mbInitialComputations)
+    {
+        ComputeImageBounds(imGray);
+
+        mfGridElementWidthInv=static_cast<float>(FRAME_GRID_COLS)/(mnMaxX-mnMinX);
+        mfGridElementHeightInv=static_cast<float>(FRAME_GRID_ROWS)/(mnMaxY-mnMinY);
+
+        fx = mK.at<float>(0,0);
+        fy = mK.at<float>(1,1);
+        cx = mK.at<float>(0,2);
+        cy = mK.at<float>(1,2);
+        invfx = 1.0f/fx;
+        invfy = 1.0f/fy;
+
+        mbInitialComputations=false;
+    }
+    else
+    {
+        // Ensure fx, fy etc are set even if not first frame
+        fx = mK.at<float>(0,0);
+        fy = mK.at<float>(1,1);
+        cx = mK.at<float>(0,2);
+        cy = mK.at<float>(1,2);
+        invfx = 1.0f/fx;
+        invfy = 1.0f/fy;
+        
+        // Also need to ensure mnMinX, mnMaxX, etc are set!
+        // They are static members, so they should persist.
+        // BUT if this is the FIRST frame of THIS type (VGGT) but mbInitialComputations was set to false by another constructor?
+        // mbInitialComputations is static, shared across all Frame instances.
+        // If a standard Frame was created before, it set these values.
+        // However, if NO Frame was created before (e.g. VGGT is the first), then mbInitialComputations is true.
+        
+        // Wait, if mbInitialComputations is false, it means SOME frame has already computed bounds.
+        // But are those bounds valid for THIS image size?
+        // Usually ORB-SLAM3 assumes constant image size.
+        // Let's assume it's fine.
+    }
+
+    mb = mbf / fx;
+    
+    // Initialize other members that might be missing compared to standard constructor
+    if(pPrevF)
+    {
+        if(pPrevF->HasVelocity())
+            SetVelocity(pPrevF->GetVelocity());
+    }
+    else
+    {
+        mVw.setZero();
+    }
+
+    // Initialize stereo/fisheye info to avoid uninitialized memory issues
+    Nleft = -1;
+    Nright = -1;
+    mvLeftToRightMatch = vector<int>(0);
+    mvRightToLeftMatch = vector<int>(0);
+    mvStereo3Dpoints = vector<Eigen::Vector3f>(0);
+    monoLeft = -1;
+    monoRight = -1;
+    
+    // Clear maps
+    mmProjectPoints.clear();
+    mmMatchedInImage.clear();
+
     // Assign to grid
     AssignFeaturesToGrid();
 
     // Compute BoW (Required for LoopClosing)
     if(mpORBvocabulary)
+    {
+        // std::cout << "[DEBUG] Frame VGGT: Computing BoW..." << std::endl;
         ComputeBoW();
+        // std::cout << "[DEBUG] Frame VGGT: BoW computed." << std::endl;
+    }
 
     // IMU
     mImuCalib = ImuCalib;

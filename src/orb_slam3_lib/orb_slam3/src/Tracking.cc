@@ -4204,6 +4204,7 @@ Sophus::SE3f Tracking::GrabImageVGGT(const cv::Mat &im, const double &timestamp,
                                      const std::vector<long> &vTrackIds,
                                      string filename)
 {
+    // std::cout << "[DEBUG] Tracking::GrabImageVGGT start." << std::endl;
     mImGray = im;
     if(mImGray.channels()==3)
     {
@@ -4235,13 +4236,16 @@ Sophus::SE3f Tracking::GrabImageVGGT(const cv::Mat &im, const double &timestamp,
     lastID = mCurrentFrame.mnId;
     
     // Call VGGT specific tracking
+    // std::cout << "[DEBUG] Calling TrackVGGT()..." << std::endl;
     TrackVGGT();
+    // std::cout << "[DEBUG] TrackVGGT() returned." << std::endl;
 
     return mCurrentFrame.GetPose();
 }
 
 void Tracking::TrackVGGT()
 {
+    // std::cout << "[DEBUG] Tracking::TrackVGGT start. State: " << mState << std::endl;
     // Basic state management similar to Track()
     if(mState==NO_IMAGES_YET)
     {
@@ -4264,7 +4268,9 @@ void Tracking::TrackVGGT()
 
     if(mState==NOT_INITIALIZED)
     {
+        // std::cout << "[DEBUG] TrackVGGT: Initializing..." << std::endl;
         MonocularInitializationVGGT();
+        // std::cout << "[DEBUG] TrackVGGT: Initialization done. State: " << mState << std::endl;
         if(mState!=OK)
         {
             mLastFrame = Frame(mCurrentFrame);
@@ -4281,7 +4287,9 @@ void Tracking::TrackVGGT()
         bool bOK = true;
 
         // 1. Match by Track IDs
+        // std::cout << "[DEBUG] TrackVGGT: Matching by Track IDs..." << std::endl;
         int nMatches = MatchByTrackIds();
+        // std::cout << "[DEBUG] TrackVGGT: Matches found: " << nMatches << std::endl;
         
         // 2. Pose Optimization
         // If we have enough matches, optimize pose
@@ -4294,7 +4302,9 @@ void Tracking::TrackVGGT()
                 mCurrentFrame.SetPose(mLastFrame.GetPose());
 
             // Optimize
+            // std::cout << "[DEBUG] TrackVGGT: Optimizing Pose..." << std::endl;
             Optimizer::PoseOptimization(&mCurrentFrame);
+            // std::cout << "[DEBUG] TrackVGGT: Optimization done." << std::endl;
 
             // Discard outliers
             int nInliers = 0;
@@ -4363,6 +4373,7 @@ void Tracking::TrackVGGT()
 
 int Tracking::MatchByTrackIds()
 {
+    // std::cout << "[DEBUG] MatchByTrackIds start. LastFrame N: " << mLastFrame.N << ", CurrentFrame N: " << mCurrentFrame.N << std::endl;
     int nMatches = 0;
     // Build a map from TrackID to MapPoint* from the Last Frame (or Local Map?)
     // Using LastFrame is faster and sufficient for frame-to-frame
@@ -4372,6 +4383,7 @@ int Tracking::MatchByTrackIds()
             lastFrameMapPoints[mLastFrame.mvTrackIds[i]] = mLastFrame.mvpMapPoints[i];
         }
     }
+    // std::cout << "[DEBUG] MatchByTrackIds: Built map with " << lastFrameMapPoints.size() << " points." << std::endl;
 
     // Assign MapPoints to Current Frame based on Track IDs
     for(int i=0; i<mCurrentFrame.N; i++) {
@@ -4390,6 +4402,7 @@ int Tracking::MatchByTrackIds()
         // but for now let's stick to simple tracking.
         // New points will be created in CreateNewKeyFrameVGGT or handled by LocalMapping.
     }
+    // std::cout << "[DEBUG] MatchByTrackIds end. Matches: " << nMatches << std::endl;
     return nMatches;
 }
 

@@ -173,11 +173,17 @@ class VGGTNode(Node):
                 with torch.cuda.amp.autocast(dtype=dtype):
                     images_batch = images_tensor[None] # Add batch dim (1, S, 3, H, W)
                     
-                    # Using fixed query points for demo
-                    query_points = torch.FloatTensor([[100.0, 200.0], [60.72, 259.94]]).to(self.device)
+                    # Generate grid query points
+                    _, _, _, H, W = images_batch.shape
+                    num_points = 128 # or any other number based on your requirement
+                    query_points = self.generate_grid_points(H, W, num_points=num_points)
                     
                     # Call model forward
+                    import time
+                    start_time = time.time()
                     predictions = self.model(images_batch, query_points=query_points[None])
+                    end_time = time.time()
+                    self.get_logger().info(f'Inference time: {end_time - start_time:.3f} seconds')
                     
                     # Extract results
                     pose_enc = predictions["pose_enc"]
@@ -394,6 +400,18 @@ class VGGTNode(Node):
             qy = (R[1,2] + R[2,1]) / S
             qz = 0.25 * S
         return [qx, qy, qz, qw]
+
+    def generate_grid_points(self, H, W, num_points=1024):
+        ratio = W / H
+        num_y = int(np.sqrt(num_points / ratio))
+        num_x = int(num_points / num_y)
+        
+        # Create a margin to avoid boundary effects
+        margin = 10
+        x = torch.linspace(margin, W - 1 - margin, num_x, device=self.device)
+        y = torch.linspace(margin, H - 1 - margin, num_y, device=self.device)
+        grid_y, grid_x = torch.meshgrid(y, x, indexing='ij')
+        return torch.stack([grid_x.flatten(), grid_y.flatten()], dim=1)
 
 def main(args=None):
     rclpy.init(args=args)
