@@ -1629,5 +1629,67 @@ bool System::SaveMap(const string &filename)
     return false;
 }
 
+Sophus::SE3f System::TrackVGGT(const cv::Mat &im, const double &timestamp, 
+                               const std::vector<cv::KeyPoint> &vKeys, 
+                               const std::vector<long> &vTrackIds,
+                               string filename)
+{
+    if(mSensor != MONOCULAR)
+    {
+        cerr << "ERROR: System::TrackVGGT only supports MONOCULAR sensor for now." << endl;
+        exit(-1);
+    }
+
+    // Check mode change
+    {
+        unique_lock<mutex> lock(mMutexMode);
+        if(mbActivateLocalizationMode)
+        {
+            mpLocalMapper->RequestStop();
+
+            // Wait until Local Mapping has effectively stopped
+            while(!mpLocalMapper->isStopped())
+            {
+                usleep(1000);
+            }
+
+            mpTracker->InformOnlyTracking(true);
+            mbActivateLocalizationMode = false;
+        }
+        if(mbDeactivateLocalizationMode)
+        {
+            mpTracker->InformOnlyTracking(false);
+            mpLocalMapper->Release();
+            mbDeactivateLocalizationMode = false;
+        }
+    }
+
+    // Check reset
+    {
+        unique_lock<mutex> lock(mMutexReset);
+        if(mbReset)
+        {
+            mpTracker->Reset();
+            mbReset = false;
+            mbResetActiveMap = false;
+        }
+        else if(mbResetActiveMap)
+        {
+            mpTracker->ResetActiveMap();
+            mbResetActiveMap = false;
+        }
+    }
+
+    Sophus::SE3f Tcw = mpTracker->GrabImageVGGT(im, timestamp, vKeys, vTrackIds, filename);
+
+    unique_lock<mutex> lock2(mMutexState);
+    mTrackingState = mpTracker->mState;
+    mTrackedMapPoints = mpTracker->mCurrentFrame.mvpMapPoints;
+    mTrackedKeyPointsUn = mpTracker->mCurrentFrame.mvKeysUn;
+    mTrackedKeyPoints = mpTracker->mCurrentFrame.mvKeys;
+
+    return Tcw;
+}
+
 } //namespace ORB_SLAM
 

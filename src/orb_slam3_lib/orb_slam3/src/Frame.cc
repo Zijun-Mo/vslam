@@ -1245,4 +1245,90 @@ Eigen::Vector3f Frame::UnprojectStereoFishEye(const int &i){
     return mRwc * mvStereo3Dpoints[i] + mOw;
 }
 
+// Constructor for VGGT (External Tracks)
+Frame::Frame(const cv::Mat &imGray, const double &timeStamp, 
+             const std::vector<cv::KeyPoint> &vKeys, 
+             const std::vector<long> &vTrackIds,
+             ORBextractor* extractor, ORBVocabulary* voc, 
+             GeometricCamera* pCamera, cv::Mat &distCoef, 
+             const float &bf, const float &thDepth, 
+             Frame* pPrevF, const IMU::Calib &ImuCalib)
+    : mpORBvocabulary(voc), mpORBextractorLeft(extractor), mpORBextractorRight(static_cast<ORBextractor*>(NULL)),
+      mTimeStamp(timeStamp), mK(pCamera->toK()), mDistCoef(distCoef), mbf(bf), mb(0), mThDepth(thDepth),
+      mpCamera(pCamera), mpCamera2(nullptr), 
+      mpImuPreintegrated(NULL), mpPrevFrame(pPrevF), mpImuPreintegratedFrame(NULL), mpReferenceKF(static_cast<KeyFrame*>(NULL)),
+      mbIsSet(false), mbImuPreintegrated(false), mpMutexImu(new std::mutex), mnDataset(0)
+{
+    // Frame ID
+    mnId = nNextId++;
+
+    // Scale Level Info
+    mnScaleLevels = mpORBextractorLeft->GetLevels();
+    mfScaleFactor = mpORBextractorLeft->GetScaleFactor();
+    mfLogScaleFactor = log(mfScaleFactor);
+    mvScaleFactors = mpORBextractorLeft->GetScaleFactors();
+    mvInvScaleFactors = mpORBextractorLeft->GetInverseScaleFactors();
+    mvLevelSigma2 = mpORBextractorLeft->GetScaleSigmaSquares();
+    mvInvLevelSigma2 = mpORBextractorLeft->GetInverseScaleSigmaSquares();
+
+    // ORB extraction
+    // For VGGT, we use provided keys and IDs
+    mvKeys = vKeys;
+    mvTrackIds = vTrackIds;
+    N = mvKeys.size();
+
+    if(mvKeys.empty())
+        return;
+
+    // Compute Descriptors (Required for LoopClosing)
+    // We need to compute descriptors at the provided keypoint locations
+    // Note: This assumes the extractor is configured correctly for the image size
+    // We might need to adapt ComputeDescriptors to take specific keypoints, 
+    // but standard ORBextractor computes for the whole image usually.
+    // Here we force computation on our specific points.
+    // Since ORBextractor::operator() does detection AND description, we need a way to just describe.
+    // Standard ORB-SLAM3 ORBextractor doesn't expose "compute descriptors for these points" easily 
+    // without modifying it. 
+    // WORKAROUND: We will use OpenCV's ORB to compute descriptors for these points if possible, 
+    // or we rely on the fact that we might not need descriptors for pure tracking if we use IDs,
+    // BUT LoopClosing needs them.
+    // Let's try to use the extractor if it has a method, otherwise use OpenCV directly for now to avoid modifying ORBextractor.h
+    
+    // Using OpenCV directly for descriptors to avoid modifying ORBextractor
+    // This requires the extractor parameters to match somewhat
+    cv::Ptr<cv::ORB> orb = cv::ORB::create(N, mfScaleFactor, mnScaleLevels, 31, 0, 2, cv::ORB::HARRIS_SCORE, 31, 20);
+    orb->compute(imGray, mvKeys, mDescriptors);
+
+    // MapPoints
+    mvpMapPoints = vector<MapPoint*>(N,static_cast<MapPoint*>(NULL));
+    mvbOutlier = vector<bool>(N,false);
+
+    // Undistort KeyPoints
+    UndistortKeyPoints();
+
+    // Set no stereo info
+    mvuRight = vector<float>(N,-1);
+    mvDepth = vector<float>(N,-1);
+    mnCloseMPs = 0;
+
+    // Assign to grid
+    AssignFeaturesToGrid();
+
+    // Compute BoW (Required for LoopClosing)
+    if(mpORBvocabulary)
+        ComputeBoW();
+
+    // IMU
+    mImuCalib = ImuCalib;
+    if(pPrevF)
+    {
+        mImuBias = pPrevF->mImuBias;
+    }
+    else
+    {
+        mImuBias = IMU::Bias();
+    }
+    mPredBias = mImuBias;
+}
+
 } //namespace ORB_SLAM

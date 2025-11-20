@@ -1,3 +1,6 @@
 [submodule "vggt"]
 	path = vggt
 	url = https://github.com/facebookresearch/vggt.git
+[submodule "src/video_reader"]
+	path = src/video_reader
+	url = https://github.com/PnX-HKUSTGZ/video_reader.git

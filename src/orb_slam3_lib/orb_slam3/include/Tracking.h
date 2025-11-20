@@ -374,6 +374,19 @@ protected:
 
 public:
     cv::Mat mImRight;
+
+    // VGGT Integration
+    Sophus::SE3f GrabImageVGGT(const cv::Mat &im, const double &timestamp, 
+                               const std::vector<cv::KeyPoint> &vKeys, 
+                               const std::vector<long> &vTrackIds,
+                               string filename);
+    
+protected:
+    void TrackVGGT();
+    int MatchByTrackIds();
+    void MonocularInitializationVGGT();
+    bool NeedNewKeyFrameVGGT();
+    void CreateNewKeyFrameVGGT();
 };
 
 } //namespace ORB_SLAM

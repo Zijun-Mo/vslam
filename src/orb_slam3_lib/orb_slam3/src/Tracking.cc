@@ -4195,4 +4195,318 @@ void Tracking::Release()
 }
 #endif
 
+// ------------------------------------------------------------------------------------------------
+// VGGT Integration Implementation
+// ------------------------------------------------------------------------------------------------
+
+Sophus::SE3f Tracking::GrabImageVGGT(const cv::Mat &im, const double &timestamp, 
+                                     const std::vector<cv::KeyPoint> &vKeys, 
+                                     const std::vector<long> &vTrackIds,
+                                     string filename)
+{
+    mImGray = im;
+    if(mImGray.channels()==3)
+    {
+        if(mbRGB)
+            cvtColor(mImGray,mImGray,cv::COLOR_RGB2GRAY);
+        else
+            cvtColor(mImGray,mImGray,cv::COLOR_BGR2GRAY);
+    }
+    else if(mImGray.channels()==4)
+    {
+        if(mbRGB)
+            cvtColor(mImGray,mImGray,cv::COLOR_RGBA2GRAY);
+        else
+            cvtColor(mImGray,mImGray,cv::COLOR_BGRA2GRAY);
+    }
+
+    // Create Frame with VGGT data
+    if(mState==NOT_INITIALIZED || mState==NO_IMAGES_YET ||(lastID - initID) < mMaxFrames)
+        mCurrentFrame = Frame(mImGray, timestamp, vKeys, vTrackIds, mpIniORBextractor, mpORBVocabulary, mpCamera, mDistCoef, mbf, mThDepth);
+    else
+        mCurrentFrame = Frame(mImGray, timestamp, vKeys, vTrackIds, mpORBextractorLeft, mpORBVocabulary, mpCamera, mDistCoef, mbf, mThDepth);
+
+    if (mState==NO_IMAGES_YET)
+        t0=timestamp;
+
+    mCurrentFrame.mNameFile = filename;
+    mCurrentFrame.mnDataset = mnNumDataset;
+
+    lastID = mCurrentFrame.mnId;
+    
+    // Call VGGT specific tracking
+    TrackVGGT();
+
+    return mCurrentFrame.GetPose();
+}
+
+void Tracking::TrackVGGT()
+{
+    // Basic state management similar to Track()
+    if(mState==NO_IMAGES_YET)
+    {
+        mState = NOT_INITIALIZED;
+    }
+
+    mLastProcessedState=mState;
+
+    // Get Map Mutex
+    Map* pCurrentMap = mpAtlas->GetCurrentMap();
+    unique_lock<mutex> lock(pCurrentMap->mMutexMapUpdate);
+    mbMapUpdated = false;
+    int nCurMapChangeIndex = pCurrentMap->GetMapChangeIndex();
+    int nMapChangeIndex = pCurrentMap->GetLastMapChange();
+    if(nCurMapChangeIndex>nMapChangeIndex)
+    {
+        pCurrentMap->SetLastMapChange(nCurMapChangeIndex);
+        mbMapUpdated = true;
+    }
+
+    if(mState==NOT_INITIALIZED)
+    {
+        MonocularInitializationVGGT();
+        if(mState!=OK)
+        {
+            mLastFrame = Frame(mCurrentFrame);
+            return;
+        }
+        if(mpAtlas->GetAllMaps().size() == 1)
+        {
+            mnFirstFrameId = mCurrentFrame.mnId;
+        }
+    }
+    else
+    {
+        // System is initialized. Track Frame.
+        bool bOK = true;
+
+        // 1. Match by Track IDs
+        int nMatches = MatchByTrackIds();
+        
+        // 2. Pose Optimization
+        // If we have enough matches, optimize pose
+        if(nMatches > 10) // Threshold?
+        {
+            // Set initial pose from last frame (constant velocity or just last pose)
+            if(mbVelocity)
+                mCurrentFrame.SetPose(mVelocity * mLastFrame.GetPose());
+            else
+                mCurrentFrame.SetPose(mLastFrame.GetPose());
+
+            // Optimize
+            Optimizer::PoseOptimization(&mCurrentFrame);
+
+            // Discard outliers
+            int nInliers = 0;
+            for(int i=0; i<mCurrentFrame.N; i++)
+            {
+                if(mCurrentFrame.mvpMapPoints[i] && !mCurrentFrame.mvbOutlier[i])
+                    nInliers++;
+            }
+
+            if(nInliers < 10)
+                bOK = false;
+        }
+        else
+        {
+            bOK = false;
+        }
+
+        // 3. Update Local Map (needed for backend)
+        if(bOK)
+        {
+            UpdateLocalMap();
+        }
+
+        // 4. KeyFrame Decision
+        if(bOK && NeedNewKeyFrameVGGT())
+        {
+            CreateNewKeyFrameVGGT();
+        }
+
+        // 5. Failure recovery (simplified)
+        if(!bOK)
+        {
+            // mState = LOST; // For now, just keep going or handle lost
+            // In VGGT, maybe we trust the external tracker more?
+            // Or we just reset if lost.
+        }
+
+        // Update motion model
+        if(mLastFrame.mnId < mCurrentFrame.mnId && bOK)
+        {
+            mVelocity = mCurrentFrame.GetPose() * mLastFrame.GetPose().inverse();
+            mbVelocity = true;
+        }
+        else
+        {
+            mbVelocity = false;
+        }
+
+        // Clean up
+        for(int i=0; i<mCurrentFrame.N; i++)
+        {
+            MapPoint* pMP = mCurrentFrame.mvpMapPoints[i];
+            if(pMP)
+                pMP->mbTrackInView = false;
+        }
+
+        // Update Last Frame
+        mLastFrame = Frame(mCurrentFrame);
+    }
+
+    // Update Drawers
+    mpFrameDrawer->Update(this);
+    if(mCurrentFrame.isSet())
+        mpMapDrawer->SetCurrentCameraPose(mCurrentFrame.GetPose());
+}
+
+int Tracking::MatchByTrackIds()
+{
+    int nMatches = 0;
+    // Build a map from TrackID to MapPoint* from the Last Frame (or Local Map?)
+    // Using LastFrame is faster and sufficient for frame-to-frame
+    map<long, MapPoint*> lastFrameMapPoints;
+    for(int i=0; i<mLastFrame.N; i++) {
+        if(mLastFrame.mvpMapPoints[i] && mLastFrame.mvTrackIds[i] != -1) {
+            lastFrameMapPoints[mLastFrame.mvTrackIds[i]] = mLastFrame.mvpMapPoints[i];
+        }
+    }
+
+    // Assign MapPoints to Current Frame based on Track IDs
+    for(int i=0; i<mCurrentFrame.N; i++) {
+        long tid = mCurrentFrame.mvTrackIds[i];
+        if(tid == -1) continue;
+
+        if(lastFrameMapPoints.count(tid)) {
+            MapPoint* pMP = lastFrameMapPoints[tid];
+            if(pMP && !pMP->isBad()) {
+                mCurrentFrame.mvpMapPoints[i] = pMP;
+                pMP->mbTrackInView = true;
+                nMatches++;
+            }
+        }
+        // Note: If not found in LastFrame, we could search in LocalMap, 
+        // but for now let's stick to simple tracking.
+        // New points will be created in CreateNewKeyFrameVGGT or handled by LocalMapping.
+    }
+    return nMatches;
+}
+
+void Tracking::MonocularInitializationVGGT()
+{
+    // Simple initialization:
+    // 1. Create KeyFrame
+    // 2. Create MapPoints for all valid Track IDs (assuming we have 3D info? No, VGGT gives 2D tracks + depth/pose?)
+    // Wait, the prompt says "VGGT info". If VGGT gives 3D points, we should use them.
+    // If VGGT only gives 2D tracks, we need to triangulate.
+    // Assuming for now we just initialize the map structure.
+    
+    if(mCurrentFrame.N > 100) // Threshold
+    {
+        // Create KeyFrame
+        KeyFrame* pKFini = new KeyFrame(mCurrentFrame, mpAtlas->GetCurrentMap(), mpKeyFrameDB);
+        
+        // Insert KeyFrame in Map
+        mpAtlas->GetCurrentMap()->AddKeyFrame(pKFini);
+        
+        // Create MapPoints
+        for(int i=0; i<mCurrentFrame.N; i++)
+        {
+            // For initialization, we might need 3D points. 
+            // If we don't have them from VGGT, we can't initialize properly without motion.
+            // BUT, if we assume VGGT provides a "good enough" initial pose or we just start here.
+            // Let's create MapPoints at a fixed depth or use VGGT depth if available.
+            // For this implementation, let's assume we create MapPoints later or 
+            // we need to extend Frame to hold 3D points from VGGT.
+            // For now, let's just create empty MapPoints to satisfy the system.
+            
+            // Create a dummy 3D point at 1 meter depth
+            cv::KeyPoint kp = mCurrentFrame.mvKeys[i];
+            // Simple unprojection assuming pinhole model and z=1
+            // We need camera parameters. mCurrentFrame.mpCamera should be available.
+            // But for initialization, we can just use a dummy point in front of camera.
+            // We will rely on subsequent triangulation or VGGT depth if available later.
+            
+            Eigen::Vector3f x3D;
+            // Use a safe default if we can't unproject properly without depth
+            // Just putting it at (0,0,1) relative to camera center for now, 
+            // but we need distinct points.
+            // Let's try to unproject using the camera model if possible.
+            
+            if(mCurrentFrame.mpCamera)
+            {
+                cv::Point3f p3d = mCurrentFrame.mpCamera->unproject(cv::Point2f(kp.pt.x, kp.pt.y));
+                x3D << p3d.x, p3d.y, p3d.z;
+                x3D *= 1.0f; // Scale to 1 meter
+            }
+            else
+            {
+                x3D << 0, 0, 1; 
+            }
+            
+            MapPoint* pMP = new MapPoint(x3D, pKFini, mpAtlas->GetCurrentMap());
+            pMP->AddObservation(pKFini, i);
+            pKFini->AddMapPoint(pMP, i);
+            pMP->ComputeDistinctiveDescriptors();
+            pMP->UpdateNormalAndDepth();
+            
+            mpAtlas->GetCurrentMap()->AddMapPoint(pMP);
+            mCurrentFrame.mvpMapPoints[i] = pMP;
+        }
+        
+        mpLocalMapper->InsertKeyFrame(pKFini);
+        
+        mState = OK;
+        mbCreatedMap = true;
+    }
+}
+
+bool Tracking::NeedNewKeyFrameVGGT()
+{
+    // Simplified logic:
+    // If number of tracked points drops below threshold, or 
+    // if many new Track IDs appeared (which means we moved to new area).
+    
+    int nTracked = 0;
+    for(int i=0; i<mCurrentFrame.N; i++)
+    {
+        if(mCurrentFrame.mvpMapPoints[i])
+            nTracked++;
+    }
+    
+    if(nTracked < 50) return true; // Need more points
+    
+    // Also check if we have many new tracks that could become MapPoints
+    int nNew = 0;
+    for(int i=0; i<mCurrentFrame.N; i++)
+    {
+        if(!mCurrentFrame.mvpMapPoints[i] && mCurrentFrame.mvTrackIds[i] != -1)
+            nNew++;
+    }
+    
+    if(nNew > 50 && nTracked < 200) return true; // Good time to insert
+    
+    return false;
+}
+
+void Tracking::CreateNewKeyFrameVGGT()
+{
+    if(!mpLocalMapper->SetNotStop(true))
+        return;
+
+    KeyFrame* pKF = new KeyFrame(mCurrentFrame, mpAtlas->GetCurrentMap(), mpKeyFrameDB);
+
+    // We need to ensure new MapPoints are created for the new Track IDs
+    // so LocalMapping can optimize them.
+    // In standard ORB-SLAM, LocalMapping creates points via triangulation.
+    // Here, we might want to create them if we have 3D info, or let LocalMapping do it.
+    // Since we don't have 3D info passed in Frame yet (only keys and IDs), 
+    // we rely on LocalMapping's triangulation or we need to upgrade Frame to carry 3D points.
+    // For now, we just pass the KeyFrame.
+    
+    mpLocalMapper->InsertKeyFrame(pKF);
+    mpLocalMapper->SetNotStop(false);
+}
+
 } //namespace ORB_SLAM

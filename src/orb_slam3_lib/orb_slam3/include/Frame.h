@@ -367,6 +367,19 @@ public:
     }
 
     Sophus::SE3<double> T_test;
+
+    // External Track IDs
+    std::vector<long> mvTrackIds;
+
+    // Constructor for VGGT (External Tracks)
+    Frame(const cv::Mat &imGray, const double &timeStamp, 
+          const std::vector<cv::KeyPoint> &vKeys, 
+          const std::vector<long> &vTrackIds,
+          ORBextractor* extractor, ORBVocabulary* voc, 
+          GeometricCamera* pCamera, cv::Mat &distCoef, 
+          const float &bf, const float &thDepth, 
+          Frame* pPrevF = static_cast<Frame*>(NULL), 
+          const IMU::Calib &ImuCalib = IMU::Calib());
 };
 
 }// namespace ORB_SLAM

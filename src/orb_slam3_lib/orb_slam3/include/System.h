@@ -124,6 +124,11 @@ public:
     // Returns the camera pose (empty if tracking fails).
     Sophus::SE3f TrackMonocular(const cv::Mat &im, const double &timestamp, const vector<IMU::Point>& vImuMeas = vector<IMU::Point>(), string filename="");
 
+    // VGGT Integration
+    Sophus::SE3f TrackVGGT(const cv::Mat &im, const double &timestamp, 
+                           const std::vector<cv::KeyPoint> &vKeys, 
+                           const std::vector<long> &vTrackIds,
+                           string filename="");
 
     // This stops local mapping thread (map building) and performs only camera tracking.
     void ActivateLocalizationMode();

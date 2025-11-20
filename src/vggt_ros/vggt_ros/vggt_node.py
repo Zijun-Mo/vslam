@@ -18,7 +18,7 @@ from sensor_msgs_py import point_cloud2
 from vggt_ros.keyframe_selector import KeyframeSelector
 
 # Add vggt to python path
-sys.path.append('/home/jun/vslam/vggt')
+sys.path.append(os.path.expanduser('~/vslam/vggt'))  # Adjust this path as necessary
 
 from vggt.models.vggt import VGGT
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
@@ -196,12 +196,11 @@ class VGGTNode(Node):
         # The camera poses are relative to this frame.
         
         ref_header = headers[-1] # Use the latest frame as reference timestamp?
-        # Actually, we should probably use a common timestamp or just "now".
-        # But for sync, let's use the last frame's timestamp.
         
         common_header = Header()
         common_header.frame_id = "map"
-        common_header.stamp = self.get_clock().now().to_msg()
+        # Use the timestamp of the latest image to ensure synchronization with the frontend
+        common_header.stamp = ref_header.stamp
         
         # 1. Point Cloud
         points_flat = points.reshape(-1, 3)
@@ -244,6 +243,32 @@ class VGGTNode(Node):
         marker_array_msg = MarkerArray()
         num_frames, num_tracks, _ = tracks.shape
         
+        # Also publish raw tracks for ORB-SLAM3 frontend
+        # We need to publish the 2D tracks of the LATEST frame in the window
+        # tracks shape is (S, N, 2) -> (Frames, NumTracks, uv)
+        # We want tracks[-1, :, :]
+        
+        # TODO: Define a custom message for this or use Float32MultiArray
+        # For now, let's just stick to MarkerArray and let the frontend parse it if possible,
+        # OR better, let's add a Float32MultiArray publisher for raw tracks.
+        
+        from std_msgs.msg import Float32MultiArray, MultiArrayDimension
+        if not hasattr(self, 'raw_tracks_pub'):
+             self.raw_tracks_pub = self.create_publisher(Float32MultiArray, 'vggt/raw_tracks_2d', 1)
+             
+        raw_tracks_msg = Float32MultiArray()
+        # Layout: dim[0]=num_tracks, dim[1]=3 (u, v, id)
+        # Wait, tracks tensor doesn't have IDs explicitly, the index is the ID.
+        # So we just publish (u, v).
+        
+        latest_tracks = tracks[-1] # (N, 2)
+        
+        raw_tracks_msg.layout.dim.append(MultiArrayDimension(label="tracks", size=num_tracks, stride=num_tracks*2))
+        raw_tracks_msg.layout.dim.append(MultiArrayDimension(label="uv", size=2, stride=2))
+        raw_tracks_msg.data = latest_tracks.flatten().tolist()
+        
+        self.raw_tracks_pub.publish(raw_tracks_msg)
+
         for n in range(num_tracks):
             marker = Marker()
             marker.header = common_header
