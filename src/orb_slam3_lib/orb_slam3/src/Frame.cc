@@ -1249,6 +1249,7 @@ Eigen::Vector3f Frame::UnprojectStereoFishEye(const int &i){
 Frame::Frame(const cv::Mat &imGray, const double &timeStamp, 
              const std::vector<cv::KeyPoint> &vKeys, 
              const std::vector<long> &vTrackIds,
+             const std::vector<cv::Point3f> &v3DPoints,
              ORBextractor* extractor, ORBVocabulary* voc, 
              GeometricCamera* pCamera, cv::Mat &distCoef, 
              const float &bf, const float &thDepth, 
@@ -1303,9 +1304,11 @@ Frame::Frame(const cv::Mat &imGray, const double &timeStamp,
     orb->compute(imGray, validKeys, mDescriptors);
     // std::cout << "[DEBUG] Frame VGGT: Descriptors computed. Valid keys: " << validKeys.size() << std::endl;
 
-    // Filter Track IDs to match valid keys (orb->compute may remove keys)
+    // Filter Track IDs and 3D Points to match valid keys (orb->compute may remove keys)
     std::vector<long> validTrackIds;
+    std::vector<cv::Point3f> valid3DPoints;
     validTrackIds.reserve(validKeys.size());
+    valid3DPoints.reserve(validKeys.size());
     
     for(const auto& k : validKeys)
     {
@@ -1313,16 +1316,23 @@ Frame::Frame(const cv::Mat &imGray, const double &timeStamp,
         if(originalIdx >= 0 && originalIdx < (int)vTrackIds.size())
         {
             validTrackIds.push_back(vTrackIds[originalIdx]);
+            if(originalIdx < (int)v3DPoints.size()) {
+                valid3DPoints.push_back(v3DPoints[originalIdx]);
+            } else {
+                valid3DPoints.push_back(cv::Point3f(0,0,0));
+            }
         }
         else
         {
             // Should not happen, but keep size consistent
             validTrackIds.push_back(-1);
+            valid3DPoints.push_back(cv::Point3f(0,0,0));
         }
     }
 
     mvKeys = validKeys;
     mvTrackIds = validTrackIds;
+    mvVGGT3Dpoints = valid3DPoints;
     N = mvKeys.size();
 
     // MapPoints
@@ -1363,18 +1373,6 @@ Frame::Frame(const cv::Mat &imGray, const double &timeStamp,
         cy = mK.at<float>(1,2);
         invfx = 1.0f/fx;
         invfy = 1.0f/fy;
-        
-        // Also need to ensure mnMinX, mnMaxX, etc are set!
-        // They are static members, so they should persist.
-        // BUT if this is the FIRST frame of THIS type (VGGT) but mbInitialComputations was set to false by another constructor?
-        // mbInitialComputations is static, shared across all Frame instances.
-        // If a standard Frame was created before, it set these values.
-        // However, if NO Frame was created before (e.g. VGGT is the first), then mbInitialComputations is true.
-        
-        // Wait, if mbInitialComputations is false, it means SOME frame has already computed bounds.
-        // But are those bounds valid for THIS image size?
-        // Usually ORB-SLAM3 assumes constant image size.
-        // Let's assume it's fine.
     }
 
     mb = mbf / fx;

@@ -1632,6 +1632,8 @@ bool System::SaveMap(const string &filename)
 Sophus::SE3f System::TrackVGGT(const cv::Mat &im, const double &timestamp, 
                                const std::vector<cv::KeyPoint> &vKeys, 
                                const std::vector<long> &vTrackIds,
+                               const std::vector<cv::Point3f> &v3DPoints,
+                               const cv::Mat &T_delta,
                                string filename)
 {
     // std::cout << "[DEBUG] System::TrackVGGT called. Timestamp: " << timestamp << ", Keys: " << vKeys.size() << std::endl;
@@ -1681,7 +1683,7 @@ Sophus::SE3f System::TrackVGGT(const cv::Mat &im, const double &timestamp,
         }
     }
 
-    Sophus::SE3f Tcw = mpTracker->GrabImageVGGT(im, timestamp, vKeys, vTrackIds, filename);
+    Sophus::SE3f Tcw = mpTracker->GrabImageVGGT(im, timestamp, vKeys, vTrackIds, v3DPoints, T_delta, filename);
 
     unique_lock<mutex> lock2(mMutexState);
     mTrackingState = mpTracker->mState;

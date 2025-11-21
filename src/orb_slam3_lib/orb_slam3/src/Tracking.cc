@@ -33,6 +33,9 @@
 
 #include <mutex>
 #include <chrono>
+#include <algorithm>
+#include <limits>
+#include <Eigen/Dense>
 
 
 using namespace std;
@@ -40,13 +43,56 @@ using namespace std;
 namespace ORB_SLAM3
 {
 
+namespace {
+
+constexpr int kRegionCols = 20;
+constexpr int kRegionRows = 15;
+constexpr int kRegionCount = kRegionCols * kRegionRows;
+constexpr float kRegionTrackRatio = 0.2f;
+constexpr float kGlobalRegionCoverageRatio = 0.1f;
+constexpr int kMinEffectiveRegions = 30;
+constexpr int kMinSamplesPerRegion = 8;
+
+Sophus::SE3f CvMatToSE3f(const cv::Mat &T)
+{
+    Eigen::Matrix4f eig = Eigen::Matrix4f::Identity();
+    if(!T.empty())
+    {
+        if(T.rows != 4 || T.cols != 4)
+        {
+            std::cerr << "Tracking::CvMatToSE3f expects a 4x4 matrix" << std::endl;
+        }
+        else if(T.type() == CV_32F)
+        {
+            for(int r=0; r<4; ++r)
+                for(int c=0; c<4; ++c)
+                    eig(r,c) = T.at<float>(r,c);
+        }
+        else if(T.type() == CV_64F)
+        {
+            for(int r=0; r<4; ++r)
+                for(int c=0; c<4; ++c)
+                    eig(r,c) = static_cast<float>(T.at<double>(r,c));
+        }
+        else
+        {
+            std::cerr << "Tracking::CvMatToSE3f unsupported matrix type: " << T.type() << std::endl;
+        }
+    }
+
+    return Sophus::SE3f(eig);
+}
+
+}
+
 
 Tracking::Tracking(System *pSys, ORBVocabulary* pVoc, FrameDrawer *pFrameDrawer, MapDrawer *pMapDrawer, Atlas *pAtlas, KeyFrameDatabase* pKFDB, const string &strSettingPath, const int sensor, Settings* settings, const string &_nameSeq):
     mState(NO_IMAGES_YET), mSensor(sensor), mTrackedFr(0), mbStep(false),
     mbOnlyTracking(false), mbMapUpdated(false), mbVO(false), mpORBVocabulary(pVoc), mpKeyFrameDB(pKFDB),
     mbReadyToInitializate(false), mpSystem(pSys), mpViewer(NULL), bStepByStep(false),
     mpFrameDrawer(pFrameDrawer), mpMapDrawer(pMapDrawer), mpAtlas(pAtlas), mnLastRelocFrameId(0), time_recently_lost(5.0),
-    mnInitialFrameId(0), mbCreatedMap(false), mnFirstFrameId(0), mpCamera2(nullptr), mpLastKeyFrame(static_cast<KeyFrame*>(NULL))
+    mnInitialFrameId(0), mbCreatedMap(false), mnFirstFrameId(0), mpCamera2(nullptr), mpLastKeyFrame(static_cast<KeyFrame*>(NULL)),
+    mVGGTDeltaT(Sophus::SE3f()), mAccumulatedVGGTMotion(Sophus::SE3f()), mbHasVGGTDelta(false)
 {
     // Load camera parameters from settings file
     if(settings){
@@ -2467,6 +2513,7 @@ void Tracking::StereoInitialization()
         mLastFrame = Frame(mCurrentFrame);
         mnLastKeyFrameId = mCurrentFrame.mnId;
         mpLastKeyFrame = pKFini;
+        mAccumulatedVGGTMotion = Sophus::SE3f();
         //mnLastRelocFrameId = mCurrentFrame.mnId;
 
         mvpLocalKeyFrames.push_back(pKFini);
@@ -4202,9 +4249,13 @@ void Tracking::Release()
 Sophus::SE3f Tracking::GrabImageVGGT(const cv::Mat &im, const double &timestamp, 
                                      const std::vector<cv::KeyPoint> &vKeys, 
                                      const std::vector<long> &vTrackIds,
+                                     const std::vector<cv::Point3f> &v3DPoints,
+                                     const cv::Mat &T_delta,
                                      string filename)
 {
     // std::cout << "[DEBUG] Tracking::GrabImageVGGT start." << std::endl;
+    mVGGTDeltaT = CvMatToSE3f(T_delta);
+    mbHasVGGTDelta = true;
     mImGray = im;
     if(mImGray.channels()==3)
     {
@@ -4223,9 +4274,9 @@ Sophus::SE3f Tracking::GrabImageVGGT(const cv::Mat &im, const double &timestamp,
 
     // Create Frame with VGGT data
     if(mState==NOT_INITIALIZED || mState==NO_IMAGES_YET ||(lastID - initID) < mMaxFrames)
-        mCurrentFrame = Frame(mImGray, timestamp, vKeys, vTrackIds, mpIniORBextractor, mpORBVocabulary, mpCamera, mDistCoef, mbf, mThDepth);
+        mCurrentFrame = Frame(mImGray, timestamp, vKeys, vTrackIds, v3DPoints, mpIniORBextractor, mpORBVocabulary, mpCamera, mDistCoef, mbf, mThDepth);
     else
-        mCurrentFrame = Frame(mImGray, timestamp, vKeys, vTrackIds, mpORBextractorLeft, mpORBVocabulary, mpCamera, mDistCoef, mbf, mThDepth);
+        mCurrentFrame = Frame(mImGray, timestamp, vKeys, vTrackIds, v3DPoints, mpORBextractorLeft, mpORBVocabulary, mpCamera, mDistCoef, mbf, mThDepth);
 
     if (mState==NO_IMAGES_YET)
         t0=timestamp;
@@ -4285,22 +4336,36 @@ void Tracking::TrackVGGT()
     {
         // System is initialized. Track Frame.
         bool bOK = true;
+        bool bPoseSeededByVGGT = false;
 
-        // 1. Match by Track IDs
-        // std::cout << "[DEBUG] TrackVGGT: Matching by Track IDs..." << std::endl;
-        int nMatches = MatchByTrackIds();
-        // std::cout << "[DEBUG] TrackVGGT: Matches found: " << nMatches << std::endl;
-        
-        // 2. Pose Optimization
-        // If we have enough matches, optimize pose
-        if(nMatches > 10) // Threshold?
+        if(mpLastKeyFrame && mbHasVGGTDelta)
         {
-            // Set initial pose from last frame (constant velocity or just last pose)
+            mAccumulatedVGGTMotion = mAccumulatedVGGTMotion * mVGGTDeltaT;
+            Sophus::SE3f TwcLast = mpLastKeyFrame->GetPoseInverse();
+            Sophus::SE3f TwcSeed = mAccumulatedVGGTMotion * TwcLast;
+            mCurrentFrame.SetPose(TwcSeed.inverse());
+            bPoseSeededByVGGT = true;
+        }
+        else{
             if(mbVelocity)
                 mCurrentFrame.SetPose(mVelocity * mLastFrame.GetPose());
             else
                 mCurrentFrame.SetPose(mLastFrame.GetPose());
+        }
 
+        // 1. Match by Track IDs
+        // std::cout << "[DEBUG] TrackVGGT: Matching by Track IDs..." << std::endl;
+        const int point_match_count = MatchByTrackIds();
+        // std::cout << "[DEBUG] TrackVGGT: Matches found: " << point_match_count << std::endl;
+        const int nEffectiveRegions = CountEffectiveMatchRegions();
+        const int requiredRegions = std::max(kMinEffectiveRegions,
+                             static_cast<int>(kRegionCount * kGlobalRegionCoverageRatio));
+        // Require spatially distributed support so matches do not collapse into a tiny area.
+        
+        // 2. Pose Optimization
+        // If we have enough matches, optimize pose
+        if(nEffectiveRegions > requiredRegions)
+        {
             // Optimize
             // std::cout << "[DEBUG] TrackVGGT: Optimizing Pose..." << std::endl;
             Optimizer::PoseOptimization(&mCurrentFrame);
@@ -4406,14 +4471,92 @@ int Tracking::MatchByTrackIds()
     return nMatches;
 }
 
+int Tracking::CountEffectiveMatchRegions() const
+{
+    const std::vector<cv::KeyPoint>* key_source = &mCurrentFrame.mvKeysUn;
+    if(key_source->empty())
+    {
+        key_source = &mCurrentFrame.mvKeys;
+    }
+    if(key_source->empty() || mCurrentFrame.mvTrackIds.empty())
+    {
+        return 0;
+    }
+
+    float min_x = std::numeric_limits<float>::max();
+    float max_x = std::numeric_limits<float>::lowest();
+    float min_y = std::numeric_limits<float>::max();
+    float max_y = std::numeric_limits<float>::lowest();
+    for(const auto &kp : *key_source)
+    {
+        min_x = std::min(min_x, kp.pt.x);
+        max_x = std::max(max_x, kp.pt.x);
+        min_y = std::min(min_y, kp.pt.y);
+        max_y = std::max(max_y, kp.pt.y);
+    }
+
+    const float span_x = std::max(1e-3f, max_x - min_x);
+    const float span_y = std::max(1e-3f, max_y - min_y);
+    if(span_x <= 1e-3f || span_y <= 1e-3f)
+    {
+        return 0;
+    }
+
+    const float inv_cell_width = static_cast<float>(kRegionCols) / span_x;
+    const float inv_cell_height = static_cast<float>(kRegionRows) / span_y;
+
+    std::vector<int> region_total(kRegionCount, 0);
+    std::vector<int> region_tracked(kRegionCount, 0);
+
+    const size_t feature_count = std::min(key_source->size(), mCurrentFrame.mvTrackIds.size());
+    const bool has_outlier_flags = mCurrentFrame.mvbOutlier.size() == feature_count;
+
+    for(size_t i = 0; i < feature_count; ++i)
+    {
+        if(mCurrentFrame.mvTrackIds[i] == -1)
+        {
+            continue;
+        }
+
+        const auto &kp = (*key_source)[i];
+        int col = static_cast<int>((kp.pt.x - min_x) * inv_cell_width);
+        int row = static_cast<int>((kp.pt.y - min_y) * inv_cell_height);
+        col = std::max(0, std::min(kRegionCols - 1, col));
+        row = std::max(0, std::min(kRegionRows - 1, row));
+        const int idx = row * kRegionCols + col;
+
+        region_total[idx]++;
+        const bool has_map_point = i < mCurrentFrame.mvpMapPoints.size() && mCurrentFrame.mvpMapPoints[i];
+        const bool not_outlier = !has_outlier_flags || !mCurrentFrame.mvbOutlier[i];
+        if(has_map_point && not_outlier)
+        {
+            region_tracked[idx]++;
+        }
+    }
+
+    int effective_regions = 0;
+    for(int idx = 0; idx < kRegionCount; ++idx)
+    {
+        if(region_total[idx] < kMinSamplesPerRegion)
+        {
+            continue;
+        }
+        const float ratio = static_cast<float>(region_tracked[idx]) /
+                            static_cast<float>(region_total[idx]);
+        if(ratio >= kRegionTrackRatio)
+        {
+            ++effective_regions;
+        }
+    }
+
+    return effective_regions;
+}
+
 void Tracking::MonocularInitializationVGGT()
 {
     // Simple initialization:
     // 1. Create KeyFrame
-    // 2. Create MapPoints for all valid Track IDs (assuming we have 3D info? No, VGGT gives 2D tracks + depth/pose?)
-    // Wait, the prompt says "VGGT info". If VGGT gives 3D points, we should use them.
-    // If VGGT only gives 2D tracks, we need to triangulate.
-    // Assuming for now we just initialize the map structure.
+    // 2. Create MapPoints for all valid Track IDs using VGGT 3D points
     
     if(mCurrentFrame.N > 100) // Threshold
     {
@@ -4426,35 +4569,14 @@ void Tracking::MonocularInitializationVGGT()
         // Create MapPoints
         for(int i=0; i<mCurrentFrame.N; i++)
         {
-            // For initialization, we might need 3D points. 
-            // If we don't have them from VGGT, we can't initialize properly without motion.
-            // BUT, if we assume VGGT provides a "good enough" initial pose or we just start here.
-            // Let's create MapPoints at a fixed depth or use VGGT depth if available.
-            // For this implementation, let's assume we create MapPoints later or 
-            // we need to extend Frame to hold 3D points from VGGT.
-            // For now, let's just create empty MapPoints to satisfy the system.
-            
-            // Create a dummy 3D point at 1 meter depth
-            cv::KeyPoint kp = mCurrentFrame.mvKeys[i];
-            // Simple unprojection assuming pinhole model and z=1
-            // We need camera parameters. mCurrentFrame.mpCamera should be available.
-            // But for initialization, we can just use a dummy point in front of camera.
-            // We will rely on subsequent triangulation or VGGT depth if available later.
-            
             Eigen::Vector3f x3D;
-            // Use a safe default if we can't unproject properly without depth
-            // Just putting it at (0,0,1) relative to camera center for now, 
-            // but we need distinct points.
-            // Let's try to unproject using the camera model if possible.
             
-            if(mCurrentFrame.mpCamera)
-            {
-                cv::Point3f p3d = mCurrentFrame.mpCamera->unproject(cv::Point2f(kp.pt.x, kp.pt.y));
+            // Use VGGT 3D points if available
+            if(i < (int)mCurrentFrame.mvVGGT3Dpoints.size()) {
+                cv::Point3f p3d = mCurrentFrame.mvVGGT3Dpoints[i];
                 x3D << p3d.x, p3d.y, p3d.z;
-                x3D *= 1.0f; // Scale to 1 meter
-            }
-            else
-            {
+            } else {
+                // Fallback (should not happen if constructor filters correctly)
                 x3D << 0, 0, 1; 
             }
             
@@ -4477,49 +4599,186 @@ void Tracking::MonocularInitializationVGGT()
 
 bool Tracking::NeedNewKeyFrameVGGT()
 {
-    // Simplified logic:
-    // If number of tracked points drops below threshold, or 
-    // if many new Track IDs appeared (which means we moved to new area).
+    // Check LocalMapper state
+    if(mpLocalMapper->isStopped() || mpLocalMapper->stopRequested())
+        return false;
     
-    int nTracked = 0;
-    for(int i=0; i<mCurrentFrame.N; i++)
+    // Require minimum frame gap from last KF
+    if(!mpLastKeyFrame)
+        return mCurrentFrame.N > 100;
+    
+    const int frames_since_kf = mCurrentFrame.mnId - mnLastKeyFrameId;
+    if(frames_since_kf < 5)  // At least 5 frames between KFs
+        return false;
+    
+    // Compute regional coverage for tracked and new points
+    const std::vector<cv::KeyPoint>* key_source = &mCurrentFrame.mvKeysUn;
+    if(key_source->empty())
+        key_source = &mCurrentFrame.mvKeys;
+    if(key_source->empty() || mCurrentFrame.mvTrackIds.empty())
+        return false;
+    
+    float min_x = std::numeric_limits<float>::max();
+    float max_x = std::numeric_limits<float>::lowest();
+    float min_y = std::numeric_limits<float>::max();
+    float max_y = std::numeric_limits<float>::lowest();
+    for(const auto &kp : *key_source)
     {
-        if(mCurrentFrame.mvpMapPoints[i])
-            nTracked++;
+        min_x = std::min(min_x, kp.pt.x);
+        max_x = std::max(max_x, kp.pt.x);
+        min_y = std::min(min_y, kp.pt.y);
+        max_y = std::max(max_y, kp.pt.y);
     }
     
-    if(nTracked < 50) return true; // Need more points
+    const float span_x = std::max(1e-3f, max_x - min_x);
+    const float span_y = std::max(1e-3f, max_y - min_y);
+    if(span_x <= 1e-3f || span_y <= 1e-3f)
+        return false;
     
-    // Also check if we have many new tracks that could become MapPoints
-    int nNew = 0;
-    for(int i=0; i<mCurrentFrame.N; i++)
+    const float inv_cell_width = static_cast<float>(kRegionCols) / span_x;
+    const float inv_cell_height = static_cast<float>(kRegionRows) / span_y;
+    
+    std::vector<int> region_total(kRegionCount, 0);
+    std::vector<int> region_tracked(kRegionCount, 0);
+    std::vector<int> region_new(kRegionCount, 0);
+    
+    const size_t feature_count = std::min(key_source->size(), mCurrentFrame.mvTrackIds.size());
+    
+    for(size_t i = 0; i < feature_count; ++i)
     {
-        if(!mCurrentFrame.mvpMapPoints[i] && mCurrentFrame.mvTrackIds[i] != -1)
-            nNew++;
+        if(mCurrentFrame.mvTrackIds[i] == -1)
+            continue;
+        
+        const auto &kp = (*key_source)[i];
+        int col = static_cast<int>((kp.pt.x - min_x) * inv_cell_width);
+        int row = static_cast<int>((kp.pt.y - min_y) * inv_cell_height);
+        col = std::max(0, std::min(kRegionCols - 1, col));
+        row = std::max(0, std::min(kRegionRows - 1, row));
+        const int idx = row * kRegionCols + col;
+        
+        region_total[idx]++;
+        
+        const bool has_map_point = i < mCurrentFrame.mvpMapPoints.size() && 
+                                   mCurrentFrame.mvpMapPoints[i] && 
+                                   !mCurrentFrame.mvpMapPoints[i]->isBad();
+        if(has_map_point)
+            region_tracked[idx]++;
+        else
+            region_new[idx]++;
     }
     
-    if(nNew > 50 && nTracked < 200) return true; // Good time to insert
+    // Count regions with sufficient tracking and regions with new points
+    int tracked_regions = 0;
+    int new_regions = 0;
+    for(int idx = 0; idx < kRegionCount; ++idx)
+    {
+        if(region_total[idx] < kMinSamplesPerRegion)
+            continue;
+        
+        const float tracked_ratio = static_cast<float>(region_tracked[idx]) / 
+                                    static_cast<float>(region_total[idx]);
+        const float new_ratio = static_cast<float>(region_new[idx]) / 
+                               static_cast<float>(region_total[idx]);
+        
+        if(tracked_ratio >= kRegionTrackRatio)
+            tracked_regions++;
+        if(new_ratio >= kRegionTrackRatio)  // Reuse same ratio for new points
+            new_regions++;
+    }
+    
+    const int min_tracked_regions = static_cast<int>(kRegionCount * 0.15f);  // 15% coverage
+    const int min_new_regions = static_cast<int>(kRegionCount * 0.10f);      // 10% new area
+    
+    // Condition 1: Too few tracked regions (losing map coverage)
+    if(tracked_regions < min_tracked_regions)
+        return true;
+    
+    // Condition 2: Many new regions with potential MapPoints
+    if(new_regions > min_new_regions && tracked_regions < static_cast<int>(kRegionCount * 0.5f))
+        return true;
+    
+    // Condition 3: Forced insertion after max frames
+    if(frames_since_kf >= 30)  // Max 30 frames between KFs
+        return true;
+    
+    // Condition 4: Check motion magnitude from VGGT delta
+    if(mbHasVGGTDelta)
+    {
+        const float translation_norm = mVGGTDeltaT.translation().norm();
+        const float rotation_angle = mVGGTDeltaT.so3().log().norm();
+        // Insert KF if significant motion (>10cm translation or >5deg rotation)
+        if(translation_norm > 0.1f || rotation_angle > 0.087f)
+            return mpLocalMapper->AcceptKeyFrames();
+    }
     
     return false;
 }
 
 void Tracking::CreateNewKeyFrameVGGT()
 {
+    if(mpLocalMapper->IsInitializing() && !mpAtlas->isImuInitialized())
+        return;
+
     if(!mpLocalMapper->SetNotStop(true))
         return;
 
     KeyFrame* pKF = new KeyFrame(mCurrentFrame, mpAtlas->GetCurrentMap(), mpKeyFrameDB);
 
-    // We need to ensure new MapPoints are created for the new Track IDs
-    // so LocalMapping can optimize them.
-    // In standard ORB-SLAM, LocalMapping creates points via triangulation.
-    // Here, we might want to create them if we have 3D info, or let LocalMapping do it.
-    // Since we don't have 3D info passed in Frame yet (only keys and IDs), 
-    // we rely on LocalMapping's triangulation or we need to upgrade Frame to carry 3D points.
-    // For now, we just pass the KeyFrame.
-    
-    mpLocalMapper->InsertKeyFrame(pKF);
+    if(mpAtlas->isImuInitialized())
+        pKF->bImu = true;
+
+    pKF->SetNewBias(mCurrentFrame.mImuBias);
+    mpReferenceKF = pKF;
+    mCurrentFrame.mpReferenceKF = pKF;
+
+    if(mpLastKeyFrame)
+    {
+        pKF->mPrevKF = mpLastKeyFrame;
+        mpLastKeyFrame->mNextKF = pKF;
+    }
+
+    if (mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD)
+    {
+        mpImuPreintegratedFromLastKF = new IMU::Preintegrated(pKF->GetImuBias(),pKF->mImuCalib);
+    }
+
+    // Create MapPoints from VGGT 3D priors when the current frame does not already track them.
+    const int vg_points = static_cast<int>(mCurrentFrame.mvVGGT3Dpoints.size());
+    const int total_feats = std::min(mCurrentFrame.N, vg_points);
+    for(int i = 0; i < total_feats; ++i)
+    {
+        if(mCurrentFrame.mvpMapPoints[i])
+            continue;
+
+        const cv::Point3f &p3d = mCurrentFrame.mvVGGT3Dpoints[i];
+        if(!std::isfinite(p3d.x) || !std::isfinite(p3d.y) || !std::isfinite(p3d.z))
+            continue;
+
+        Eigen::Vector3f x3D(p3d.x, p3d.y, p3d.z);
+        MapPoint* pNewMP = new MapPoint(x3D, pKF, mpAtlas->GetCurrentMap());
+        pNewMP->AddObservation(pKF, i);
+        pKF->AddMapPoint(pNewMP, i);
+        pNewMP->ComputeDistinctiveDescriptors();
+        pNewMP->UpdateNormalAndDepth();
+        mpAtlas->AddMapPoint(pNewMP);
+        mCurrentFrame.mvpMapPoints[i]=pNewMP;
+    }
+
+    if (mpLocalMapper->insertKeyFrameCallback)
+    {
+        mpLocalMapper->insertKeyFrameCallback(pKF);
+    }
+    else
+    {
+        Verbose::PrintMess("[VGGT] LocalMapper callback not set, enqueuing KeyFrame directly. Ensure LocalMapping thread is running.", Verbose::VERBOSITY_NORMAL);
+        mpLocalMapper->InsertKeyFrame(pKF);
+    }
+
     mpLocalMapper->SetNotStop(false);
+
+    mnLastKeyFrameId = mCurrentFrame.mnId;
+    mpLastKeyFrame = pKF;
+    mAccumulatedVGGTMotion = Sophus::SE3f();
 }
 
 } //namespace ORB_SLAM

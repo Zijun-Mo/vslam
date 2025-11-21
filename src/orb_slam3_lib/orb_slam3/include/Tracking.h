@@ -376,14 +376,20 @@ public:
     cv::Mat mImRight;
 
     // VGGT Integration
+    Sophus::SE3f mVGGTDeltaT;
+    Sophus::SE3f mAccumulatedVGGTMotion;
+    bool mbHasVGGTDelta;
     Sophus::SE3f GrabImageVGGT(const cv::Mat &im, const double &timestamp, 
                                const std::vector<cv::KeyPoint> &vKeys, 
                                const std::vector<long> &vTrackIds,
+                               const std::vector<cv::Point3f> &v3DPoints,
+                               const cv::Mat &T_delta,
                                string filename);
     
 protected:
     void TrackVGGT();
     int MatchByTrackIds();
+    int CountEffectiveMatchRegions() const;
     void MonocularInitializationVGGT();
     bool NeedNewKeyFrameVGGT();
     void CreateNewKeyFrameVGGT();

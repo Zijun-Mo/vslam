@@ -128,6 +128,8 @@ public:
     Sophus::SE3f TrackVGGT(const cv::Mat &im, const double &timestamp, 
                            const std::vector<cv::KeyPoint> &vKeys, 
                            const std::vector<long> &vTrackIds,
+                           const std::vector<cv::Point3f> &v3DPoints,
+                           const cv::Mat &T_delta,
                            string filename="");
 
     // This stops local mapping thread (map building) and performs only camera tracking.
