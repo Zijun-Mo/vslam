@@ -1,9 +1,9 @@
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import PointCloud2, PointField, Image, CameraInfo, PointCloud, ChannelFloat32
+from sensor_msgs.msg import Image, PointCloud, ChannelFloat32
 from geometry_msgs.msg import PoseArray, Pose, Point32
-from visualization_msgs.msg import MarkerArray, Marker
-from std_msgs.msg import Header
+from std_msgs.msg import Header, Float32MultiArray, MultiArrayDimension
+from vslam_msgs.msg import VggtOutput
 from cv_bridge import CvBridge
 import numpy as np
 import torch
@@ -13,9 +13,9 @@ import glob
 from collections import deque
 from PIL import Image as PILImage
 from torchvision import transforms as TF
-from sensor_msgs_py import point_cloud2
 
 from vggt_ros.keyframe_selector import KeyframeSelector
+from vggt_ros.geometry_utils import compute_3d_tracks
 
 # Add vggt to python path
 sys.path.append(os.path.expanduser('~/vslam/vggt'))  # Adjust this path as necessary
@@ -50,11 +50,12 @@ class VGGTNode(Node):
         self.keyframe_selector = KeyframeSelector(window_size=self.window_size, min_parallax=self.min_parallax)
         
         # Publishers
-        self.pcd_pub = self.create_publisher(PointCloud2, 'vggt/world_points', 1)
-        self.pose_pub = self.create_publisher(PoseArray, 'vggt/camera_poses', 1)
-        self.tracks_pub = self.create_publisher(MarkerArray, 'vggt/tracks', 1)
-        self.depth_pub = self.create_publisher(Image, 'vggt/depth', 10)
-        self.info_pub = self.create_publisher(CameraInfo, 'vggt/camera_info', 10)
+        self.vggt_pub = self.create_publisher(VggtOutput, 'vggt/output', 1)
+        self.frame_count = 0
+        
+        # Inference time tracking
+        self.inference_times = []
+        self.inference_log_interval = 50
         
         # Subscriber
         self.create_subscription(Image, self.image_topic, self.image_callback, 10)
@@ -175,34 +176,64 @@ class VGGTNode(Node):
                     
                     # Generate grid query points
                     _, _, _, H, W = images_batch.shape
-                    num_points = 128 # or any other number based on your requirement
-                    query_points = self.generate_grid_points(H, W, num_points=num_points)
+                    # Query all pixels
+                    stride = 4  # Downsample grid so the number of query points is 1/16 of original
+                    grid_y, grid_x = torch.meshgrid(
+                        torch.arange(0, H, stride, device=self.device),
+                        torch.arange(0, W, stride, device=self.device),
+                        indexing='ij'
+                    )
+                    query_points = torch.stack([grid_x.flatten(), grid_y.flatten()], dim=1)
                     
                     # Call model forward
                     import time
                     start_time = time.time()
                     predictions = self.model(images_batch, query_points=query_points[None])
                     end_time = time.time()
-                    self.get_logger().info(f'Inference time: {end_time - start_time:.3f} seconds')
+                    inference_time = end_time - start_time
+                    
+                    # Track inference time
+                    self.inference_times.append(inference_time)
+                    if len(self.inference_times) >= self.inference_log_interval:
+                        avg_time = sum(self.inference_times) / len(self.inference_times)
+                        self.get_logger().info(f'Average Inference Time (last {self.inference_log_interval} frames): {avg_time:.3f}s')
+                        self.inference_times.clear()
                     
                     # Extract results
                     pose_enc = predictions["pose_enc"]
                     extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images_batch.shape[-2:])
                     
                     depth_map = predictions["depth"]
-                    
                     track_list = predictions["track"]
                     
                     # Unproject points
                     point_map_by_unprojection = unproject_depth_map_to_point_map(depth_map.squeeze(0), 
                                                                                 extrinsic.squeeze(0), 
-                                                                                intrinsic.squeeze(0))            # Publish results
+                                                                                intrinsic.squeeze(0))
+                    
+                    # Compute 3D tracks efficiently on GPU
+                    tracks_3d_world, tracks_valid_mask = compute_3d_tracks(
+                        track_list[-1].squeeze(0), # (S, N, 2)
+                        depth_map.squeeze(0),      # (S, H, W, 1)
+                        intrinsic.squeeze(0),      # (S, 3, 3)
+                        extrinsic.squeeze(0)       # (S, 4, 4)
+                    )
+
+            # Publish results
+            # Convert BFloat16 to Float32 before numpy conversion
+            def to_numpy(tensor):
+                if tensor.dtype == torch.bfloat16:
+                    return tensor.float().cpu().numpy()
+                return tensor.cpu().numpy()
+            
             self.publish_results(
                 point_map_by_unprojection,
-                extrinsic.squeeze(0).cpu().numpy(),
-                intrinsic.squeeze(0).cpu().numpy(),
-                depth_map.squeeze(0).cpu().numpy(),
-                track_list[-1].squeeze(0).cpu().numpy(),
+                to_numpy(extrinsic.squeeze(0)),
+                to_numpy(intrinsic.squeeze(0)),
+                to_numpy(depth_map.squeeze(0)),
+                to_numpy(track_list[-1].squeeze(0)),
+                to_numpy(tracks_3d_world),
+                to_numpy(tracks_valid_mask),
                 current_headers,
                 transforms
             )
@@ -210,7 +241,7 @@ class VGGTNode(Node):
         except Exception as e:
             self.get_logger().error(f'Inference failed: {e}')
 
-    def publish_results(self, points, extrinsic, intrinsic, depth, tracks, headers, transforms):
+    def publish_results(self, points, extrinsic, intrinsic, depth, tracks, tracks_3d, tracks_mask, headers, transforms):
         # Use the header of the last frame for the point cloud and poses?
         # Or use the map frame.
         # Usually SLAM systems publish in a fixed frame (e.g. "map" or "odom").
@@ -223,21 +254,12 @@ class VGGTNode(Node):
         # Use the timestamp of the latest image to ensure synchronization with the frontend
         common_header.stamp = ref_header.stamp
         
-        # 1. Point Cloud
-        points_flat = points.reshape(-1, 3)
-        # Filter out points with z <= 0 or very large
-        # Simple filter for valid points
-        valid_mask = (points_flat[:, 2] > 0) & (points_flat[:, 2] < 100)
-        points_valid = points_flat[valid_mask]
+        output_msg = VggtOutput()
+        output_msg.header = common_header
+        output_msg.vggt_frame_id = self.frame_count
+        self.frame_count += 1
         
-        # Downsample if too many points?
-        if len(points_valid) > 50000:
-             points_valid = points_valid[::int(len(points_valid)/50000)]
-             
-        self.pcd_msg = point_cloud2.create_cloud_xyz32(common_header, points_valid)
-        self.pcd_pub.publish(self.pcd_msg)
-        
-        # 2. Camera Poses
+        # 1. Camera Poses
         pose_array_msg = PoseArray()
         pose_array_msg.header = common_header
         
@@ -257,121 +279,46 @@ class VGGTNode(Node):
             pose.orientation.w = q[3]
             
             pose_array_msg.poses.append(pose)
-        self.pose_pub.publish(pose_array_msg)
         
-        # 3. Tracks
-        marker_array_msg = MarkerArray()
-        num_frames, num_tracks, _ = tracks.shape
+        output_msg.camera_poses = pose_array_msg
         
-        # Also publish raw tracks for ORB-SLAM3 frontend
-        # We need to publish the 2D tracks of the LATEST frame in the window
-        # tracks shape is (S, N, 2) -> (Frames, NumTracks, uv)
-        # We want tracks[-1, :, :]
+        # 2. Tracks 3D (Dense MultiArray)
+        # tracks_3d: (S, N, 3) where N = H*W
+        # tracks_mask: (S, N)
         
-        # TODO: Define a custom message for this or use Float32MultiArray
-        # For now, let's just stick to MarkerArray and let the frontend parse it if possible,
-        # OR better, let's add a Float32MultiArray publisher for raw tracks.
+        S, N, _ = tracks_3d.shape
+        # Assuming N = H * W, we need to know H and W to reconstruct the grid.
+        # We can get H, W from the last image in headers or transforms?
+        # Or just pass them.
+        # In run_inference_and_publish, we generated grid from H, W.
+        # Let's assume N is correct.
         
-        if not hasattr(self, 'raw_tracks_pub'):
-             self.raw_tracks_pub = self.create_publisher(PointCloud, 'vggt/raw_tracks_2d', 1)
-             
-        raw_tracks_msg = PointCloud()
-        raw_tracks_msg.header = common_header
+        # Create MultiArray for tracks_3d
+        tracks_msg = Float32MultiArray()
         
-        # Layout: dim[0]=num_tracks, dim[1]=3 (u, v, id)
-        # Wait, tracks tensor doesn't have IDs explicitly, the index is the ID.
-        # So we just publish (u, v).
+        # Define layout
+        dim_s = MultiArrayDimension(label="S", size=S, stride=S*N*3)
+        dim_n = MultiArrayDimension(label="N", size=N, stride=N*3)
+        dim_c = MultiArrayDimension(label="C", size=3, stride=3)
+        tracks_msg.layout.dim = [dim_s, dim_n, dim_c]
         
-        latest_tracks = tracks[-1] # (N, 2)
-        latest_transform = transforms[-1]
+        # Flatten data
+        tracks_msg.data = tracks_3d.flatten().tolist()
+        output_msg.tracks_3d = tracks_msg
         
-        # Create channel for IDs (indices)
-        id_channel = ChannelFloat32()
-        id_channel.name = "ids"
+        # Create MultiArray for tracks_mask
+        mask_msg = Float32MultiArray()
         
-        for i in range(num_tracks):
-            u, v = latest_tracks[i]
-            
-            # Restore to original coordinates
-            u_orig = (u - latest_transform['pad_left']) / latest_transform['scale_x']
-            v_orig = (v - latest_transform['pad_top'] + latest_transform['start_y']) / latest_transform['scale_y']
-            
-            p = Point32()
-            p.x = float(u_orig)
-            p.y = float(v_orig)
-            p.z = 0.0
-            raw_tracks_msg.points.append(p)
-            id_channel.values.append(float(i))
-            
-        raw_tracks_msg.channels.append(id_channel)
+        dim_s_mask = MultiArrayDimension(label="S", size=S, stride=S*N)
+        dim_n_mask = MultiArrayDimension(label="N", size=N, stride=N)
+        mask_msg.layout.dim = [dim_s_mask, dim_n_mask]
         
-        self.raw_tracks_pub.publish(raw_tracks_msg)
+        mask_msg.data = tracks_mask.flatten().astype(float).tolist()
+        output_msg.tracks_mask = mask_msg
+        
+        self.vggt_pub.publish(output_msg)
+        
 
-        for n in range(num_tracks):
-            marker = Marker()
-            marker.header = common_header
-            marker.ns = "tracks"
-            marker.id = n
-            marker.type = Marker.LINE_STRIP
-            marker.action = Marker.ADD
-            marker.scale.x = 0.02
-            marker.color.a = 1.0
-            marker.color.r = 1.0 if n % 3 == 0 else 0.0
-            marker.color.g = 1.0 if n % 3 == 1 else 0.0
-            marker.color.b = 1.0 if n % 3 == 2 else 0.0
-            
-            for s in range(num_frames):
-                u, v = tracks[s, n]
-                H, W = depth.shape[1:3]
-                u_int, v_int = int(u), int(v)
-                if 0 <= u_int < W and 0 <= v_int < H:
-                    d = depth[s, v_int, u_int, 0]
-                    if d > 0.1:
-                        K = intrinsic[s]
-                        fx, fy = K[0, 0], K[1, 1]
-                        cx, cy = K[0, 2], K[1, 2]
-                        
-                        z_cam = d
-                        x_cam = (u - cx) * z_cam / fx
-                        y_cam = (v - cy) * z_cam / fy
-                        
-                        p_cam = np.array([x_cam, y_cam, z_cam, 1.0])
-                        p_world = cam_to_world[s] @ p_cam
-                        
-                        from geometry_msgs.msg import Point
-                        pt = Point()
-                        pt.x = float(p_world[0])
-                        pt.y = float(p_world[1])
-                        pt.z = float(p_world[2])
-                        marker.points.append(pt)
-            
-            if len(marker.points) > 1:
-                marker_array_msg.markers.append(marker)
-        self.tracks_pub.publish(marker_array_msg)
-        
-        # 4. Depth & Info (Publish latest frame only?)
-        # Or publish all frames in the window?
-        # Publishing all frames might be too much. Let's publish the latest frame in the window.
-        latest_idx = -1
-        
-        depth_header = headers[latest_idx]
-        # depth_header.frame_id = "vggt_camera_latest" # Or keep original frame_id?
-        
-        depth_frame = depth[latest_idx, :, :, 0]
-        depth_msg = self.bridge.cv2_to_imgmsg(depth_frame, encoding="32FC1")
-        depth_msg.header = depth_header
-        self.depth_pub.publish(depth_msg)
-        
-        info_msg = CameraInfo()
-        info_msg.header = depth_header
-        info_msg.width = depth_frame.shape[1]
-        info_msg.height = depth_frame.shape[0]
-        K = intrinsic[latest_idx].flatten()
-        info_msg.k = K.tolist()
-        P = np.zeros((3, 4))
-        P[:3, :3] = intrinsic[latest_idx]
-        info_msg.p = P.flatten().tolist()
-        self.info_pub.publish(info_msg)
 
     def rotation_matrix_to_quaternion(self, R):
         tr = R[0,0] + R[1,1] + R[2,2]
