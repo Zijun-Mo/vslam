@@ -49,6 +49,11 @@ class VGGTNode(Node):
         # Keyframe Selector
         self.keyframe_selector = KeyframeSelector(window_size=self.window_size, min_parallax=self.min_parallax)
         
+        # Track keyframe IDs that have been inferred
+        self.keyframe_id_counter = 0
+        self.inferred_keyframe_ids = set()
+        self.keyframe_id_map = {}  # Maps keyframe tuple to ID
+        
         # Publishers
         self.vggt_pub = self.create_publisher(VggtOutput, 'vggt/output', 1)
         self.frame_count = 0
@@ -79,10 +84,29 @@ class VGGTNode(Node):
         try:
             cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
             
+            # Check for keyframes that will be removed from the window
+            old_keyframes = list(self.keyframe_selector.keyframes)
+            
             # Process frame with KeyframeSelector
             is_keyframe = self.keyframe_selector.process_frame(cv_image, msg.header)
             
             if is_keyframe:
+                # Assign ID to new keyframe
+                new_keyframe = self.keyframe_selector.keyframes[-1]
+                keyframe_id = self.keyframe_id_counter
+                self.keyframe_id_counter += 1
+                self.keyframe_id_map[id(new_keyframe)] = keyframe_id
+                
+                # Check if any keyframe was removed from the window
+                if len(old_keyframes) >= self.window_size:
+                    removed_keyframe = old_keyframes[0]
+                    removed_id = self.keyframe_id_map.get(id(removed_keyframe))
+                    if removed_id is not None and removed_id not in self.inferred_keyframe_ids:
+                        self.get_logger().warn(f'Keyframe {removed_id} was removed from window without being inferred!')
+                    # Clean up the ID map
+                    if removed_id is not None:
+                        self.keyframe_id_map.pop(id(removed_keyframe), None)
+                
                 # Trigger inference if window is full
                 if self.keyframe_selector.is_full():
                     self.run_inference_and_publish()
@@ -184,6 +208,8 @@ class VGGTNode(Node):
                         indexing='ij'
                     )
                     query_points = torch.stack([grid_x.flatten(), grid_y.flatten()], dim=1)
+                    query_grid_height = grid_y.shape[0]
+                    query_grid_width = grid_x.shape[1]
                     
                     # Call model forward
                     import time
@@ -191,6 +217,12 @@ class VGGTNode(Node):
                     predictions = self.model(images_batch, query_points=query_points[None])
                     end_time = time.time()
                     inference_time = end_time - start_time
+                    
+                    # Mark all current keyframes as inferred
+                    for kf in self.keyframe_selector.keyframes:
+                        kf_id = self.keyframe_id_map.get(id(kf))
+                        if kf_id is not None:
+                            self.inferred_keyframe_ids.add(kf_id)
                     
                     # Track inference time
                     self.inference_times.append(inference_time)
@@ -235,13 +267,17 @@ class VGGTNode(Node):
                 to_numpy(tracks_3d_world),
                 to_numpy(tracks_valid_mask),
                 current_headers,
-                transforms
+                transforms,
+                query_grid_width,
+                query_grid_height,
+                stride,
+                current_images
             )
             
         except Exception as e:
             self.get_logger().error(f'Inference failed: {e}')
 
-    def publish_results(self, points, extrinsic, intrinsic, depth, tracks, tracks_3d, tracks_mask, headers, transforms):
+    def publish_results(self, points, extrinsic, intrinsic, depth, tracks, tracks_3d, tracks_mask, headers, transforms, query_grid_width, query_grid_height, query_stride, current_images):
         # Use the header of the last frame for the point cloud and poses?
         # Or use the map frame.
         # Usually SLAM systems publish in a fixed frame (e.g. "map" or "odom").
@@ -315,6 +351,17 @@ class VGGTNode(Node):
         
         mask_msg.data = tracks_mask.flatten().astype(float).tolist()
         output_msg.tracks_mask = mask_msg
+        
+        # Set query grid dimensions
+        output_msg.query_grid_width = query_grid_width
+        output_msg.query_grid_height = query_grid_height
+        output_msg.query_stride = query_stride
+        
+        # Set original image dimensions (from the last keyframe)
+        if current_images:
+            orig_img = current_images[-1]
+            output_msg.original_image_height = orig_img.shape[0]
+            output_msg.original_image_width = orig_img.shape[1]
         
         self.vggt_pub.publish(output_msg)
         

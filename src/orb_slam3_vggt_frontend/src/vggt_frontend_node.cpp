@@ -156,20 +156,24 @@ private:
         const auto& data = vggt_msg->tracks_3d.data;
         const auto& mask_data = vggt_msg->tracks_mask.data;
         
-        // Get image dimensions to map index to (u, v)
-        int W = img_msg->width;
-        int H = img_msg->height;
-        
-        int downsampled_width = std::max(1, W / kVGGTQueryStride);
-        int downsampled_height = std::max(1, H / kVGGTQueryStride);
+        // Use query grid dimensions from VGGT output
+        int downsampled_width = static_cast<int>(vggt_msg->query_grid_width);
+        int downsampled_height = static_cast<int>(vggt_msg->query_grid_height);
+        int query_stride = static_cast<int>(vggt_msg->query_stride);
         int expected_N = downsampled_width * downsampled_height;
+        
+        // Get original image dimensions
+        int orig_W = static_cast<int>(vggt_msg->original_image_width);
+        int orig_H = static_cast<int>(vggt_msg->original_image_height);
+        
         if (N != expected_N)
         {
-            RCLCPP_WARN(get_logger(), "tracks_3d size %d does not match expected downsampled grid %d (W=%d,H=%d,stride=%d)",
-                        N, expected_N, W, H, kVGGTQueryStride);
+            RCLCPP_WARN(get_logger(), "tracks_3d size %d does not match expected grid %d (grid: %dx%d, stride=%d, orig_img: %dx%d)",
+                        N, expected_N, downsampled_width, downsampled_height, query_stride, orig_W, orig_H);
+            // Fallback: try to infer dimensions
             if (N > 0)
             {
-                downsampled_width = std::max(1, static_cast<int>(std::round(static_cast<double>(W) / kVGGTQueryStride)));
+                downsampled_width = std::max(1, static_cast<int>(std::round(std::sqrt(static_cast<double>(N)))));
                 downsampled_height = std::max(1, N / downsampled_width);
                 expected_N = downsampled_width * downsampled_height;
             }
@@ -194,9 +198,20 @@ private:
                 float y = data[offset + i*3 + 1];
                 float z = data[offset + i*3 + 2];
                 
-                // 2D Point
-                int u = (i % downsampled_width) * kVGGTQueryStride;
-                int v = (i / downsampled_width) * kVGGTQueryStride;
+                // 2D Point: map from query grid to original image coordinates
+                int grid_x = i % downsampled_width;
+                int grid_y = i / downsampled_width;
+                
+                // Scale from preprocessed coordinates to original image
+                float scale_x = static_cast<float>(orig_W) / static_cast<float>(downsampled_width * query_stride);
+                float scale_y = static_cast<float>(orig_H) / static_cast<float>(downsampled_height * query_stride);
+                
+                int u = static_cast<int>((grid_x * query_stride) * scale_x);
+                int v = static_cast<int>((grid_y * query_stride) * scale_y);
+                
+                // Use current image dimensions for bounds checking
+                int W = img_msg->width;
+                int H = img_msg->height;
                 if(u >= W || v >= H)
                 {
                     continue;

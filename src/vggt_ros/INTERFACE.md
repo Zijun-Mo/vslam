@@ -18,6 +18,11 @@ uint64 vggt_frame_id
 geometry_msgs/PoseArray camera_poses
 std_msgs/Float32MultiArray tracks_3d
 std_msgs/Float32MultiArray tracks_mask
+uint32 query_grid_width
+uint32 query_grid_height
+uint32 query_stride
+uint32 original_image_width
+uint32 original_image_height
 ```
 
 ## Field Details
@@ -43,26 +48,51 @@ std_msgs/Float32MultiArray tracks_mask
 *   **Description**: A flattened tensor representing dense 3D tracks。下游节点会基于 `(s, n)` 的索引构造 `vTrackIds`，并借助 `vggt_frame_id` 延续这些 ID，从而跨窗口复用同一物理点的 `MapPoint`。
 *   **Logical Shape**: `(S, N, 3)`
     *   `S`: Window size (number of frames).
-    *   `N`: Number of query points. 为了避免显存占用过大，节点对像素网格做了 `stride = 4` 的子采样，因此 `N = (Height / 4) * (Width / 4)`（向下取整后相乘）。
+    *   `N`: Number of query points. 等于 `query_grid_width * query_grid_height`，由 VGGT 模型在预处理后的图像上生成。
     *   `3`: Coordinates `(x, y, z)` in the world frame.
 *   **Layout**:
     *   `dim[0]`: Label "S", Size `S`, Stride `S * N * 3`
     *   `dim[1]`: Label "N", Size `N`, Stride `N * 3`
     *   `dim[2]`: Label "C", Size `3`, Stride `3`
-*   **Pixel Mapping**: 第 `n` 个采样点对应的像素坐标为 `(u, v)`，其中 `u = (n % (Width/4)) * 4`，`v = (n / (Width/4)) * 4`（行优先顺序，同样假设能被 4 整除）。
-    *   `tracks_3d[s, n]` 表示在帧 `s` 上该下采样像素 `(u, v)` 的 3D 位置；相邻帧中相同的 `n` 代表同一物理点。
-    *   This structure implicitly encodes the optical flow/alignment: `tracks_3d[s, n]` and `tracks_3d[s+1, n]` refer to the **same physical point** (identified by pixel index `n` in the query frame) across time.
+*   **Pixel Mapping**: 第 `n` 个查询点在原始图像上的坐标可通过以下方式计算：
+    *   网格坐标: `grid_x = n % query_grid_width`, `grid_y = n / query_grid_width`
+    *   原图坐标缩放比例: `scale_x = original_image_width / (query_grid_width * query_stride)`, `scale_y = original_image_height / (query_grid_height * query_stride)`
+    *   原图像素坐标: `u = (grid_x * query_stride) * scale_x`, `v = (grid_y * query_stride) * scale_y`
+    *   `tracks_3d[s, n]` 表示在帧 `s` 上该查询点对应的 3D 位置；相邻帧中相同的 `n` 代表同一物理点。
+    *   This structure implicitly encodes the optical flow/alignment: `tracks_3d[s, n]` and `tracks_3d[s+1, n]` refer to the **same physical point** (identified by query index `n`) across time.
 
 ### 5. `tracks_mask`
 *   **Type**: `std_msgs/Float32MultiArray`
 *   **Description**: A flattened tensor representing the validity of each 3D track point.
 *   **Logical Shape**: `(S, N)`
     *   `S`: Window size.
-    *   `N`: Number of下采样查询点（与 `tracks_3d` 相同，约等于 `(H/4)*(W/4)`）。
+    *   `N`: Number of query points（与 `tracks_3d` 相同，等于 `query_grid_width * query_grid_height`）。
 *   **Layout**:
     *   `dim[0]`: Label "S", Size `S`, Stride `S * N`
     *   `dim[1]`: Label "N", Size `N`, Stride `N`
 *   **Values**: `1.0` indicates a valid track point, `0.0` indicates invalid/occluded.
+
+### 6. `query_grid_width`
+*   **Type**: `uint32`
+*   **Description**: Width of the query grid used by VGGT model (after downsampling from preprocessed image).
+*   **Note**: `N = query_grid_width * query_grid_height`
+
+### 7. `query_grid_height`
+*   **Type**: `uint32`
+*   **Description**: Height of the query grid used by VGGT model (after downsampling from preprocessed image).
+
+### 8. `query_stride`
+*   **Type**: `uint32`
+*   **Description**: Stride used when downsampling the preprocessed image to generate query points (typically 4).
+*   **Note**: 查询点在预处理后图像上的间距，用于将查询网格坐标映射回原始图像坐标。
+
+### 9. `original_image_width`
+*   **Type**: `uint32`
+*   **Description**: Width of the original input image before preprocessing.
+
+### 10. `original_image_height`
+*   **Type**: `uint32`
+*   **Description**: Height of the original input image before preprocessing.
 
 ## Parsing Guide
 
@@ -86,12 +116,24 @@ def callback(msg: VggtOutput):
     # Reshape data to (S, N)
     tracks_mask = np.array(msg.tracks_mask.data).reshape((S, N))
     
+    # --- Get query grid dimensions ---
+    grid_width = msg.query_grid_width
+    grid_height = msg.query_grid_height
+    query_stride = msg.query_stride
+    orig_w = msg.original_image_width
+    orig_h = msg.original_image_height
+    
     # --- Accessing a specific point ---
-    # Assuming you know the image resolution H x W
-    # N = H * W
-    # To get the 3D point for pixel (u, v) at frame s:
-    # idx = v * W + u
-    # point = tracks_3d[s, idx]
+    # To get the 3D point for query index n at frame s:
+    # point = tracks_3d[s, n]
+    
+    # To map query index n back to original image coordinates:
+    grid_x = n % grid_width
+    grid_y = n // grid_width
+    scale_x = orig_w / (grid_width * query_stride)
+    scale_y = orig_h / (grid_height * query_stride)
+    u = int((grid_x * query_stride) * scale_x)
+    v = int((grid_y * query_stride) * scale_y)
 ```
 
 ### C++ Example
@@ -108,8 +150,15 @@ void callback(const vslam_msgs::msg::VggtOutput::SharedPtr msg) {
     const auto& data = msg->tracks_3d.data;
     const auto& mask = msg->tracks_mask.data;
     
+    // Get query grid dimensions
+    int grid_width = msg->query_grid_width;
+    int grid_height = msg->query_grid_height;
+    int query_stride = msg->query_stride;
+    int orig_w = msg->original_image_width;
+    int orig_h = msg->original_image_height;
+    
     // Accessing data
-    // To get point at frame s, pixel index n:
+    // To get point at frame s, query index n:
     int index_3d = s * (N * C) + n * C;
     int index_mask = s * N + n;
     
@@ -117,7 +166,16 @@ void callback(const vslam_msgs::msg::VggtOutput::SharedPtr msg) {
         float x = data[index_3d + 0];
         float y = data[index_3d + 1];
         float z = data[index_3d + 2];
-        // Process valid 3D point...
+        
+        // Map query index to original image coordinates
+        int grid_x = n % grid_width;
+        int grid_y = n / grid_width;
+        float scale_x = static_cast<float>(orig_w) / (grid_width * query_stride);
+        float scale_y = static_cast<float>(orig_h) / (grid_height * query_stride);
+        int u = static_cast<int>((grid_x * query_stride) * scale_x);
+        int v = static_cast<int>((grid_y * query_stride) * scale_y);
+        
+        // Process valid 3D point at pixel (u, v)...
     }
 }
 ```
