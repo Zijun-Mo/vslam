@@ -1,12 +1,13 @@
 import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, TimerAction, RegisterEventHandler
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node, ComposableNodeContainer, LoadComposableNodes
 from launch_ros.descriptions import ComposableNode
 from launch.conditions import IfCondition
 from launch_ros.substitutions import FindPackageShare
+from launch.event_handlers import OnProcessStart
 import os
 
 def generate_launch_description():
@@ -42,16 +43,7 @@ def generate_launch_description():
     
     # Nodes
     
-    # VGGT Tracker Node (Python - Cannot be composed)
-    vggt_node = Node(
-        package='vggt_ros',
-        executable='vggt_node',
-        name='vggt_node',
-        output='screen',
-        parameters=[config_file]
-    )
-    
-    # Composable Nodes Container
+    # 1. Composable Nodes Container (ORB-SLAM3 components) - Start first
     container = ComposableNodeContainer(
         name='vslam_container',
         namespace='',
@@ -66,7 +58,7 @@ def generate_launch_description():
                 parameters=[config_file],
                 remappings=[
                     ('/camera/image_raw', '/camera/image_raw'),
-                    ('/vggt/raw_tracks_2d', '/vggt/raw_tracks_2d')
+                    ('/vggt/output', '/vggt/output')
                 ],
                 extra_arguments=[{'use_intra_process_comms': True}]
             ),
@@ -80,7 +72,21 @@ def generate_launch_description():
         output='screen',
     )
     
-    # Conditional Video Reader Loader
+    # 2. VGGT Tracker Node - Start 5 seconds after container
+    vggt_node = Node(
+        package='vggt_ros',
+        executable='vggt_node',
+        name='vggt_node',
+        output='screen',
+        parameters=[config_file]
+    )
+    
+    delayed_vggt_node = TimerAction(
+        period=5.0,
+        actions=[vggt_node]
+    )
+    
+    # 3. Video Reader - Start 5 seconds after VGGT node (10 seconds total)
     load_video_reader = LoadComposableNodes(
         condition=IfCondition(LaunchConfiguration('use_video')),
         target_container='vslam_container',
@@ -97,10 +103,15 @@ def generate_launch_description():
             )
         ]
     )
+    
+    delayed_video_reader = TimerAction(
+        period=10.0,
+        actions=[load_video_reader]
+    )
 
     return LaunchDescription([
         use_video_arg,
-        vggt_node,
         container,
-        load_video_reader
+        delayed_vggt_node,
+        delayed_video_reader
     ])
