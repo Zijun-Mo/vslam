@@ -3,5 +3,6 @@
         "/home/jun/vslam/vggt",
         "/opt/ros/humble/lib/python3.10/site-packages",
         "/opt/ros/humble/local/lib/python3.10/dist-packages"
-    ]
+    ],
+    "cmake.sourceDirectory": "/home/jun/vslam/src/orb_slam3_lib"
 }
