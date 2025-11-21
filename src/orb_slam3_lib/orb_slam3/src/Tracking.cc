@@ -4347,6 +4347,14 @@ void Tracking::TrackVGGT()
             bPoseSeededByVGGT = true;
         }
         else{
+            if (!mpLastKeyFrame)
+            {
+                std::cerr << "[VGGT Warning] No last keyframe available for seeding pose." << std::endl;
+            }
+            if (!mbHasVGGTDelta)
+            {
+                std::cerr << "[VGGT Warning] No VGGT delta available for seeding pose." << std::endl;
+            }
             if(mbVelocity)
                 mCurrentFrame.SetPose(mVelocity * mLastFrame.GetPose());
             else
@@ -4592,8 +4600,19 @@ void Tracking::MonocularInitializationVGGT()
         
         mpLocalMapper->InsertKeyFrame(pKFini);
         
+        // 设置最后一个关键帧
+        mpLastKeyFrame = pKFini;
+        mnLastKeyFrameId = mCurrentFrame.mnId;
+        mpReferenceKF = pKFini;
+        
+        // 初始化VGGT累积运动为单位矩阵
+        mAccumulatedVGGTMotion = Sophus::SE3f();
+        
         mState = OK;
         mbCreatedMap = true;
+        
+        std::cerr << "[VGGT Init] First KF created: " << pKFini->mnId 
+                  << ", mpLastKeyFrame set" << std::endl;
     }
 }
 
@@ -4779,6 +4798,10 @@ void Tracking::CreateNewKeyFrameVGGT()
     mnLastKeyFrameId = mCurrentFrame.mnId;
     mpLastKeyFrame = pKF;
     mAccumulatedVGGTMotion = Sophus::SE3f();
+    
+    std::cerr << "[VGGT KF] New KeyFrame created: " << pKF->mnId 
+              << ", Frame: " << mCurrentFrame.mnId 
+              << ", mpLastKeyFrame updated" << std::endl;
 }
 
 } //namespace ORB_SLAM
