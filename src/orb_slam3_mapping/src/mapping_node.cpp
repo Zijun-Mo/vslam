@@ -3,8 +3,8 @@
 #include <thread>
 
 #include "System.h"
-#include "orb_slam3_msgs/msg/system_ptr.hpp"
-#include "orb_slam3_msgs/msg/key_frame_ptr.hpp"
+#include "vslam_msgs/msg/system_ptr.hpp"
+#include "vslam_msgs/msg/key_frame_ptr.hpp"
 
 namespace orb_slam3_mapping
 {
@@ -18,12 +18,12 @@ public:
         RCLCPP_INFO(get_logger(), "Mapping Node Initialized. Waiting for SystemPtr...");
 
         // Subscribe to SystemPtr
-        sys_sub_ = create_subscription<orb_slam3_msgs::msg::SystemPtr>(
+        sys_sub_ = create_subscription<vslam_msgs::msg::SystemPtr>(
             "system_ptr", rclcpp::QoS(1),
             std::bind(&MappingNode::SystemCallback, this, std::placeholders::_1));
 
         // Subscribe to KeyFramePtr
-        kf_sub_ = create_subscription<orb_slam3_msgs::msg::KeyFramePtr>(
+        kf_sub_ = create_subscription<vslam_msgs::msg::KeyFramePtr>(
             "keyframe_data", 100,
             std::bind(&MappingNode::KeyFrameCallback, this, std::placeholders::_1));
     }
@@ -34,7 +34,7 @@ public:
     }
 
 private:
-    void SystemCallback(const orb_slam3_msgs::msg::SystemPtr::SharedPtr msg)
+    void SystemCallback(const vslam_msgs::msg::SystemPtr::SharedPtr msg)
     {
         if (mpSystem) {
             // System already initialized, ignore subsequent messages
@@ -60,7 +60,7 @@ private:
         RCLCPP_INFO(get_logger(), "Backend threads started.");
     }
 
-    void KeyFrameCallback(const orb_slam3_msgs::msg::KeyFramePtr::SharedPtr msg)
+    void KeyFrameCallback(const vslam_msgs::msg::KeyFramePtr::SharedPtr msg)
     {
         if (!mpSystem) return;
         ORB_SLAM3::KeyFrame* pKF = reinterpret_cast<ORB_SLAM3::KeyFrame*>(msg->kf_addr);
@@ -68,8 +68,8 @@ private:
     }
 
     ORB_SLAM3::System* mpSystem = nullptr;
-    rclcpp::Subscription<orb_slam3_msgs::msg::SystemPtr>::SharedPtr sys_sub_;
-    rclcpp::Subscription<orb_slam3_msgs::msg::KeyFramePtr>::SharedPtr kf_sub_;
+    rclcpp::Subscription<vslam_msgs::msg::SystemPtr>::SharedPtr sys_sub_;
+    rclcpp::Subscription<vslam_msgs::msg::KeyFramePtr>::SharedPtr kf_sub_;
     std::thread mapping_thread_;
     std::thread loop_closing_thread_;
 };

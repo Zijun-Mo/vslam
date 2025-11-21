@@ -12,7 +12,7 @@
   <depend>rclcpp</depend>
   <depend>rclcpp_components</depend>
   <depend>orb_slam3_lib</depend>
-  <depend>orb_slam3_msgs</depend>
+  <depend>vslam_msgs</depend>
 
   <export>
     <build_type>ament_cmake</build_type>

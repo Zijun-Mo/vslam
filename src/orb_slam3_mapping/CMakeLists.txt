@@ -8,7 +8,7 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
 find_package(orb_slam3_lib REQUIRED)
-find_package(orb_slam3_msgs REQUIRED)
+find_package(vslam_msgs REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(Eigen3 REQUIRED)
 
@@ -25,7 +25,7 @@ ament_target_dependencies(mapping_component
   rclcpp
   rclcpp_components
   orb_slam3_lib
-  orb_slam3_msgs
+  vslam_msgs
   OpenCV
   Eigen3
 )

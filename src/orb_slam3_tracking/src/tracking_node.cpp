@@ -5,8 +5,8 @@
 #include <sensor_msgs/msg/imu.hpp>
 
 #include "System.h"
-#include "orb_slam3_msgs/msg/system_ptr.hpp"
-#include "orb_slam3_msgs/msg/key_frame_ptr.hpp"
+#include "vslam_msgs/msg/system_ptr.hpp"
+#include "vslam_msgs/msg/key_frame_ptr.hpp"
 
 namespace orb_slam3_tracking
 {
@@ -45,7 +45,7 @@ public:
 
             // Publisher for SystemPtr
             // Use volatile durability for IPC compatibility, publish periodically
-            sys_pub_ = create_publisher<orb_slam3_msgs::msg::SystemPtr>(
+            sys_pub_ = create_publisher<vslam_msgs::msg::SystemPtr>(
                 "system_ptr", rclcpp::QoS(1));
 
             // Timer to publish SystemPtr periodically
@@ -53,18 +53,18 @@ public:
                 std::chrono::seconds(1),
                 [this]() {
                     if (mpSystem) {
-                        auto msg = orb_slam3_msgs::msg::SystemPtr();
+                        auto msg = vslam_msgs::msg::SystemPtr();
                         msg.system_addr = reinterpret_cast<uint64_t>(mpSystem);
                         sys_pub_->publish(msg);
                     }
                 });
 
             // Publisher for KeyFramePtr
-            kf_pub_ = create_publisher<orb_slam3_msgs::msg::KeyFramePtr>("keyframe_data", 100);
+            kf_pub_ = create_publisher<vslam_msgs::msg::KeyFramePtr>("keyframe_data", 100);
 
             // Set callback to intercept KeyFrame insertion
             mpSystem->mpLocalMapper->SetInsertKeyFrameCallback([this](ORB_SLAM3::KeyFrame* pKF) {
-                auto msg = orb_slam3_msgs::msg::KeyFramePtr();
+                auto msg = vslam_msgs::msg::KeyFramePtr();
                 msg.kf_addr = reinterpret_cast<uint64_t>(pKF);
                 kf_pub_->publish(msg);
             });
@@ -100,9 +100,9 @@ private:
     }
 
     ORB_SLAM3::System* mpSystem = nullptr;
-    rclcpp::Publisher<orb_slam3_msgs::msg::SystemPtr>::SharedPtr sys_pub_;
+    rclcpp::Publisher<vslam_msgs::msg::SystemPtr>::SharedPtr sys_pub_;
     rclcpp::TimerBase::SharedPtr sys_pub_timer_;
-    rclcpp::Publisher<orb_slam3_msgs::msg::KeyFramePtr>::SharedPtr kf_pub_;
+    rclcpp::Publisher<vslam_msgs::msg::KeyFramePtr>::SharedPtr kf_pub_;
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr img_sub_;
 };
 
