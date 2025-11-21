@@ -18,7 +18,7 @@
   <depend>image_transport</depend>
   <depend>message_filters</depend>
   <depend>orb_slam3_lib</depend>
-  <depend>orb_slam3_msgs</depend>
+  <depend>vslam_msgs</depend>
   <depend>libopencv-dev</depend>
 
   <test_depend>ament_lint_auto</test_depend>

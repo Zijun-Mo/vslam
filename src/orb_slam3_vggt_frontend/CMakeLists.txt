@@ -21,7 +21,7 @@ find_package(cv_bridge REQUIRED)
 find_package(image_transport REQUIRED)
 find_package(message_filters REQUIRED)
 find_package(orb_slam3_lib REQUIRED)
-find_package(orb_slam3_msgs REQUIRED)
+find_package(vslam_msgs REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(Eigen3 3.3.0 REQUIRED)
 find_package(Pangolin REQUIRED)
@@ -49,7 +49,7 @@ ament_target_dependencies(vggt_frontend_component
   cv_bridge
   image_transport
   message_filters
-  orb_slam3_msgs
+  vslam_msgs
 )
 
 # Link against ORB_SLAM3 library
