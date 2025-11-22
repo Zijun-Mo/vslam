@@ -70,6 +70,9 @@ class VGGTNode(Node):
         
         self.get_logger().info('VGGT Node Initialized. Waiting for images...')
         self.load_model()
+        # Running intrinsic average accumulator
+        self.intrinsic_sum = None  # torch or numpy array shape (3,3)
+        self.intrinsic_count = 0
 
     def load_model(self):
         self.get_logger().info(f'Loading model {self.model_name}...')
@@ -251,6 +254,19 @@ class VGGTNode(Node):
                         extrinsic.squeeze(0)       # (S, 4, 4)
                     )
 
+            # Update intrinsic running average using the latest frame's intrinsic (choose last index)
+            try:
+                latest_intrinsic = intrinsic.squeeze(0)[-1]  # shape (3,3)
+            except Exception:
+                latest_intrinsic = intrinsic.squeeze(0)[0]
+            latest_intrinsic_cpu = latest_intrinsic.detach().cpu().float().numpy()
+            if self.intrinsic_sum is None:
+                self.intrinsic_sum = latest_intrinsic_cpu.copy()
+                self.intrinsic_count = 1
+            else:
+                self.intrinsic_sum += latest_intrinsic_cpu
+                self.intrinsic_count += 1
+
             # Publish results
             # Convert BFloat16 to Float32 before numpy conversion
             def to_numpy(tensor):
@@ -273,6 +289,7 @@ class VGGTNode(Node):
                 stride,
                 current_images
             )
+            # After publishing results, attach intrinsic average to last published message via stored fields
             
         except Exception as e:
             self.get_logger().error(f'Inference failed: {e}')
@@ -371,6 +388,15 @@ class VGGTNode(Node):
             orig_img = current_images[-1]
             output_msg.original_image_height = orig_img.shape[0]
             output_msg.original_image_width = orig_img.shape[1]
+
+        # Fill intrinsic average
+        if self.intrinsic_sum is not None and self.intrinsic_count > 0:
+            avg_intrinsic = (self.intrinsic_sum / self.intrinsic_count).astype(np.float32)
+            output_msg.intrinsic_avg = avg_intrinsic.reshape(-1).tolist()
+            output_msg.intrinsic_samples = int(self.intrinsic_count)
+        else:
+            output_msg.intrinsic_avg = [0.0]*9
+            output_msg.intrinsic_samples = 0
         
         self.vggt_pub.publish(output_msg)
         

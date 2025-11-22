@@ -31,10 +31,27 @@ public:
         declare_parameter("voc_file", "");
         declare_parameter("settings_file", "");
         declare_parameter("use_viewer", true);
+        // Camera intrinsic override parameters (optional). If provided (fx>0) we will generate a temp YAML and call ChangeCalibration.
+        declare_parameter("camera.fx", 0.0);
+        declare_parameter("camera.fy", 0.0);
+        declare_parameter("camera.cx", 0.0);
+        declare_parameter("camera.cy", 0.0);
+        declare_parameter("camera.k1", 0.0);
+        declare_parameter("camera.k2", 0.0);
+        declare_parameter("camera.p1", 0.0);
+        declare_parameter("camera.p2", 0.0);
+        declare_parameter("camera.k3", 0.0); // optional
+        declare_parameter("camera.width", 0);
+        declare_parameter("camera.height", 0);
+        // If true, override intrinsics dynamically from VGGT averaged output instead of static params/YAML
+        declare_parameter("override_intrinsics_from_vggt", false);
+        // Minimum map points required before allowing dynamic intrinsic updates (safety guard)
+        declare_parameter("min_map_points_for_intrinsic_update", 100);
 
         std::string voc_file = get_parameter("voc_file").as_string();
         std::string settings_file = get_parameter("settings_file").as_string();
         bool use_viewer = get_parameter("use_viewer").as_bool();
+        bool override_from_vggt = get_parameter("override_intrinsics_from_vggt").as_bool();
 
         if (voc_file.empty() || settings_file.empty()) {
             RCLCPP_ERROR(get_logger(), "Please provide voc_file and settings_file parameters");
@@ -45,6 +62,55 @@ public:
         // Initialize System with bStartThreads = false (we only run Tracking here)
         // Note: We use MONOCULAR sensor type as base, but we will use TrackVGGT
         mpSystem = new ORB_SLAM3::System(voc_file, settings_file, ORB_SLAM3::System::MONOCULAR, use_viewer, 0, "", false);
+
+        // Optional intrinsic override after System construction
+        double fx = get_parameter("camera.fx").as_double();
+        double fy = get_parameter("camera.fy").as_double();
+        double cx = get_parameter("camera.cx").as_double();
+        double cy = get_parameter("camera.cy").as_double();
+        double k1 = get_parameter("camera.k1").as_double();
+        double k2 = get_parameter("camera.k2").as_double();
+        double p1 = get_parameter("camera.p1").as_double();
+        double p2 = get_parameter("camera.p2").as_double();
+        double k3 = get_parameter("camera.k3").as_double();
+        int cam_w = get_parameter("camera.width").as_int();
+        int cam_h = get_parameter("camera.height").as_int();
+
+        if(!override_from_vggt && fx > 0.0 && fy > 0.0 && cam_w > 0 && cam_h > 0)
+        {
+            std::string override_path = "/tmp/vslam_calib_override.yaml";
+            try
+            {
+                cv::FileStorage fs(override_path, cv::FileStorage::WRITE);
+                // Use underscore keys (dots cause OpenCV write error in some versions)
+                fs << "Camera_fx" << fx;
+                fs << "Camera_fy" << fy;
+                fs << "Camera_cx" << cx;
+                fs << "Camera_cy" << cy;
+                fs << "Camera_k1" << k1;
+                fs << "Camera_k2" << k2;
+                fs << "Camera_p1" << p1;
+                fs << "Camera_p2" << p2;
+                fs << "Camera_k3" << k3; // may be zero
+                fs << "Camera_width" << cam_w;
+                fs << "Camera_height" << cam_h;
+                fs << "Camera_fps" << 30.0; // default fallback (not currently read)
+                fs.release();
+                if(mpSystem && mpSystem->mpTracker)
+                {
+                    RCLCPP_INFO(get_logger(), "Applying intrinsic override from parameters -> %s", override_path.c_str());
+                    mpSystem->mpTracker->ChangeCalibration(override_path);
+                }
+                else 
+                {
+                    RCLCPP_WARN(get_logger(), "System or Tracker not initialized, cannot apply intrinsic override");
+                }
+            }
+            catch(const std::exception &e)
+            {
+                RCLCPP_ERROR(get_logger(), "Failed writing override calibration file: %s", e.what());
+            }
+        }
 
         // Publisher for SystemPtr (to initialize Mapping Node)
         rclcpp::PublisherOptions pub_opts;
@@ -280,6 +346,98 @@ private:
         has_prev_pose_window_ = current_window.valid();
 
         // 3. Call System
+        // Optional dynamic intrinsic override from VGGT
+        bool override_from_vggt = get_parameter("override_intrinsics_from_vggt").as_bool();
+        if(override_from_vggt && vggt_msg->intrinsic_samples > 0 && vggt_msg->intrinsic_avg.size() == 9)
+        {
+            double fx = vggt_msg->intrinsic_avg[0];
+            double fy = vggt_msg->intrinsic_avg[4];
+            double cx = vggt_msg->intrinsic_avg[2];
+            double cy = vggt_msg->intrinsic_avg[5];
+            int cam_w = static_cast<int>(vggt_msg->original_image_width);
+            int cam_h = static_cast<int>(vggt_msg->original_image_height);
+            if(fx > 0.0 && fy > 0.0 && cam_w > 0 && cam_h > 0)
+            {
+                // Query current tracker intrinsics for relative change threshold
+                float cur_fx=0.f, cur_fy=0.f, cur_cx=0.f, cur_cy=0.f;
+                if(mpSystem && mpSystem->mpTracker)
+                {
+                    mpSystem->mpTracker->GetCurrentIntrinsics(cur_fx, cur_fy, cur_cx, cur_cy);
+                }
+
+                // If current values are zero (e.g., before init), force update
+                bool force_update = (cur_fx <= 0.f || cur_fy <= 0.f);
+                auto rel_diff = [](double old_v, double new_v){ return old_v>0.0 ? std::abs(new_v-old_v)/old_v : 1.0; };
+                double d_fx = rel_diff(cur_fx, fx);
+                double d_fy = rel_diff(cur_fy, fy);
+                double d_cx = rel_diff(cur_cx, cx);
+                double d_cy = rel_diff(cur_cy, cy);
+                double max_diff = std::max(std::max(d_fx, d_fy), std::max(d_cx, d_cy));
+                const double threshold = 0.05; // 5%
+                size_t total_mps = 0;
+                if(mpSystem && mpSystem->mpAtlas && mpSystem->mpAtlas->GetCurrentMap())
+                    total_mps = mpSystem->mpAtlas->GetCurrentMap()->GetAllMapPoints().size();
+                RCLCPP_DEBUG(get_logger(), "Intrinsic diff check: fx_cur=%.3f fx_new=%.3f d_fx=%.2f%% max=%.2f%% MP_count=%zu",
+                              cur_fx, fx, d_fx*100.0, max_diff*100.0, total_mps);
+
+                // Safety: require minimum map points before updating to avoid disrupting initialization
+                int min_mps = get_parameter("min_map_points_for_intrinsic_update").as_int();
+                if(total_mps < static_cast<size_t>(min_mps))
+                {
+                    RCLCPP_DEBUG(get_logger(), "Skip intrinsic update: insufficient map points (%zu < %d)", total_mps, min_mps);
+                    // Allow first-time update only if force_update AND no large change
+                    if(!(force_update && max_diff < 0.3)) // Allow <30% change when uninitialized
+                    {
+                        // Skip this update
+                    }
+                    else
+                    {
+                        // Proceed with careful first update
+                    }
+                }
+                else if(force_update || max_diff > threshold)
+                {
+                    RCLCPP_INFO(get_logger(), "Updating intrinsics (fx %.3f->%.3f d=%.2f%%, fy %.3f->%.3f d=%.2f%%, cx %.3f->%.3f d=%.2f%%, cy %.3f->%.3f d=%.2f%%; max %.2f%%) MP_before=%zu",
+                                cur_fx, fx, d_fx*100.0, cur_fy, fy, d_fy*100.0, cur_cx, cx, d_cx*100.0, cur_cy, cy, d_cy*100.0, max_diff*100.0, total_mps);
+                std::string override_path = "/tmp/vslam_calib_override_vggt.yaml";
+                try
+                {
+                    cv::FileStorage fs(override_path, cv::FileStorage::WRITE);
+                    fs << "Camera_fx" << fx;
+                    fs << "Camera_fy" << fy;
+                    fs << "Camera_cx" << cx;
+                    fs << "Camera_cy" << cy;
+                    fs << "Camera_k1" << 0.0; // Unknown from VGGT – default
+                    fs << "Camera_k2" << 0.0;
+                    fs << "Camera_p1" << 0.0;
+                    fs << "Camera_p2" << 0.0;
+                    fs << "Camera_k3" << 0.0;
+                    fs << "Camera_width" << cam_w;
+                    fs << "Camera_height" << cam_h;
+                    fs << "Camera_fps" << 30.0;
+                    fs.release();
+                    if(mpSystem && mpSystem->mpTracker)
+                    {
+                        // Apply every frame (could be throttled) – ensures convergence as average updates
+                        mpSystem->mpTracker->ChangeCalibration(override_path);
+                        size_t mp_after = 0;
+                        if(mpSystem->mpAtlas && mpSystem->mpAtlas->GetCurrentMap())
+                            mp_after = mpSystem->mpAtlas->GetCurrentMap()->GetAllMapPoints().size();
+                        RCLCPP_INFO(get_logger(), "Intrinsics applied; MapPoints before=%zu after=%zu", total_mps, mp_after);
+                    }
+                }
+                catch(const std::exception &e)
+                {
+                    RCLCPP_ERROR(get_logger(), "Failed writing VGGT override calibration file: %s", e.what());
+                }
+                }
+                else
+                {
+                    RCLCPP_DEBUG(get_logger(), "Skip intrinsic update: max relative diff %.2f%% <= 5%%", max_diff*100.0);
+                }
+            }
+        }
+
         mpSystem->TrackVGGT(cv_ptr->image, timestamp, vKeys, vTrackIds, v3DPoints, vTrackColors, delta_pose);
     }
 

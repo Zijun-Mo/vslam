@@ -1,0 +1,13 @@
+/**:
+  ros__parameters:
+    camera.fx: 458.0
+    camera.fy: 457.0
+    camera.cx: 367.0
+    camera.cy: 248.0
+    camera.k1: -0.28340811
+    camera.k2: 0.07395907
+    camera.p1: 0.00019359
+    camera.p2: 1.76187114e-05
+    camera.k3: 0.0
+    camera.width: 752
+    camera.height: 480

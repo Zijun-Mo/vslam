@@ -11,6 +11,7 @@
     voc_file: "/home/jun/vslam/src/orb_slam3_lib/orb_slam3/Vocabulary/ORBvoc.txt.bin"
     settings_file: "/home/jun/vslam/src/orb_slam3_lib/orb_slam3/config/Monocular/EuRoC.yaml"
     use_viewer: true
+    override_intrinsics_from_vggt: true
 
     # Video Reader Parameters
     video_path: "/docs/kitchen.mp4"

@@ -14,3 +14,8 @@ uint32 query_stride
 # Original image dimensions
 uint32 original_image_width
 uint32 original_image_height
+
+# Average intrinsic matrix (row-major 3x3) accumulated over all model inferences so far
+float32[9] intrinsic_avg
+# Number of samples used in intrinsic_avg
+uint64 intrinsic_samples

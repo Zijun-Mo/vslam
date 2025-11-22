@@ -4038,10 +4038,11 @@ vector<MapPoint*> Tracking::GetLocalMapMPS()
 void Tracking::ChangeCalibration(const string &strSettingPath)
 {
     cv::FileStorage fSettings(strSettingPath, cv::FileStorage::READ);
-    float fx = fSettings["Camera.fx"];
-    float fy = fSettings["Camera.fy"];
-    float cx = fSettings["Camera.cx"];
-    float cy = fSettings["Camera.cy"];
+    // Support legacy keys with dots and fallback keys without dots (e.g., Camera_fx)
+    auto node_fx = fSettings["Camera.fx"]; if(node_fx.empty()) node_fx = fSettings["Camera_fx"]; float fx = node_fx.empty() ? 0.f : (float)node_fx;
+    auto node_fy = fSettings["Camera.fy"]; if(node_fy.empty()) node_fy = fSettings["Camera_fy"]; float fy = node_fy.empty() ? 0.f : (float)node_fy;
+    auto node_cx = fSettings["Camera.cx"]; if(node_cx.empty()) node_cx = fSettings["Camera_cx"]; float cx = node_cx.empty() ? 0.f : (float)node_cx;
+    auto node_cy = fSettings["Camera.cy"]; if(node_cy.empty()) node_cy = fSettings["Camera_cy"]; float cy = node_cy.empty() ? 0.f : (float)node_cy;
 
     mK_.setIdentity();
     mK_(0,0) = fx;
@@ -4057,11 +4058,11 @@ void Tracking::ChangeCalibration(const string &strSettingPath)
     K.copyTo(mK);
 
     cv::Mat DistCoef(4,1,CV_32F);
-    DistCoef.at<float>(0) = fSettings["Camera.k1"];
-    DistCoef.at<float>(1) = fSettings["Camera.k2"];
-    DistCoef.at<float>(2) = fSettings["Camera.p1"];
-    DistCoef.at<float>(3) = fSettings["Camera.p2"];
-    const float k3 = fSettings["Camera.k3"];
+    auto node_k1 = fSettings["Camera.k1"]; if(node_k1.empty()) node_k1 = fSettings["Camera_k1"]; DistCoef.at<float>(0) = node_k1.empty()?0.f:(float)node_k1;
+    auto node_k2 = fSettings["Camera.k2"]; if(node_k2.empty()) node_k2 = fSettings["Camera_k2"]; DistCoef.at<float>(1) = node_k2.empty()?0.f:(float)node_k2;
+    auto node_p1 = fSettings["Camera.p1"]; if(node_p1.empty()) node_p1 = fSettings["Camera_p1"]; DistCoef.at<float>(2) = node_p1.empty()?0.f:(float)node_p1;
+    auto node_p2 = fSettings["Camera.p2"]; if(node_p2.empty()) node_p2 = fSettings["Camera_p2"]; DistCoef.at<float>(3) = node_p2.empty()?0.f:(float)node_p2;
+    auto node_k3 = fSettings["Camera.k3"]; if(node_k3.empty()) node_k3 = fSettings["Camera_k3"]; const float k3 = node_k3.empty()?0.f:(float)node_k3;
     if(k3!=0)
     {
         DistCoef.resize(5);
@@ -4069,9 +4070,30 @@ void Tracking::ChangeCalibration(const string &strSettingPath)
     }
     DistCoef.copyTo(mDistCoef);
 
-    mbf = fSettings["Camera.bf"];
+    auto node_bf = fSettings["Camera.bf"]; if(node_bf.empty()) node_bf = fSettings["Camera_bf"]; mbf = node_bf.empty()?mbf:(float)node_bf;
+
+    // Sync mpCamera parameters if it's a Pinhole camera using public setParameter method
+    if(mpCamera && mpCamera->GetType() == GeometricCamera::CAM_PINHOLE)
+    {
+        // Update parameters: [fx, fy, cx, cy]
+        if(mpCamera->size() >= 4)
+        {
+            mpCamera->setParameter(fx, 0);
+            mpCamera->setParameter(fy, 1);
+            mpCamera->setParameter(cx, 2);
+            mpCamera->setParameter(cy, 3);
+        }
+    }
 
     Frame::mbInitialComputations = true;
+}
+
+void Tracking::GetCurrentIntrinsics(float &fx, float &fy, float &cx, float &cy) const
+{
+    fx = mK_(0,0);
+    fy = mK_(1,1);
+    cx = mK_(0,2);
+    cy = mK_(1,2);
 }
 
 void Tracking::InformOnlyTracking(const bool &flag)

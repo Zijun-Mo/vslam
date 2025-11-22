@@ -33,6 +33,13 @@ def generate_launch_description():
         default_value=use_video_default,
         description='Launch video_reader node'
     )
+    
+    # Optional camera intrinsics override file
+    camera_intrinsics_file = PathJoinSubstitution([
+        FindPackageShare('vslam_bringup'),
+        'config',
+        'camera_intrinsics_override.yaml'
+    ])
 
     # Get the path to the config file
     config_file = PathJoinSubstitution([
@@ -55,7 +62,7 @@ def generate_launch_description():
                 package='orb_slam3_vggt_frontend',
                 plugin='orb_slam3_vggt_frontend::VggtFrontendNode',
                 name='vggt_frontend_node',
-                parameters=[config_file],
+                parameters=[config_file, camera_intrinsics_file],
                 remappings=[
                     ('/camera/image_raw', '/camera/image_raw'),
                     ('/vggt/output', '/vggt/output')
@@ -78,7 +85,7 @@ def generate_launch_description():
         executable='vggt_node',
         name='vggt_node',
         output='screen',
-        parameters=[config_file]
+        parameters=[config_file, camera_intrinsics_file]
     )
     
     delayed_vggt_node = TimerAction(
