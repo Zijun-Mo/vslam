@@ -314,6 +314,8 @@ void Viewer::Run()
             mpMapDrawer->DrawKeyFrames(menuShowKeyFrames,menuShowGraph, menuShowInertialGraph, menuShowOptLba);
         if(menuShowPoints)
             mpMapDrawer->DrawMapPoints();
+        // Draw stored non-keyframe trajectory points (does not affect map points)
+        mpMapDrawer->DrawFrameTrajectory();
 
         // Draw world frame
         pangolin::glDrawAxis(10.0);

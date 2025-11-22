@@ -50,6 +50,12 @@ public:
     void SetReferenceKeyFrame(KeyFrame *pKF);
     void GetCurrentOpenGLCameraMatrix(pangolin::OpenGlMatrix &M, pangolin::OpenGlMatrix &MOw);
 
+    // Add a non-keyframe (or keyframe) pose marker to be visualized as trajectory points.
+    // If isKeyFrame is true we can choose to draw with a different color.
+    void AddFramePose(const Sophus::SE3f &Tcw, bool isKeyFrame);
+    void DrawFrameTrajectory();
+    void ClearFrameTrajectory();
+
 private:
 
     bool ParseViewerParamFile(cv::FileStorage &fSettings);
@@ -64,6 +70,11 @@ private:
     Sophus::SE3f mCameraPose;
 
     std::mutex mMutexCamera;
+
+    // Stored trajectory poses for non-keyframes (and optionally keyframes) in world coordinates Twc
+    std::vector<Sophus::SE3f, Eigen::aligned_allocator<Sophus::SE3f>> mFrameTrajectory;
+    std::vector<bool> mFrameIsKeyFrame; // parallel array marking keyframes
+    std::mutex mMutexTrajectory;
 
     float mfFrameColors[6][3] = {{0.0f, 0.0f, 1.0f},
                                 {0.8f, 0.4f, 1.0f},

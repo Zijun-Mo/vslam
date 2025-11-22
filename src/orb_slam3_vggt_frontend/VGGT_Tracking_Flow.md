@@ -47,8 +47,7 @@
 - **条件**：不再简单依赖匹配点计数，而是将图像划分为 `20×15`（共 300）个小区域；只要某区域内有效 Track ID 的 20% 以上成功匹配、且该区域累计采样点不少于 8，就视为“有效区域”。当满足 `max(30, 10%×总区域数)` 个有效区域时才继续优化。
 - **操作**：
   - 若没有 VGGT 先验，则使用常规速度模型 `mVelocity * mLastFrame.GetPose()` 为初始位姿。
-  - 调用 `Optimizer::PoseOptimization(&mCurrentFrame)`，基于匹配到的 `MapPoint` 最小化重投影误差。
-  - 清除外点并统计 `nInliers`；若 inlier 数少于 10，则认为跟踪失败。
+  - 将所有的点作为内点。
 - **结果**：得到经过优化的 `mCurrentFrame.mTcw`，同时 `mCurrentFrame.mvpMapPoints`、`mvbOutlier` 标识哪些匹配可信。区域覆盖判定能避免所有匹配集中在极小图像区域导致的退化。
 
 ## 7. 更新局部地图（成功时）

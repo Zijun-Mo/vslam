@@ -193,6 +193,61 @@ void MapDrawer::DrawMapPoints()
     glEnd();
 }
 
+void MapDrawer::AddFramePose(const Sophus::SE3f &Tcw, bool isKeyFrame)
+{
+    // Store Twc (world pose) for drawing; limit size to avoid unbounded growth
+    std::lock_guard<std::mutex> lock(mMutexTrajectory);
+    const size_t kMaxStored = 20000; // configurable cap
+    mFrameTrajectory.push_back(Tcw.inverse());
+    mFrameIsKeyFrame.push_back(isKeyFrame);
+    if(mFrameTrajectory.size() > kMaxStored)
+    {
+        // Drop oldest block (simple strategy)
+        mFrameTrajectory.erase(mFrameTrajectory.begin(), mFrameTrajectory.begin()+ (mFrameTrajectory.size()/10));
+        mFrameIsKeyFrame.erase(mFrameIsKeyFrame.begin(), mFrameIsKeyFrame.begin()+ (mFrameIsKeyFrame.size()/10));
+    }
+}
+
+void MapDrawer::ClearFrameTrajectory()
+{
+    std::lock_guard<std::mutex> lock(mMutexTrajectory);
+    mFrameTrajectory.clear();
+    mFrameIsKeyFrame.clear();
+}
+
+void MapDrawer::DrawFrameTrajectory()
+{
+    std::lock_guard<std::mutex> lock(mMutexTrajectory);
+    if(mFrameTrajectory.empty()) return;
+
+    // Draw as small points and a polyline: non-keyframes in light gray, keyframes (if stored) in cyan.
+    glPointSize(std::max(1.0f, mPointSize * 0.5f));
+    glBegin(GL_POINTS);
+    for(size_t i=0; i<mFrameTrajectory.size(); ++i)
+    {
+        const Sophus::SE3f &Twc = mFrameTrajectory[i];
+        Eigen::Vector3f t = Twc.translation();
+        if(mFrameIsKeyFrame[i])
+            glColor3f(0.0f, 0.8f, 0.8f); // keyframe color (different from KF boxes)
+        else
+            glColor3f(0.5f, 0.5f, 0.5f); // non-keyframe
+        glVertex3f(t.x(), t.y(), t.z());
+    }
+    glEnd();
+
+    // Polyline of trajectory
+    glLineWidth(1.0f);
+    glBegin(GL_LINE_STRIP);
+    glColor3f(0.3f,0.3f,0.3f);
+    for(size_t i=0; i<mFrameTrajectory.size(); ++i)
+    {
+        const Sophus::SE3f &Twc = mFrameTrajectory[i];
+        Eigen::Vector3f t = Twc.translation();
+        glVertex3f(t.x(), t.y(), t.z());
+    }
+    glEnd();
+}
+
 void MapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const bool bDrawInertialGraph, const bool bDrawOptLba)
 {
     const float &w = mKeyFrameSize;

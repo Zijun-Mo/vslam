@@ -2745,6 +2745,9 @@ void Tracking::CreateInitialMapMonocular()
     mpAtlas->SetReferenceMapPoints(mvpLocalMapPoints);
 
     mpMapDrawer->SetCurrentCameraPose(pKFcur->GetPose());
+    // Store initialization keyframe pose in trajectory (marked as keyframe)
+    if(mpMapDrawer)
+        mpMapDrawer->AddFramePose(pKFcur->GetPose(), true);
 
     mpAtlas->GetCurrentMap()->mvpKeyFrameOrigins.push_back(pKFini);
 
@@ -4445,7 +4448,12 @@ void Tracking::TrackVGGT()
     // Update Drawers
     mpFrameDrawer->Update(this);
     if(mCurrentFrame.isSet())
+    {
         mpMapDrawer->SetCurrentCameraPose(mCurrentFrame.GetPose());
+        // Record non-keyframe poses only (do not duplicate keyframes). This adds localization markers without modifying point cloud.
+        if(mpMapDrawer && mCurrentFrame.mnId != mnLastKeyFrameId)
+            mpMapDrawer->AddFramePose(mCurrentFrame.GetPose(), false);
+    }
 }
 
 int Tracking::MatchByTrackIds()
@@ -4627,18 +4635,14 @@ void Tracking::MonocularInitializationVGGT()
 bool Tracking::NeedNewKeyFrameVGGT()
 {
     // Check LocalMapper state
-    if (mpLocalMapper->isStopped() || mpLocalMapper->stopRequested())
-        std::cerr << "[VGGT] LocalMapper is stopped or stop requested." << std::endl;
     if(mpLocalMapper->isStopped() || mpLocalMapper->stopRequested())
         return false;
     
     // Require minimum frame gap from last KF
-    std::cerr << "[VGGT] Checking if new KeyFrame is needed. Last KF ID: " << (mpLastKeyFrame ? std::to_string(mpLastKeyFrame->mnId) : "None") << std::endl;
     if(!mpLastKeyFrame)
         return mCurrentFrame.N > 100;
     
     const int frames_since_kf = mCurrentFrame.mnId - mnLastKeyFrameId;
-    std::cerr << "[VGGT] Frames since last KeyFrame: " << frames_since_kf << std::endl;
     if(frames_since_kf < 5)  // At least 5 frames between KFs
         return false;
     
@@ -4747,11 +4751,6 @@ bool Tracking::NeedNewKeyFrameVGGT()
 
 void Tracking::CreateNewKeyFrameVGGT()
 {
-    std::cerr << "[VGGT KF] Creating new KeyFrame from Frame: " << mCurrentFrame.mnId << std::endl;
-    std::cerr << "if local mapper can accept keyframes..." << std::endl;
-    std::cerr << "LocalMapper is stopped: " << mpLocalMapper->isStopped() << std::endl;
-    std::cerr << "Is Initializing: " << mpLocalMapper->IsInitializing() << std::endl;
-
     if(mpLocalMapper->IsInitializing() && !mpAtlas->isImuInitialized())
         return;
 
