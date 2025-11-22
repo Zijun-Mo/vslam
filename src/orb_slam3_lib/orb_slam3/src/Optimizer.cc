@@ -826,6 +826,11 @@ int Optimizer::PoseOptimization(Frame *pFrame)
     optimizer.setAlgorithm(solver);
 
     int nInitialCorrespondences=0;
+    int edgesMonoAdded=0, edgesStereoAdded=0, edgesMonoBodyAdded=0;
+    std::cerr << "[PoseOpt Debug] FrameID=" << pFrame->mnId
+              << " N=" << pFrame->N
+              << " HasPose=" << pFrame->HasPose()
+              << " MapPointsSize=" << pFrame->mvpMapPoints.size() << std::endl;
 
     // Set Frame vertex
     g2o::VertexSE3Expmap * vSE3 = new g2o::VertexSE3Expmap();
@@ -834,6 +839,7 @@ int Optimizer::PoseOptimization(Frame *pFrame)
     vSE3->setId(0);
     vSE3->setFixed(false);
     optimizer.addVertex(vSE3);
+    std::cerr << "[PoseOpt Debug] After adding pose vertex: vertices=" << optimizer.vertices().size() << std::endl;
 
     // Set MapPoint vertices
     const int N = pFrame->N;
@@ -862,6 +868,10 @@ int Optimizer::PoseOptimization(Frame *pFrame)
         MapPoint* pMP = pFrame->mvpMapPoints[i];
         if(pMP)
         {
+            if(i < 3) {
+                Eigen::Vector3f wp = pMP->GetWorldPos();
+                std::cerr << "[PoseOpt Debug] MP[" << i << "] WorldPos=" << wp.transpose() << " isBad=" << pMP->isBad() << std::endl;
+            }
             //Conventional SLAM
             if(!pFrame->mpCamera2){
                 // Monocular observation
@@ -892,6 +902,7 @@ int Optimizer::PoseOptimization(Frame *pFrame)
 
                     vpEdgesMono.push_back(e);
                     vnIndexEdgeMono.push_back(i);
+                    edgesMonoAdded++;
                 }
                 else  // Stereo observation
                 {
@@ -926,6 +937,7 @@ int Optimizer::PoseOptimization(Frame *pFrame)
 
                     vpEdgesStereo.push_back(e);
                     vnIndexEdgeStereo.push_back(i);
+                    edgesStereoAdded++;
                 }
             }
             //SLAM with respect a rigid body
@@ -960,6 +972,7 @@ int Optimizer::PoseOptimization(Frame *pFrame)
 
                     vpEdgesMono.push_back(e);
                     vnIndexEdgeMono.push_back(i);
+                    edgesMonoAdded++;
                 }
                 else {
                     kpUn = pFrame->mvKeysRight[i - pFrame->Nleft];
@@ -989,14 +1002,49 @@ int Optimizer::PoseOptimization(Frame *pFrame)
 
                     vpEdgesMono_FHR.push_back(e);
                     vnIndexEdgeRight.push_back(i);
+                    edgesMonoBodyAdded++;
                 }
             }
+        }
+        else if(i < 3) {
+            std::cerr << "[PoseOpt Debug] MP[" << i << "] is NULL" << std::endl;
         }
     }
     }
 
-    if(nInitialCorrespondences<3)
+    std::cerr << "[PoseOpt Debug] Build edges summary: initialCorr=" << nInitialCorrespondences
+              << " monoEdges=" << edgesMonoAdded
+              << " stereoEdges=" << edgesStereoAdded
+              << " bodyEdges=" << edgesMonoBodyAdded
+              << " totalEdges=" << optimizer.edges().size() << std::endl;
+
+    // 精简调试：仅打印前2个单目投影残差
+    int samplePrint = 0;
+    if(!vnIndexEdgeMono.empty()) {
+        Sophus::SE3f Tcw_dbg = pFrame->GetPose();
+        Eigen::Matrix3f Rcw_dbg = Tcw_dbg.rotationMatrix();
+        Eigen::Vector3f tcw_dbg = Tcw_dbg.translation();
+        for(size_t si=0; si<vnIndexEdgeMono.size() && samplePrint<2; ++si) {
+            size_t idx = vnIndexEdgeMono[si];
+            MapPoint* pMP = pFrame->mvpMapPoints[idx];
+            if(!pMP) continue;
+            const cv::KeyPoint &kpUn = pFrame->mvKeysUn[idx];
+            Eigen::Vector3f Pw = pMP->GetWorldPos();
+            Eigen::Vector3f Pc = Rcw_dbg * Pw + tcw_dbg;
+            if(Pc(2) <= 0) { std::cerr << "[PoseOpt Debug] Residual idx=" << idx << " negDepth=" << Pc(2) << std::endl; samplePrint++; continue; }
+            Eigen::Vector2f uv = pFrame->mpCamera->project(Pc);
+            float errx = kpUn.pt.x - uv(0);
+            float erry = kpUn.pt.y - uv(1);
+            std::cerr << "[PoseOpt Debug] Residual idx=" << idx
+                      << " meas(" << kpUn.pt.x << "," << kpUn.pt.y << ") pred(" << uv(0) << "," << uv(1) << ")"
+                      << " err(" << errx << "," << erry << ")" << std::endl;
+            samplePrint++;
+        }
+    }
+    if(nInitialCorrespondences<3) {
+        std::cerr << "[PoseOpt Debug] Early exit: nInitialCorrespondences=" << nInitialCorrespondences << std::endl;
         return 0;
+    }
 
     // We perform 4 optimizations, after each optimization we classify observation as inlier/outlier
     // At the next optimization, outliers are not included, but at the end they can be classified as inliers again.
@@ -1010,8 +1058,15 @@ int Optimizer::PoseOptimization(Frame *pFrame)
         Tcw = pFrame->GetPose();
         vSE3->setEstimate(g2o::SE3Quat(Tcw.unit_quaternion().cast<double>(),Tcw.translation().cast<double>()));
 
+        std::cerr << "[PoseOpt Debug] Iter=" << it << " pre-init vertices=" << optimizer.vertices().size()
+                  << " edges=" << optimizer.edges().size() << std::endl;
         optimizer.initializeOptimization(0);
+        if(optimizer.vertices().size()==0) {
+            std::cerr << "[PoseOpt Debug] WARNING: no vertices before optimize" << std::endl;
+        }
         optimizer.optimize(its[it]);
+        std::cerr << "[PoseOpt Debug] Iter=" << it << " post-opt vertices=" << optimizer.vertices().size()
+                  << " edges=" << optimizer.edges().size() << std::endl;
 
         nBad=0;
         for(size_t i=0, iend=vpEdgesMono.size(); i<iend; i++)
@@ -1103,6 +1158,17 @@ int Optimizer::PoseOptimization(Frame *pFrame)
 
         if(optimizer.edges().size()<10)
             break;
+
+        // 精简迭代统计：仅输出活动(等级0)与外点数量
+        int level0=0, level1=0;
+        for(auto *e : vpEdgesMono) { if(e->level()==0) level0++; else level1++; }
+        for(auto *e : vpEdgesStereo) { if(e->level()==0) level0++; else level1++; }
+        for(auto *e : vpEdgesMono_FHR) { if(e->level()==0) level0++; else level1++; }
+        int totalEdges = vpEdgesMono.size() + vpEdgesStereo.size() + vpEdgesMono_FHR.size();
+        std::cerr << "[PoseOpt Debug] Iter=" << it << " active=" << level0 << " outliers=" << level1 << " total=" << totalEdges << std::endl;
+        if(level0==0) {
+            std::cerr << "[PoseOpt Debug] WARNING: all edges outliers; subsequent iterations will have no effect." << std::endl;
+        }
     }    
 
     // Recover optimized pose and return number of inliers

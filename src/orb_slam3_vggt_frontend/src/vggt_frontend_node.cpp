@@ -182,14 +182,25 @@ private:
         std::vector<cv::KeyPoint> vKeys;
         std::vector<long> vTrackIds;
         std::vector<cv::Point3f> v3DPoints;
+        std::vector<cv::Vec3b> vTrackColors;
 
         vKeys.reserve(N);
         vTrackIds.reserve(N);
         v3DPoints.reserve(N);
+        vTrackColors.reserve(N);
 
         const bool consecutive_frame = has_prev_global_tracks_ &&
             (vggt_msg->vggt_frame_id == last_vggt_frame_id_ + 1);
         std::vector<int64_t> current_global_ids(N, -1);
+
+        const auto &color_layout = vggt_msg->tracks_colors.layout.dim;
+        const auto &color_data = vggt_msg->tracks_colors.data;
+        const bool has_color = color_layout.size() >= 3 &&
+                       static_cast<int>(color_layout[0].size) >= (frame_idx + 1) &&
+                       static_cast<int>(color_layout[1].size) == N &&
+                       static_cast<int>(color_layout[2].size) >= 3 &&
+                               color_data.size() >= static_cast<size_t>(S) * static_cast<size_t>(N) * 3;
+        const size_t color_offset = has_color ? static_cast<size_t>(frame_idx) * static_cast<size_t>(N) * 3 : 0;
 
         for(int i=0; i<N; ++i) {
             if(mask_data[mask_offset + i] > 0.5) { // Valid
@@ -235,6 +246,20 @@ private:
 
                 vTrackIds.push_back(static_cast<long>(global_id));
                 v3DPoints.push_back(cv::Point3f(x, y, z));
+
+                cv::Vec3b track_color(255, 255, 255);
+                if(has_color)
+                {
+                    const size_t idx = color_offset + static_cast<size_t>(i) * 3;
+                    if(idx + 2 < color_data.size())
+                    {
+                        // VGGT outputs RGB, cv::Vec3b expects BGR
+                        track_color[0] = color_data[idx + 2]; // B <- R
+                        track_color[1] = color_data[idx + 1]; // G <- G
+                        track_color[2] = color_data[idx + 0]; // R <- B
+                    }
+                }
+                vTrackColors.push_back(track_color);
             }
         }
 
@@ -255,7 +280,7 @@ private:
         has_prev_pose_window_ = current_window.valid();
 
         // 3. Call System
-        mpSystem->TrackVGGT(cv_ptr->image, timestamp, vKeys, vTrackIds, v3DPoints, delta_pose);
+        mpSystem->TrackVGGT(cv_ptr->image, timestamp, vKeys, vTrackIds, v3DPoints, vTrackColors, delta_pose);
     }
 
     ORB_SLAM3::System* mpSystem = nullptr;

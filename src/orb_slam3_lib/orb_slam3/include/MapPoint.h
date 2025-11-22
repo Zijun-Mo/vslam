@@ -91,6 +91,10 @@ class MapPoint
         ar & mBackupObservationsId2;
         serializeMatrix(ar,mDescriptor,version);
         ar & mBackupRefKFId;
+        ar & mColor[0];
+        ar & mColor[1];
+        ar & mColor[2];
+        ar & mbHasColor;
         //ar & mnVisible;
         //ar & mnFound;
 
@@ -157,6 +161,10 @@ public:
 
     void PrintObservations();
 
+    void SetColor(const cv::Vec3b &color);
+    cv::Vec3b GetColor();
+    bool HasColor();
+
     void PreSave(set<KeyFrame*>& spKF,set<MapPoint*>& spMP);
     void PostLoad(map<long unsigned int, KeyFrame*>& mpKFid, map<long unsigned int, MapPoint*>& mpMPid);
 
@@ -221,16 +229,20 @@ protected:
      // Mean viewing direction
      Eigen::Vector3f mNormalVector;
 
-     // Best descriptor to fast matching
-     cv::Mat mDescriptor;
+    // Best descriptor to fast matching
+    cv::Mat mDescriptor;
 
-     // Reference KeyFrame
-     KeyFrame* mpRefKF;
-     long unsigned int mBackupRefKFId;
+    // Reference KeyFrame
+    KeyFrame* mpRefKF;
+    long unsigned int mBackupRefKFId;
 
-     // Tracking counters
-     int mnVisible;
-     int mnFound;
+    // Tracking counters
+    int mnVisible;
+    int mnFound;
+
+    // Optional RGB color used for visualization
+    cv::Vec3b mColor;
+    bool mbHasColor;
 
      // Bad flag (we do not currently erase MapPoint from memory)
      bool mbBad;

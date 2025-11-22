@@ -2,7 +2,7 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image, PointCloud, ChannelFloat32
 from geometry_msgs.msg import PoseArray, Pose, Point32
-from std_msgs.msg import Header, Float32MultiArray, MultiArrayDimension
+from std_msgs.msg import Header, Float32MultiArray, MultiArrayDimension, UInt8MultiArray
 from vslam_msgs.msg import VggtOutput
 from cv_bridge import CvBridge
 import numpy as np
@@ -351,6 +351,15 @@ class VGGTNode(Node):
         
         mask_msg.data = tracks_mask.flatten().astype(float).tolist()
         output_msg.tracks_mask = mask_msg
+
+        color_tensor = self.sample_track_colors(current_images, transforms, query_grid_width, query_grid_height, query_stride)
+        color_msg = UInt8MultiArray()
+        dim_s_color = MultiArrayDimension(label="S", size=color_tensor.shape[0], stride=color_tensor.shape[0] * color_tensor.shape[1] * 3)
+        dim_n_color = MultiArrayDimension(label="N", size=color_tensor.shape[1], stride=color_tensor.shape[1] * 3)
+        dim_c_color = MultiArrayDimension(label="C", size=3, stride=3)
+        color_msg.layout.dim = [dim_s_color, dim_n_color, dim_c_color]
+        color_msg.data = color_tensor.flatten().tolist()
+        output_msg.tracks_colors = color_msg
         
         # Set query grid dimensions
         output_msg.query_grid_width = query_grid_width
@@ -406,6 +415,46 @@ class VGGTNode(Node):
         y = torch.linspace(margin, H - 1 - margin, num_y, device=self.device)
         grid_y, grid_x = torch.meshgrid(y, x, indexing='ij')
         return torch.stack([grid_x.flatten(), grid_y.flatten()], dim=1)
+
+    def sample_track_colors(self, current_images, transforms, query_grid_width, query_grid_height, query_stride):
+        if not current_images:
+            return np.zeros((0, 0, 3), dtype=np.uint8)
+
+        S = len(current_images)
+        N = query_grid_width * query_grid_height
+        colors = np.zeros((S, N, 3), dtype=np.uint8)
+
+        for s in range(S):
+            img = current_images[s]
+            if img.size == 0:
+                continue
+            img_h, img_w = img.shape[:2]
+            tf = transforms[s] if s < len(transforms) else {}
+            scale_x = tf.get('scale_x', 1.0)
+            scale_y = tf.get('scale_y', 1.0)
+            pad_left = tf.get('pad_left', 0)
+            pad_top = tf.get('pad_top', 0)
+            start_y = tf.get('start_y', 0)
+
+            for idx in range(N):
+                grid_x = (idx % query_grid_width) * query_stride
+                grid_y = (idx // query_grid_width) * query_stride
+
+                proc_x = grid_x
+                proc_y = grid_y
+
+                unpadded_x = max(0.0, proc_x - pad_left)
+                unpadded_y = max(0.0, proc_y - pad_top)
+                cropped_y = unpadded_y + start_y
+
+                orig_x = unpadded_x / max(scale_x, 1e-6)
+                orig_y = cropped_y / max(scale_y, 1e-6)
+
+                u = int(np.clip(round(orig_x), 0, img_w - 1))
+                v = int(np.clip(round(orig_y), 0, img_h - 1))
+                colors[s, idx] = img[v, u]
+
+        return colors
 
 def main(args=None):
     rclpy.init(args=args)

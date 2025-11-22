@@ -154,6 +154,15 @@ void MapDrawer::DrawMapPoints()
     {
         if(vpMPs[i]->isBad() || spRefMPs.count(vpMPs[i]))
             continue;
+        if(vpMPs[i]->HasColor())
+        {
+            const cv::Vec3b color = vpMPs[i]->GetColor();
+            glColor3f(color[2] / 255.f, color[1] / 255.f, color[0] / 255.f);
+        }
+        else
+        {
+            glColor3f(0.2f, 0.2f, 0.2f);
+        }
         Eigen::Matrix<float,3,1> pos = vpMPs[i]->GetWorldPos();
         glVertex3f(pos(0),pos(1),pos(2));
     }
@@ -167,6 +176,15 @@ void MapDrawer::DrawMapPoints()
     {
         if((*sit)->isBad())
             continue;
+        if((*sit)->HasColor())
+        {
+            const cv::Vec3b color = (*sit)->GetColor();
+            glColor3f(color[2] / 255.f, color[1] / 255.f, color[0] / 255.f);
+        }
+        else
+        {
+            glColor3f(1.0f, 0.0f, 0.0f);
+        }
         Eigen::Matrix<float,3,1> pos = (*sit)->GetWorldPos();
         glVertex3f(pos(0),pos(1),pos(2));
 

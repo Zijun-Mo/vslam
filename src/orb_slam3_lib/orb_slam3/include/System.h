@@ -129,6 +129,7 @@ public:
                            const std::vector<cv::KeyPoint> &vKeys, 
                            const std::vector<long> &vTrackIds,
                            const std::vector<cv::Point3f> &v3DPoints,
+                           const std::vector<cv::Vec3b> &vTrackColors,
                            const cv::Mat &T_delta,
                            string filename="");
 

@@ -29,6 +29,8 @@
 
 #include <mutex>
 #include <functional>
+#include <vector>
+#include <cstddef>
 
 
 namespace ORB_SLAM3
@@ -145,6 +147,10 @@ protected:
     void MapPointCulling();
     void SearchInNeighbors();
     void KeyFrameCulling();
+    void MaybeDownsampleMap();
+    void DownsampleMapPoints();
+    float ComputeAdaptiveVoxelSize();
+    MapPoint* SelectRepresentative(const std::vector<MapPoint*>& group) const;
 
     System *mpSystem;
 
@@ -185,6 +191,14 @@ protected:
 
     bool mbAcceptKeyFrames;
     std::mutex mMutexAccept;
+
+    bool mbEnableVoxelDownsample;
+    std::size_t mMapPointThreshold;
+    float mDownsampleVoxelScale;
+    float mfMinVoxelSize;
+    float mfMaxVoxelSize;
+    float mfDownsampleGrowthRatio;
+    std::size_t mLastDownsampleCount;
 
     void InitializeIMU(float priorG = 1e2, float priorA = 1e6, bool bFirst = false);
     void ScaleRefinement();

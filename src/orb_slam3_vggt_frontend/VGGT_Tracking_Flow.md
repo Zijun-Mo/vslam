@@ -12,7 +12,7 @@
     - `std::vector<cv::Point3f> v3DPoints`（VGGT 在该像素估计的 3D 点，处于世界系）
   - 借助 `vggt_frame_id` 维护一个全局 Track ID 映射：当窗口顺序连续时，沿用上一帧的 ID；否则为新的采样点分配自增 ID，使 `MatchByTrackIds()` 可以跨窗口稳定位图点。
   - 基于 `camera_poses` 构建 `PoseWindow`，调用 `ComputePoseDelta` 得到 `delta_pose`（`cv::Mat` 4x4，同步窗口最新帧相对于上一窗口最新帧的 SE(3) 变换）。
-- **输出对象**：调用 `mpSystem->TrackVGGT(...)`，传入 `vKeys / vTrackIds / v3DPoints / delta_pose`，这些数据承载了当前帧与上一帧之间的像素-Track 对应以及 VGGT 估计的相对位姿。
+- **输出对象**：调用 `mpSystem->TrackVGGT(...)`，传入 `vKeys / vTrackIds / v3DPoints / vTrackColors / delta_pose`，这些数据承载了当前帧与上一帧之间的像素-Track 对应、颜色信息以及 VGGT 估计的相对位姿。
 
 ## 2. Tracking 入口 `Tracking::GrabImageVGGT`
 - **对象**：`mImGray`（灰度图）、`mCurrentFrame`（ORB-SLAM3 Frame）。

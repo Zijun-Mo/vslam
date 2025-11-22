@@ -4250,6 +4250,7 @@ Sophus::SE3f Tracking::GrabImageVGGT(const cv::Mat &im, const double &timestamp,
                                      const std::vector<cv::KeyPoint> &vKeys, 
                                      const std::vector<long> &vTrackIds,
                                      const std::vector<cv::Point3f> &v3DPoints,
+                                     const std::vector<cv::Vec3b> &vTrackColors,
                                      const cv::Mat &T_delta,
                                      string filename)
 {
@@ -4274,9 +4275,9 @@ Sophus::SE3f Tracking::GrabImageVGGT(const cv::Mat &im, const double &timestamp,
 
     // Create Frame with VGGT data
     if(mState==NOT_INITIALIZED || mState==NO_IMAGES_YET ||(lastID - initID) < mMaxFrames)
-        mCurrentFrame = Frame(mImGray, timestamp, vKeys, vTrackIds, v3DPoints, mpIniORBextractor, mpORBVocabulary, mpCamera, mDistCoef, mbf, mThDepth);
+        mCurrentFrame = Frame(mImGray, timestamp, vKeys, vTrackIds, v3DPoints, vTrackColors, mpIniORBextractor, mpORBVocabulary, mpCamera, mDistCoef, mbf, mThDepth);
     else
-        mCurrentFrame = Frame(mImGray, timestamp, vKeys, vTrackIds, v3DPoints, mpORBextractorLeft, mpORBVocabulary, mpCamera, mDistCoef, mbf, mThDepth);
+        mCurrentFrame = Frame(mImGray, timestamp, vKeys, vTrackIds, v3DPoints, vTrackColors, mpORBextractorLeft, mpORBVocabulary, mpCamera, mDistCoef, mbf, mThDepth);
 
     if (mState==NO_IMAGES_YET)
         t0=timestamp;
@@ -4331,6 +4332,9 @@ void Tracking::TrackVGGT()
         {
             mnFirstFrameId = mCurrentFrame.mnId;
         }
+        // 初始化成功后也要设置 mLastFrame，供下一帧 MatchByTrackIds 使用
+        mLastFrame = Frame(mCurrentFrame);
+        return;
     }
     else
     {
@@ -4374,19 +4378,20 @@ void Tracking::TrackVGGT()
         // If we have enough matches, optimize pose
         if(nEffectiveRegions > requiredRegions)
         {
-            // Optimize
-            // std::cout << "[DEBUG] TrackVGGT: Optimizing Pose..." << std::endl;
-            Optimizer::PoseOptimization(&mCurrentFrame);
-            // std::cout << "[DEBUG] TrackVGGT: Optimization done." << std::endl;
-
-            // Discard outliers
+            // 统计并同步内点，保持与常规跟踪路径一致
             int nInliers = 0;
             for(int i=0; i<mCurrentFrame.N; i++)
             {
-                if(mCurrentFrame.mvpMapPoints[i] && !mCurrentFrame.mvbOutlier[i])
+                if(mCurrentFrame.mvpMapPoints[i])
+                {
                     nInliers++;
+                    // 与主流程一致：成功跟踪的地图点增加 found 计数
+                    mCurrentFrame.mvpMapPoints[i]->IncreaseFound();
+                }
             }
-
+            mnMatchesInliers = nInliers;
+            if(mpLocalMapper)
+                mpLocalMapper->mnMatchesInliers = mnMatchesInliers;
             if(nInliers < 10)
                 bOK = false;
         }
@@ -4400,7 +4405,6 @@ void Tracking::TrackVGGT()
         {
             UpdateLocalMap();
         }
-
         // 4. KeyFrame Decision
         if(bOK && NeedNewKeyFrameVGGT())
         {
@@ -4589,6 +4593,10 @@ void Tracking::MonocularInitializationVGGT()
             }
             
             MapPoint* pMP = new MapPoint(x3D, pKFini, mpAtlas->GetCurrentMap());
+            if(i < static_cast<int>(mCurrentFrame.mvVGGTTrackColors.size()))
+            {
+                pMP->SetColor(mCurrentFrame.mvVGGTTrackColors[i]);
+            }
             pMP->AddObservation(pKFini, i);
             pKFini->AddMapPoint(pMP, i);
             pMP->ComputeDistinctiveDescriptors();
@@ -4619,14 +4627,18 @@ void Tracking::MonocularInitializationVGGT()
 bool Tracking::NeedNewKeyFrameVGGT()
 {
     // Check LocalMapper state
+    if (mpLocalMapper->isStopped() || mpLocalMapper->stopRequested())
+        std::cerr << "[VGGT] LocalMapper is stopped or stop requested." << std::endl;
     if(mpLocalMapper->isStopped() || mpLocalMapper->stopRequested())
         return false;
     
     // Require minimum frame gap from last KF
+    std::cerr << "[VGGT] Checking if new KeyFrame is needed. Last KF ID: " << (mpLastKeyFrame ? std::to_string(mpLastKeyFrame->mnId) : "None") << std::endl;
     if(!mpLastKeyFrame)
         return mCurrentFrame.N > 100;
     
     const int frames_since_kf = mCurrentFrame.mnId - mnLastKeyFrameId;
+    std::cerr << "[VGGT] Frames since last KeyFrame: " << frames_since_kf << std::endl;
     if(frames_since_kf < 5)  // At least 5 frames between KFs
         return false;
     
@@ -4735,6 +4747,11 @@ bool Tracking::NeedNewKeyFrameVGGT()
 
 void Tracking::CreateNewKeyFrameVGGT()
 {
+    std::cerr << "[VGGT KF] Creating new KeyFrame from Frame: " << mCurrentFrame.mnId << std::endl;
+    std::cerr << "if local mapper can accept keyframes..." << std::endl;
+    std::cerr << "LocalMapper is stopped: " << mpLocalMapper->isStopped() << std::endl;
+    std::cerr << "Is Initializing: " << mpLocalMapper->IsInitializing() << std::endl;
+
     if(mpLocalMapper->IsInitializing() && !mpAtlas->isImuInitialized())
         return;
 
@@ -4775,6 +4792,10 @@ void Tracking::CreateNewKeyFrameVGGT()
 
         Eigen::Vector3f x3D(p3d.x, p3d.y, p3d.z);
         MapPoint* pNewMP = new MapPoint(x3D, pKF, mpAtlas->GetCurrentMap());
+        if(i < static_cast<int>(mCurrentFrame.mvVGGTTrackColors.size()))
+        {
+            pNewMP->SetColor(mCurrentFrame.mvVGGTTrackColors[i]);
+        }
         pNewMP->AddObservation(pKF, i);
         pKF->AddMapPoint(pNewMP, i);
         pNewMP->ComputeDistinctiveDescriptors();

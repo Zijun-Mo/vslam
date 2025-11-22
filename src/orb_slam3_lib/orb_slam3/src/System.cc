@@ -1633,6 +1633,7 @@ Sophus::SE3f System::TrackVGGT(const cv::Mat &im, const double &timestamp,
                                const std::vector<cv::KeyPoint> &vKeys, 
                                const std::vector<long> &vTrackIds,
                                const std::vector<cv::Point3f> &v3DPoints,
+                               const std::vector<cv::Vec3b> &vTrackColors,
                                const cv::Mat &T_delta,
                                string filename)
 {
@@ -1683,7 +1684,7 @@ Sophus::SE3f System::TrackVGGT(const cv::Mat &im, const double &timestamp,
         }
     }
 
-    Sophus::SE3f Tcw = mpTracker->GrabImageVGGT(im, timestamp, vKeys, vTrackIds, v3DPoints, T_delta, filename);
+    Sophus::SE3f Tcw = mpTracker->GrabImageVGGT(im, timestamp, vKeys, vTrackIds, v3DPoints, vTrackColors, T_delta, filename);
 
     unique_lock<mutex> lock2(mMutexState);
     mTrackingState = mpTracker->mState;

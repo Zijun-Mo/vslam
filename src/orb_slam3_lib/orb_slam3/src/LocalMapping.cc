@@ -23,9 +23,14 @@
 #include "Optimizer.h"
 #include "Converter.h"
 #include "GeometricTools.h"
+#include "VoxelGridCUDA.h"
 
 #include<mutex>
 #include<chrono>
+#include<unordered_map>
+#include<limits>
+#include<cmath>
+#include<iostream>
 
 namespace ORB_SLAM3
 {
@@ -33,7 +38,9 @@ namespace ORB_SLAM3
 LocalMapping::LocalMapping(System* pSys, Atlas *pAtlas, const float bMonocular, bool bInertial, const string &_strSeqName):
     mpSystem(pSys), mbMonocular(bMonocular), mbInertial(bInertial), mbResetRequested(false), mbResetRequestedActiveMap(false), mbFinishRequested(false), mbFinished(true), mpAtlas(pAtlas), bInitializing(false),
     mbAbortBA(false), mbStopped(false), mbStopRequested(false), mbNotStop(false), mbAcceptKeyFrames(true),
-    mIdxInit(0), mScale(1.0), mInitSect(0), mbNotBA1(true), mbNotBA2(true), mIdxIteration(0), infoInertial(Eigen::MatrixXd::Zero(9,9))
+    mIdxInit(0), mScale(1.0), mInitSect(0), mbNotBA1(true), mbNotBA2(true), mIdxIteration(0), infoInertial(Eigen::MatrixXd::Zero(9,9)),
+    mbEnableVoxelDownsample(true), mMapPointThreshold(50000), mDownsampleVoxelScale(0.01f),
+    mfMinVoxelSize(0.01f), mfMaxVoxelSize(1.0f), mfDownsampleGrowthRatio(0.2f), mLastDownsampleCount(0)
 {
     mnMatchesInliers = 0;
 
@@ -106,6 +113,7 @@ void LocalMapping::Run()
             {
                 // Find more matches in neighbor keyframes and fuse point duplications
                 SearchInNeighbors();
+                MaybeDownsampleMap();
             }
 
 #ifdef REGISTER_TIMES
@@ -822,6 +830,209 @@ void LocalMapping::SearchInNeighbors()
     mpCurrentKeyFrame->UpdateConnections();
 }
 
+void LocalMapping::MaybeDownsampleMap()
+{
+    if(!mbEnableVoxelDownsample || !mpCurrentKeyFrame)
+        return;
+
+    Map* pMap = mpCurrentKeyFrame->GetMap();
+    if(!pMap || pMap->IsBad())
+        return;
+
+    const std::size_t point_count = static_cast<std::size_t>(pMap->MapPointsInMap());
+    if(point_count < mMapPointThreshold)
+        return;
+
+    if(mLastDownsampleCount > 0)
+    {
+        const float growth = static_cast<float>(point_count) /
+                             static_cast<float>(mLastDownsampleCount);
+        if(growth < (1.f + mfDownsampleGrowthRatio))
+            return;
+    }
+
+    DownsampleMapPoints();
+}
+
+void LocalMapping::DownsampleMapPoints()
+{
+    if(!mpCurrentKeyFrame)
+        return;
+
+    Map* pMap = mpCurrentKeyFrame->GetMap();
+    if(!pMap || pMap->IsBad())
+        return;
+
+    const float voxel_size = ComputeAdaptiveVoxelSize();
+    if(voxel_size <= 0.f || !std::isfinite(voxel_size))
+        return;
+
+    std::vector<MapPoint*> vpAllPoints = pMap->GetAllMapPoints();
+    std::vector<MapPoint*> vpValidPoints;
+    vpValidPoints.reserve(vpAllPoints.size());
+    for(MapPoint* pMP : vpAllPoints)
+    {
+        if(!pMP || pMP->isBad())
+            continue;
+        vpValidPoints.push_back(pMP);
+    }
+
+    if(vpValidPoints.size() < mMapPointThreshold)
+    {
+        mLastDownsampleCount = vpValidPoints.size();
+        return;
+    }
+
+    std::vector<Eigen::Vector3f> points;
+    std::vector<cv::Vec3b> colors;
+    points.reserve(vpValidPoints.size());
+    colors.reserve(vpValidPoints.size());
+    for(MapPoint* pMP : vpValidPoints)
+    {
+        points.push_back(pMP->GetWorldPos());
+        if(pMP->HasColor())
+            colors.push_back(pMP->GetColor());
+        else
+            colors.emplace_back(255, 255, 255);
+    }
+
+    std::vector<Eigen::Vector3f> out_points;
+    std::vector<cv::Vec3b> out_colors;
+    std::vector<uint64_t> out_keys;
+    Eigen::Vector3f min_bound = Eigen::Vector3f::Zero();
+    VoxelGridStats stats;
+
+    if(!VoxelGridDownsample(points, colors, voxel_size,
+                            out_points, out_colors, &out_keys,
+                            &min_bound, &stats))
+    {
+        mLastDownsampleCount = vpValidPoints.size();
+        return;
+    }
+
+    if(out_points.empty())
+    {
+        mLastDownsampleCount = vpValidPoints.size();
+        return;
+    }
+
+    const float inv_voxel = 1.0f / voxel_size;
+    const int bias = 1 << 20;
+    const int max_coord = (1 << 21) - 1;
+    const uint64_t mask = (1ull << 21) - 1ull;
+
+    auto compute_key = [&](const Eigen::Vector3f& pos) -> uint64_t
+    {
+        int ix = static_cast<int>(std::floor((pos.x() - min_bound.x()) * inv_voxel)) + bias;
+        int iy = static_cast<int>(std::floor((pos.y() - min_bound.y()) * inv_voxel)) + bias;
+        int iz = static_cast<int>(std::floor((pos.z() - min_bound.z()) * inv_voxel)) + bias;
+
+        ix = std::max(0, std::min(ix, max_coord));
+        iy = std::max(0, std::min(iy, max_coord));
+        iz = std::max(0, std::min(iz, max_coord));
+
+        return ((static_cast<uint64_t>(ix) & mask) << 42) |
+               ((static_cast<uint64_t>(iy) & mask) << 21) |
+               (static_cast<uint64_t>(iz) & mask);
+    };
+
+    if(out_keys.size() != out_points.size())
+    {
+        out_keys.resize(out_points.size());
+        for(size_t i = 0; i < out_points.size(); ++i)
+            out_keys[i] = compute_key(out_points[i]);
+    }
+
+    std::unordered_map<uint64_t, std::vector<MapPoint*>> buckets;
+    buckets.reserve(vpValidPoints.size());
+    for(MapPoint* pMP : vpValidPoints)
+    {
+        const uint64_t key = compute_key(pMP->GetWorldPos());
+        buckets[key].push_back(pMP);
+    }
+
+    std::size_t merged_voxels = 0;
+    std::size_t removed_points = 0;
+
+    {
+        unique_lock<mutex> lock(pMap->mMutexMapUpdate);
+
+        for(size_t i = 0; i < out_keys.size(); ++i)
+        {
+            auto bucket_it = buckets.find(out_keys[i]);
+            if(bucket_it == buckets.end())
+                continue;
+
+            std::vector<MapPoint*>& group = bucket_it->second;
+            MapPoint* keeper = SelectRepresentative(group);
+            if(!keeper)
+                continue;
+
+            keeper->SetWorldPos(out_points[i]);
+            if(i < out_colors.size())
+                keeper->SetColor(out_colors[i]);
+            keeper->UpdateNormalAndDepth();
+
+            for(MapPoint* candidate : group)
+            {
+                if(candidate == keeper || !candidate || candidate->isBad())
+                    continue;
+                candidate->Replace(keeper);
+                removed_points++;
+            }
+
+            merged_voxels++;
+        }
+    }
+
+    mLastDownsampleCount = static_cast<std::size_t>(pMap->MapPointsInMap());
+
+    std::cout << "[LocalMapping] Voxel downsampled " << removed_points
+              << " points across " << merged_voxels << " voxels (voxel="
+              << voxel_size << "m)" << std::endl;
+}
+
+float LocalMapping::ComputeAdaptiveVoxelSize()
+{
+    if(!mpCurrentKeyFrame)
+        return mfMinVoxelSize;
+
+    float median_depth = mpCurrentKeyFrame->ComputeSceneMedianDepth(2);
+    if(!std::isfinite(median_depth) || median_depth <= 0.f)
+        median_depth = 1.0f;
+
+    float voxel = median_depth * mDownsampleVoxelScale;
+    voxel = std::max(mfMinVoxelSize, std::min(mfMaxVoxelSize, voxel));
+    return voxel;
+}
+
+MapPoint* LocalMapping::SelectRepresentative(const std::vector<MapPoint*>& group) const
+{
+    MapPoint* best = nullptr;
+    int best_obs = -1;
+    float best_ratio = -1.f;
+
+    for(MapPoint* pMP : group)
+    {
+        if(!pMP || pMP->isBad())
+            continue;
+
+        const int obs = pMP->Observations();
+        const float ratio = pMP->GetFoundRatio();
+        if(obs > best_obs || (obs == best_obs && ratio > best_ratio))
+        {
+            best = pMP;
+            best_obs = obs;
+            best_ratio = ratio;
+        }
+    }
+
+    if(!best && !group.empty())
+        best = group.front();
+
+    return best;
+}
+
 void LocalMapping::RequestStop()
 {
     unique_lock<mutex> lock(mMutexStop);
@@ -933,7 +1144,6 @@ void LocalMapping::KeyFrameCulling()
         }
         last_ID = aux_KF->mnId;
     }
-
 
 
     for(vector<KeyFrame*>::iterator vit=vpLocalKeyFrames.begin(), vend=vpLocalKeyFrames.end(); vit!=vend; vit++)

@@ -5,6 +5,8 @@ geometry_msgs/PoseArray camera_poses
 std_msgs/Float32MultiArray tracks_3d
 # Validity mask with shape (S, N)
 std_msgs/Float32MultiArray tracks_mask
+# Per-track RGB colors stored as uint8 with layout (S, N, 3)
+std_msgs/UInt8MultiArray tracks_colors
 # Query grid dimensions (downsampled from original image)
 uint32 query_grid_width
 uint32 query_grid_height

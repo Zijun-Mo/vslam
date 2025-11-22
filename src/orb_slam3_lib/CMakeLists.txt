@@ -6,6 +6,28 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -O3")
 
+option(ORB_SLAM3_ENABLE_CUDA "Enable CUDA accelerated voxel grid" ON)
+
+set(ORB_SLAM3_CUDA_AVAILABLE OFF)
+set(ORB_SLAM3_VOXELGRID_SOURCE ${PROJECT_SOURCE_DIR}/orb_slam3/src/VoxelGridCUDA_stub.cc)
+
+if(ORB_SLAM3_ENABLE_CUDA)
+  include(CheckLanguage)
+  check_language(CUDA)
+  if(CMAKE_CUDA_COMPILER)
+    enable_language(CUDA)
+    set(CMAKE_CUDA_STANDARD 14)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    set(ORB_SLAM3_CUDA_AVAILABLE ON)
+    set(ORB_SLAM3_VOXELGRID_SOURCE ${PROJECT_SOURCE_DIR}/orb_slam3/src/VoxelGridCUDA.cu)
+    message(STATUS "ORB-SLAM3: CUDA voxel grid enabled (compiler: ${CMAKE_CUDA_COMPILER}).")
+  else()
+    message(WARNING "ORB-SLAM3: CUDA compiler not found, falling back to CPU voxel grid implementation.")
+  endif()
+else()
+  message(STATUS "ORB-SLAM3: CUDA voxel grid disabled by option, using CPU fallback.")
+endif()
+
 find_package(ament_cmake REQUIRED)
 find_package(OpenCV 4.2 REQUIRED)
 find_package(Eigen3 3.3.0 REQUIRED)
@@ -50,7 +72,12 @@ add_library(orb_slam3_lib SHARED
   ${PROJECT_SOURCE_DIR}/orb_slam3/src/TwoViewReconstruction.cc
   ${PROJECT_SOURCE_DIR}/orb_slam3/src/Config.cc
   ${PROJECT_SOURCE_DIR}/orb_slam3/src/Settings.cc
+  ${ORB_SLAM3_VOXELGRID_SOURCE}
 )
+
+if(ORB_SLAM3_CUDA_AVAILABLE)
+  set_property(TARGET orb_slam3_lib PROPERTY CUDA_SEPARABLE_COMPILATION ON)
+endif()
 
 # Find the .so files provided in orb_slam3/Thirdparty projects
 set(DBoW2_PATH "${PROJECT_SOURCE_DIR}/orb_slam3/Thirdparty/DBoW2/lib/libDBoW2.so")
@@ -66,6 +93,16 @@ target_link_libraries(orb_slam3_lib
   -lboost_serialization
   -lcrypto 
 )
+
+if(ORB_SLAM3_CUDA_AVAILABLE)
+  find_package(CUDA QUIET)
+  if(CUDA_FOUND)
+    target_include_directories(orb_slam3_lib PRIVATE ${CUDA_INCLUDE_DIRS})
+    target_link_libraries(orb_slam3_lib ${CUDA_LIBRARIES})
+  else()
+    message(WARNING "ORB-SLAM3: CUDA toolkit libraries not found; build may fail to link cudart.")
+  endif()
+endif()
 
 # Install .so files
 install(FILES 

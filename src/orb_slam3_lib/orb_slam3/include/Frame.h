@@ -370,14 +370,16 @@ public:
 
     // External Track IDs
     std::vector<long> mvTrackIds;
-    // External 3D Points (VGGT)
+    // External 3D points and per-track colors (VGGT)
     std::vector<cv::Point3f> mvVGGT3Dpoints;
+    std::vector<cv::Vec3b> mvVGGTTrackColors;
 
     // Constructor for VGGT (External Tracks)
     Frame(const cv::Mat &imGray, const double &timeStamp, 
           const std::vector<cv::KeyPoint> &vKeys, 
           const std::vector<long> &vTrackIds,
           const std::vector<cv::Point3f> &v3DPoints,
+          const std::vector<cv::Vec3b> &vTrackColors,
           ORBextractor* extractor, ORBVocabulary* voc, 
           GeometricCamera* pCamera, cv::Mat &distCoef, 
           const float &bf, const float &thDepth, 

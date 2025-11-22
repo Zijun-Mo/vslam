@@ -55,8 +55,9 @@ Frame::Frame(): mpcpi(NULL), mpImuPreintegrated(NULL), mpPrevFrame(NULL), mpImuP
 Frame::Frame(const Frame &frame)
     :mpcpi(frame.mpcpi),mpORBvocabulary(frame.mpORBvocabulary), mpORBextractorLeft(frame.mpORBextractorLeft), mpORBextractorRight(frame.mpORBextractorRight),
      mTimeStamp(frame.mTimeStamp), mK(frame.mK.clone()), mK_(Converter::toMatrix3f(frame.mK)), mDistCoef(frame.mDistCoef.clone()),
-     mbf(frame.mbf), mb(frame.mb), mThDepth(frame.mThDepth), N(frame.N), mvKeys(frame.mvKeys),
-     mvTrackIds(frame.mvTrackIds), mvKeysRight(frame.mvKeysRight), mvKeysUn(frame.mvKeysUn), mvuRight(frame.mvuRight),
+    mbf(frame.mbf), mb(frame.mb), mThDepth(frame.mThDepth), N(frame.N), mvKeys(frame.mvKeys),
+    mvTrackIds(frame.mvTrackIds), mvVGGT3Dpoints(frame.mvVGGT3Dpoints), mvVGGTTrackColors(frame.mvVGGTTrackColors),
+    mvKeysRight(frame.mvKeysRight), mvKeysUn(frame.mvKeysUn), mvuRight(frame.mvuRight),
      mvDepth(frame.mvDepth), mBowVec(frame.mBowVec), mFeatVec(frame.mFeatVec),
      mDescriptors(frame.mDescriptors.clone()), mDescriptorsRight(frame.mDescriptorsRight.clone()),
      mvpMapPoints(frame.mvpMapPoints), mvbOutlier(frame.mvbOutlier), mImuCalib(frame.mImuCalib), mnCloseMPs(frame.mnCloseMPs),
@@ -1250,6 +1251,7 @@ Frame::Frame(const cv::Mat &imGray, const double &timeStamp,
              const std::vector<cv::KeyPoint> &vKeys, 
              const std::vector<long> &vTrackIds,
              const std::vector<cv::Point3f> &v3DPoints,
+             const std::vector<cv::Vec3b> &vTrackColors,
              ORBextractor* extractor, ORBVocabulary* voc, 
              GeometricCamera* pCamera, cv::Mat &distCoef, 
              const float &bf, const float &thDepth, 
@@ -1307,8 +1309,10 @@ Frame::Frame(const cv::Mat &imGray, const double &timeStamp,
     // Filter Track IDs and 3D Points to match valid keys (orb->compute may remove keys)
     std::vector<long> validTrackIds;
     std::vector<cv::Point3f> valid3DPoints;
+    std::vector<cv::Vec3b> validTrackColors;
     validTrackIds.reserve(validKeys.size());
     valid3DPoints.reserve(validKeys.size());
+    validTrackColors.reserve(validKeys.size());
     
     for(const auto& k : validKeys)
     {
@@ -1321,18 +1325,25 @@ Frame::Frame(const cv::Mat &imGray, const double &timeStamp,
             } else {
                 valid3DPoints.push_back(cv::Point3f(0,0,0));
             }
+            if(originalIdx < (int)vTrackColors.size()) {
+                validTrackColors.push_back(vTrackColors[originalIdx]);
+            } else {
+                validTrackColors.emplace_back(255, 255, 255);
+            }
         }
         else
         {
             // Should not happen, but keep size consistent
             validTrackIds.push_back(-1);
             valid3DPoints.push_back(cv::Point3f(0,0,0));
+            validTrackColors.emplace_back(255, 255, 255);
         }
     }
 
     mvKeys = validKeys;
     mvTrackIds = validTrackIds;
     mvVGGT3Dpoints = valid3DPoints;
+    mvVGGTTrackColors = validTrackColors;
     N = mvKeys.size();
 
     // MapPoints
