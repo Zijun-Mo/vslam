@@ -1,0 +1,53 @@
+# 项目统一 Python 依赖（Python 3.10，建议使用 pyenv + virtualenv）
+# 说明：
+# 1. 该文件整合了 VGGT 基础依赖、演示(可选)依赖、以及 ROS2 Python 节点常用依赖。
+# 2. 若仅使用核心 VGGT + ORB-SLAM3 功能，可删除下方标记为 (demo 可选) 的包。
+# 3. C++ 部分（ORB-SLAM3、Pangolin、Eigen、OpenCV）由系统与 colcon 构建管理，不在此列。
+
+torch==2.3.1
+torchvision==0.18.1
+numpy==1.26.1
+Pillow
+huggingface_hub
+einops
+safetensors
+
+# VGGT 推理与几何处理辅助
+opencv-python
+scipy
+onnxruntime
+requests
+trimesh
+matplotlib
+pyyaml
+hydra-core
+omegaconf
+einops  # 已列出，保留以防某些环境解析差异
+pydantic==2.10.6
+
+# 轨迹 / 特征 / 匹配相关 (LightGlue 从源码安装)
+git+https://github.com/jytime/LightGlue.git#egg=lightglue
+
+# ROS2 Python 节点常用依赖
+# 注意：ROS2 消息类型 (sensor_msgs, cv_bridge 等) 需通过 apt 系统安装，不在 pip 中
+# sudo apt install ros-humble-sensor-msgs ros-humble-cv-bridge
+# rclpy 也建议用系统版本: sudo apt install ros-humble-rclpy
+# 如需在虚拟环境中开发，可保留下行但可能与系统冲突，建议用 --system-site-packages
+# rclpy
+
+# 进度与可视化 (demo 可选)
+tqdm
+gradio==5.17.1    # (demo 可选)
+viser==0.2.23     # (demo 可选)
+
+# COLMAP / BA 相关 (demo_colmap 可选)
+pycolmap==3.10.0  # (demo 可选)
+pyceres==2.3      # (demo 可选)
+
+# 若需 Flash Attention 3 可自行编译，不放入通用 requirements
+# 可选: gsplat (Gaussian Splatting) 请参考其官方安装说明
+# ros2
+catkin_pkg
+empy == 3.3.4
+lark
+colcon-common-extensions

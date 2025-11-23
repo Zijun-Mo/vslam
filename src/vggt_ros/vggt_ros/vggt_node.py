@@ -204,7 +204,7 @@ class VGGTNode(Node):
                     # Generate grid query points
                     _, _, _, H, W = images_batch.shape
                     # Query all pixels
-                    stride = 4  # Downsample grid so the number of query points is 1/16 of original
+                    stride = 10  # Downsample grid so the number of query points is 1/16 of original
                     grid_y, grid_x = torch.meshgrid(
                         torch.arange(0, H, stride, device=self.device),
                         torch.arange(0, W, stride, device=self.device),
