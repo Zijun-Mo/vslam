@@ -1,5 +1,6 @@
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSPresetProfiles
 from sensor_msgs.msg import Image, PointCloud, ChannelFloat32
 from geometry_msgs.msg import PoseArray, Pose, Point32
 from std_msgs.msg import Header, Float32MultiArray, MultiArrayDimension, UInt8MultiArray
@@ -18,7 +19,7 @@ from vggt_ros.keyframe_selector import KeyframeSelector
 from vggt_ros.geometry_utils import compute_3d_tracks
 
 # Add vggt to python path
-sys.path.append(os.path.expanduser('~/vslam/vggt'))  # Adjust this path as necessary
+sys.path.append(os.path.expanduser('~/aiaa2205final/vslam/vggt'))  # Adjust this path as necessary
 
 from vggt.models.vggt import VGGT
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
@@ -55,15 +56,18 @@ class VGGTNode(Node):
         self.keyframe_id_map = {}  # Maps keyframe tuple to ID
         
         # Publishers
-        self.vggt_pub = self.create_publisher(VggtOutput, 'vggt/output', 1)
+        # Use absolute topic to avoid namespace confusion when launched in containers
+        self.vggt_pub = self.create_publisher(VggtOutput, '/vggt/output', 1)
         self.frame_count = 0
         
         # Inference time tracking
         self.inference_times = []
         self.inference_log_interval = 50
-        
+
         # Subscriber
-        self.create_subscription(Image, self.image_topic, self.image_callback, 10)
+        # Use sensor data QoS so we can connect to best-effort camera drivers without compatibility warnings
+        image_qos = QoSPresetProfiles.SENSOR_DATA.value
+        self.create_subscription(Image, self.image_topic, self.image_callback, image_qos)
         
         self.model = None
         self.to_tensor = TF.ToTensor()
