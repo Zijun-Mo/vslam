@@ -12,6 +12,7 @@
 #include <unordered_map>
 #include <cmath>
 #include <cstdint>
+#include <chrono>
 
 #include "System.h"
 #include "vslam_msgs/msg/system_ptr.hpp"
@@ -27,6 +28,9 @@ public:
     explicit VggtFrontendNode(const rclcpp::NodeOptions & options)
     : Node("vggt_frontend_node", options)
     {
+        last_img_stamp_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
+        last_vggt_stamp_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
+
         // Parameters
         declare_parameter("voc_file", "");
         declare_parameter("settings_file", "");
@@ -150,17 +154,52 @@ public:
         // However, for intra-process comms, we need to be careful.
         // Let's try to use default QoS for now, but ensure durability is volatile for intra-process.
         
-        auto qos = rclcpp::QoS(10);
-        qos.durability(rclcpp::DurabilityPolicy::Volatile);
-        qos.reliability(rclcpp::ReliabilityPolicy::BestEffort); // Match sensor data QoS
+        // Use best-effort for camera images, but keep VGGT output reliable to match the publisher
+        auto img_qos = rclcpp::SensorDataQoS();
+        auto vggt_qos = rclcpp::QoS(rclcpp::KeepLast(10));
+        vggt_qos.durability(rclcpp::DurabilityPolicy::Volatile);
+        vggt_qos.reliability(rclcpp::ReliabilityPolicy::Reliable);
 
-        img_sub_.subscribe(this, "camera/image_raw", qos.get_rmw_qos_profile());
-        vggt_sub_.subscribe(this, "vggt/output", qos.get_rmw_qos_profile());
+        // Disable intra-process for message_filters subscriptions; message_filters does not play well
+        // with loaned/intra-process messages in some RMWs.
+        rclcpp::SubscriptionOptions sub_options;
+        sub_options.use_intra_process_comm = rclcpp::IntraProcessSetting::Disable;
+
+        img_sub_.subscribe(this, "/camera/image_raw", img_qos.get_rmw_qos_profile(), sub_options);
+        vggt_sub_.subscribe(this, "/vggt/output", vggt_qos.get_rmw_qos_profile(), sub_options);
+
+        // Extra debug: log when each individual topic is received (throttled)
+        img_sub_.registerCallback([this](const sensor_msgs::msg::Image::ConstSharedPtr & msg){
+            last_img_stamp_ = msg->header.stamp;
+            RCLCPP_INFO_THROTTLE(get_logger(), *this->get_clock(), 2000,
+                "Image received: stamp %.3f", msg->header.stamp.sec + msg->header.stamp.nanosec * 1e-9);
+        });
+        vggt_sub_.registerCallback([this](const vslam_msgs::msg::VggtOutput::ConstSharedPtr & msg){
+            last_vggt_stamp_ = msg->header.stamp;
+            RCLCPP_INFO_THROTTLE(get_logger(), *this->get_clock(), 2000,
+                "VGGT output received: frame_id=%lu stamp %.3f", static_cast<unsigned long>(msg->vggt_frame_id),
+                msg->header.stamp.sec + msg->header.stamp.nanosec * 1e-9);
+        });
 
         // Approximate time sync policy
         typedef message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::Image, vslam_msgs::msg::VggtOutput> SyncPolicy;
-        sync_.reset(new message_filters::Synchronizer<SyncPolicy>(SyncPolicy(10), img_sub_, vggt_sub_));
+        sync_.reset(new message_filters::Synchronizer<SyncPolicy>(SyncPolicy(50), img_sub_, vggt_sub_));
+        sync_->setMaxIntervalDuration(rclcpp::Duration::from_seconds(1.0)); // VGGT publishes delayed relative to images
         sync_->registerCallback(std::bind(&VggtFrontendNode::SyncCallback, this, std::placeholders::_1, std::placeholders::_2));
+
+        using namespace std::chrono_literals;
+        sync_debug_timer_ = create_wall_timer(2s, [this]() {
+            if(sync_seen_) return;
+            if(last_img_stamp_.nanoseconds() == 0 && last_vggt_stamp_.nanoseconds() == 0)
+            {
+                RCLCPP_WARN(get_logger(), "Sync not fired yet: waiting for both topics");
+                return;
+            }
+            double img_t = last_img_stamp_.seconds();
+            double vggt_t = last_vggt_stamp_.seconds();
+            double delta = (last_img_stamp_ - last_vggt_stamp_).seconds();
+            RCLCPP_WARN(get_logger(), "Sync not fired yet: last img=%.3f last vggt=%.3f delta=%.3f s", img_t, vggt_t, delta);
+        });
 
         RCLCPP_INFO(get_logger(), "VGGT Frontend Node Initialized");
     }
@@ -187,14 +226,30 @@ private:
     {
         if (!mpSystem) return;
 
-        // 1. Convert Image
-        cv_bridge::CvImagePtr cv_ptr;
+        // Visible markers to confirm the sync is firing
+        RCLCPP_INFO_ONCE(get_logger(), "SyncCallback received first synchronized messages");
+        RCLCPP_INFO_THROTTLE(get_logger(), *this->get_clock(), 3000,
+            "SyncCallback running: img stamp %.3f, vggt_frame_id=%lu, tracks=%zu, poses=%zu",
+            img_msg->header.stamp.sec + img_msg->header.stamp.nanosec * 1e-9,
+            static_cast<unsigned long>(vggt_msg->vggt_frame_id),
+            vggt_msg->tracks_3d.data.size(),
+            vggt_msg->camera_poses.poses.size());
+        sync_seen_ = true;
+
+        // 1. Convert Image (both color for visualization and gray for tracking)
+        cv_bridge::CvImagePtr cv_ptr_color;
+        cv_bridge::CvImagePtr cv_ptr_mono;
         try {
-            cv_ptr = cv_bridge::toCvCopy(img_msg, sensor_msgs::image_encodings::MONO8);
+            cv_ptr_color = cv_bridge::toCvCopy(img_msg, sensor_msgs::image_encodings::BGR8);
+            cv_ptr_mono = std::make_shared<cv_bridge::CvImage>();
+            cv_ptr_mono->header = img_msg->header;
+            cv_ptr_mono->encoding = sensor_msgs::image_encodings::MONO8;
+            cv::cvtColor(cv_ptr_color->image, cv_ptr_mono->image, cv::COLOR_BGR2GRAY);
         } catch (cv_bridge::Exception& e) {
             RCLCPP_ERROR(get_logger(), "cv_bridge exception: %s", e.what());
             return;
         }
+        const cv::Mat* color_for_tracks = cv_ptr_color ? &cv_ptr_color->image : nullptr;
 
         // 2. Parse Tracks from Float32MultiArray
         // Layout: [S, N, 3]
@@ -325,6 +380,11 @@ private:
                         track_color[2] = color_data[idx + 0]; // R <- B
                     }
                 }
+                else if(color_for_tracks && v >= 0 && v < color_for_tracks->rows && u >= 0 && u < color_for_tracks->cols)
+                {
+                    // Fallback: sample from the current color image so map points carry RGB
+                    track_color = color_for_tracks->at<cv::Vec3b>(v, u);
+                }
                 vTrackColors.push_back(track_color);
             }
         }
@@ -438,7 +498,7 @@ private:
             }
         }
 
-        mpSystem->TrackVGGT(cv_ptr->image, timestamp, vKeys, vTrackIds, v3DPoints, vTrackColors, delta_pose);
+        mpSystem->TrackVGGT(cv_ptr_mono->image, timestamp, vKeys, vTrackIds, v3DPoints, vTrackColors, delta_pose);
     }
 
     ORB_SLAM3::System* mpSystem = nullptr;
@@ -449,6 +509,10 @@ private:
     message_filters::Subscriber<sensor_msgs::msg::Image> img_sub_;
     message_filters::Subscriber<vslam_msgs::msg::VggtOutput> vggt_sub_;
     std::shared_ptr<message_filters::Synchronizer<message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::Image, vslam_msgs::msg::VggtOutput>>> sync_;
+    rclcpp::TimerBase::SharedPtr sync_debug_timer_;
+    rclcpp::Time last_img_stamp_;
+    rclcpp::Time last_vggt_stamp_;
+    bool sync_seen_{false};
     PoseWindow prev_pose_window_;
     bool has_prev_pose_window_{false};
     std::vector<int64_t> last_global_track_ids_;
