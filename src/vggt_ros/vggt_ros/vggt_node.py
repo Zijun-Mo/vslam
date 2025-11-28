@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import sys
 import os
+from pathlib import Path
 import glob
 from collections import deque
 from PIL import Image as PILImage
@@ -18,8 +19,11 @@ from torchvision import transforms as TF
 from vggt_ros.keyframe_selector import KeyframeSelector
 from vggt_ros.geometry_utils import compute_3d_tracks
 
-# Add vggt to python path
-sys.path.append(os.path.expanduser('~/aiaa2205final/vslam/vggt'))  # Adjust this path as necessary
+# Add vggt to python path without hard-coding absolute path
+repo_root = Path(__file__).resolve().parents[3]
+vggt_path = repo_root / 'vggt'
+if vggt_path.is_dir():
+    sys.path.append(str(vggt_path))
 
 from vggt.models.vggt import VGGT
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
