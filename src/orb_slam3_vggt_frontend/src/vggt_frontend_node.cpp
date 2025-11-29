@@ -214,10 +214,17 @@ private:
         bool valid() const { return !poses.empty(); }
     };
 
+    struct PoseDeltaResult
+    {
+        Eigen::Matrix4d delta = Eigen::Matrix4d::Identity();
+        Eigen::Matrix4d align_prev_to_curr = Eigen::Matrix4d::Identity();
+        bool has_overlap = false;
+    };
+
     static constexpr int kVGGTQueryStride = 4;
 
     PoseWindow BuildPoseWindow(uint64_t latest_id, const geometry_msgs::msg::PoseArray &pose_array) const;
-    Eigen::Matrix4d ComputePoseDelta(const PoseWindow &previous_window, const PoseWindow &current_window) const;
+    PoseDeltaResult ComputePoseDelta(const PoseWindow &previous_window, const PoseWindow &current_window) const;
     static Eigen::Isometry3d PoseMsgToIsometry(const geometry_msgs::msg::Pose &pose);
     static cv::Mat EigenToCvMat(const Eigen::Matrix4d &transform);
 
@@ -300,6 +307,33 @@ private:
             }
         }
 
+        PoseWindow current_window = BuildPoseWindow(vggt_msg->vggt_frame_id, vggt_msg->camera_poses);
+        PoseDeltaResult delta_result;
+        if(has_prev_pose_window_ && current_window.valid())
+        {
+            delta_result = ComputePoseDelta(prev_pose_window_, current_window);
+        }
+
+        if(!has_world_alignment_)
+        {
+            world_from_vggt_.setIdentity();
+            has_world_alignment_ = true;
+        }
+        if(delta_result.has_overlap)
+        {
+            Eigen::Isometry3d align_iso = Eigen::Isometry3d::Identity();
+            align_iso.matrix() = delta_result.align_prev_to_curr;
+            world_from_vggt_ = world_from_vggt_ * align_iso.inverse();
+        }
+
+        prev_pose_window_ = current_window;
+        has_prev_pose_window_ = current_window.valid();
+
+        Eigen::Matrix4d world_from_g = world_from_vggt_.matrix();
+        Eigen::Matrix4d g_from_world = world_from_vggt_.inverse().matrix();
+        Eigen::Matrix4d delta_world = world_from_g * delta_result.delta * g_from_world;
+        cv::Mat delta_pose = EigenToCvMat(delta_world);
+
         std::vector<cv::KeyPoint> vKeys;
         std::vector<long> vTrackIds;
         std::vector<cv::Point3f> v3DPoints;
@@ -366,7 +400,11 @@ private:
                 current_global_ids[i] = global_id;
 
                 vTrackIds.push_back(static_cast<long>(global_id));
-                v3DPoints.push_back(cv::Point3f(x, y, z));
+                Eigen::Vector3d local_point(static_cast<double>(x), static_cast<double>(y), static_cast<double>(z));
+                Eigen::Vector3d global_point = world_from_vggt_ * local_point;
+                v3DPoints.emplace_back(static_cast<float>(global_point.x()),
+                                       static_cast<float>(global_point.y()),
+                                       static_cast<float>(global_point.z()));
 
                 cv::Vec3b track_color(255, 255, 255);
                 if(has_color)
@@ -395,16 +433,6 @@ private:
 
         double timestamp = img_msg->header.stamp.sec + img_msg->header.stamp.nanosec * 1e-9;
         
-        PoseWindow current_window = BuildPoseWindow(vggt_msg->vggt_frame_id, vggt_msg->camera_poses);
-        cv::Mat delta_pose = cv::Mat::eye(4, 4, CV_32F);
-        if(has_prev_pose_window_ && current_window.valid())
-        {
-            Eigen::Matrix4d delta = ComputePoseDelta(prev_pose_window_, current_window);
-            delta_pose = EigenToCvMat(delta);
-        }
-        prev_pose_window_ = current_window;
-        has_prev_pose_window_ = current_window.valid();
-
         // 3. Call System
         // Optional dynamic intrinsic override from VGGT
         bool override_from_vggt = get_parameter("override_intrinsics_from_vggt").as_bool();
@@ -519,6 +547,8 @@ private:
     uint64_t last_vggt_frame_id_{0};
     bool has_prev_global_tracks_{false};
     int64_t next_global_track_id_{0};
+    Eigen::Isometry3d world_from_vggt_{Eigen::Isometry3d::Identity()};
+    bool has_world_alignment_{false};
 };
 
     VggtFrontendNode::PoseWindow VggtFrontendNode::BuildPoseWindow(uint64_t latest_id, const geometry_msgs::msg::PoseArray &pose_array) const
@@ -548,12 +578,12 @@ private:
         return window;
     }
 
-    Eigen::Matrix4d VggtFrontendNode::ComputePoseDelta(const PoseWindow &previous_window, const PoseWindow &current_window) const
+    VggtFrontendNode::PoseDeltaResult VggtFrontendNode::ComputePoseDelta(const PoseWindow &previous_window, const PoseWindow &current_window) const
     {
-        Eigen::Matrix4d identity = Eigen::Matrix4d::Identity();
+        PoseDeltaResult result;
         if(!previous_window.valid() || !current_window.valid())
         {
-            return identity;
+            return result;
         }
 
         std::unordered_map<uint64_t, size_t> prev_index;
@@ -596,7 +626,10 @@ private:
         Eigen::Isometry3d T_prev_last_aligned = T_align * T_prev_last;
         Eigen::Isometry3d T_delta = T_curr_last * T_prev_last_aligned.inverse();
 
-        return T_delta.matrix();
+        result.delta = T_delta.matrix();
+        result.align_prev_to_curr = T_align.matrix();
+        result.has_overlap = matched;
+        return result;
     }
 
     Eigen::Isometry3d VggtFrontendNode::PoseMsgToIsometry(const geometry_msgs::msg::Pose &pose)

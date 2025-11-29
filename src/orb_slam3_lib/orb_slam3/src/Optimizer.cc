@@ -1354,7 +1354,15 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool* pbStopFlag, Map* pMap
         vPoint->setEstimate(pMP->GetWorldPos().cast<double>());
         int id = pMP->mnId+maxKFid+1;
         vPoint->setId(id);
-        vPoint->setMarginalized(true);
+        if(pMP->IsVGGTPoint())
+        {
+            vPoint->setFixed(true); // Keep VGGT priors rigid during LBA
+            vPoint->setMarginalized(false);
+        }
+        else
+        {
+            vPoint->setMarginalized(true);
+        }
         optimizer.addVertex(vPoint);
         nPoints++;
 
@@ -1490,6 +1498,9 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool* pbStopFlag, Map* pMap
         if(pMP->isBad())
             continue;
 
+        if(pMP->IsVGGTPoint())
+            continue;
+
         if(e->chi2()>5.991 || !e->isDepthPositive())
         {
             KeyFrame* pKFi = vpEdgeKFMono[i];
@@ -1505,6 +1516,9 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool* pbStopFlag, Map* pMap
         if(pMP->isBad())
             continue;
 
+        if(pMP->IsVGGTPoint())
+            continue;
+
         if(e->chi2()>5.991 || !e->isDepthPositive())
         {
             KeyFrame* pKFi = vpEdgeKFBody[i];
@@ -1518,6 +1532,9 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool* pbStopFlag, Map* pMap
         MapPoint* pMP = vpMapPointEdgeStereo[i];
 
         if(pMP->isBad())
+            continue;
+
+        if(pMP->IsVGGTPoint())
             continue;
 
         if(e->chi2()>7.815 || !e->isDepthPositive())
@@ -1557,6 +1574,9 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool* pbStopFlag, Map* pMap
     for(list<MapPoint*>::iterator lit=lLocalMapPoints.begin(), lend=lLocalMapPoints.end(); lit!=lend; lit++)
     {
         MapPoint* pMP = *lit;
+        if(pMP->IsVGGTPoint())
+            continue;
+
         g2o::VertexSBAPointXYZ* vPoint = static_cast<g2o::VertexSBAPointXYZ*>(optimizer.vertex(pMP->mnId+maxKFid+1));
         pMP->SetWorldPos(vPoint->estimate().cast<float>());
         pMP->UpdateNormalAndDepth();
@@ -2781,7 +2801,15 @@ void Optimizer::LocalInertialBA(KeyFrame *pKF, bool *pbStopFlag, Map *pMap, int&
 
         unsigned long id = pMP->mnId+iniMPid+1;
         vPoint->setId(id);
-        vPoint->setMarginalized(true);
+        if(pMP->IsVGGTPoint())
+        {
+            vPoint->setFixed(true); // VGGT priors stay fixed under LocalInertialBA
+            vPoint->setMarginalized(false);
+        }
+        else
+        {
+            vPoint->setMarginalized(true);
+        }
         optimizer.addVertex(vPoint);
         const map<KeyFrame*,tuple<int,int>> observations = pMP->GetObservations();
 
@@ -2927,6 +2955,9 @@ void Optimizer::LocalInertialBA(KeyFrame *pKF, bool *pbStopFlag, Map *pMap, int&
         if(pMP->isBad())
             continue;
 
+        if(pMP->IsVGGTPoint())
+            continue;
+
         if((e->chi2()>chi2Mono2 && !bClose) || (e->chi2()>1.5f*chi2Mono2 && bClose) || !e->isDepthPositive())
         {
             KeyFrame* pKFi = vpEdgeKFMono[i];
@@ -2942,6 +2973,9 @@ void Optimizer::LocalInertialBA(KeyFrame *pKF, bool *pbStopFlag, Map *pMap, int&
         MapPoint* pMP = vpMapPointEdgeStereo[i];
 
         if(pMP->isBad())
+            continue;
+
+        if(pMP->IsVGGTPoint())
             continue;
 
         if(e->chi2()>chi2Stereo2)
@@ -3017,6 +3051,9 @@ void Optimizer::LocalInertialBA(KeyFrame *pKF, bool *pbStopFlag, Map *pMap, int&
     for(list<MapPoint*>::iterator lit=lLocalMapPoints.begin(), lend=lLocalMapPoints.end(); lit!=lend; lit++)
     {
         MapPoint* pMP = *lit;
+        if(pMP->IsVGGTPoint())
+            continue;
+
         g2o::VertexSBAPointXYZ* vPoint = static_cast<g2o::VertexSBAPointXYZ*>(optimizer.vertex(pMP->mnId+iniMPid+1));
         pMP->SetWorldPos(vPoint->estimate().cast<float>());
         pMP->UpdateNormalAndDepth();

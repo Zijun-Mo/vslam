@@ -40,7 +40,8 @@ LocalMapping::LocalMapping(System* pSys, Atlas *pAtlas, const float bMonocular, 
     mbAbortBA(false), mbStopped(false), mbStopRequested(false), mbNotStop(false), mbAcceptKeyFrames(true),
     mIdxInit(0), mScale(1.0), mInitSect(0), mbNotBA1(true), mbNotBA2(true), mIdxIteration(0), infoInertial(Eigen::MatrixXd::Zero(9,9)),
     mbEnableVoxelDownsample(true), mMapPointThreshold(50000), mDownsampleVoxelScale(0.01f),
-    mfMinVoxelSize(0.01f), mfMaxVoxelSize(1.0f), mfDownsampleGrowthRatio(0.2f), mLastDownsampleCount(0)
+    mfMinVoxelSize(0.01f), mfMaxVoxelSize(1.0f), mfDownsampleGrowthRatio(0.2f), mLastDownsampleCount(0),
+    mbCurrentKeyFrameIsVGGT(false)
 {
     mnMatchesInliers = 0;
 
@@ -310,7 +311,8 @@ void LocalMapping::ProcessNewKeyFrame()
         mpCurrentKeyFrame = mlNewKeyFrames.front();
         mlNewKeyFrames.pop_front();
     }
-
+    mbCurrentKeyFrameIsVGGT = mpCurrentKeyFrame && mpCurrentKeyFrame->IsVGGTKeyframe();
+    std::cerr << "[VGGT LM] KF " << mpCurrentKeyFrame->mnId << " fromVGGT=" << mpCurrentKeyFrame->IsVGGTKeyframe() << std::endl;
     // Compute Bags of Words structures
     mpCurrentKeyFrame->ComputeBoW();
 
@@ -330,7 +332,7 @@ void LocalMapping::ProcessNewKeyFrame()
                     pMP->UpdateNormalAndDepth();
                     pMP->ComputeDistinctiveDescriptors();
                 }
-                else // this can only happen for new stereo points inserted by the Tracking
+                else if(!pMP->IsVGGTPoint()) // Avoid re-culling VGGT priors
                 {
                     mlpRecentAddedMapPoints.push_back(pMP);
                 }
@@ -365,13 +367,23 @@ void LocalMapping::MapPointCulling()
     const int cnThObs = nThObs;
 
     int borrar = mlpRecentAddedMapPoints.size();
+    int bad_points_num = 0;
 
     while(lit!=mlpRecentAddedMapPoints.end())
     {
         MapPoint* pMP = *lit;
 
-        if(pMP->isBad())
+        if(pMP->IsVGGTPoint())
+        {
+            lit++;
+            borrar--;
+            continue;
+        }
+
+        if(pMP->isBad()){
+            bad_points_num++;
             lit = mlpRecentAddedMapPoints.erase(lit);
+        }
         else if(pMP->GetFoundRatio()<0.25f)
         {
             pMP->SetBadFlag();
@@ -390,11 +402,15 @@ void LocalMapping::MapPointCulling()
             borrar--;
         }
     }
+    std::cerr << "[VGGT LM] Bad points culled: " << bad_points_num << std::endl;
 }
 
 
 void LocalMapping::CreateNewMapPoints()
 {
+    if(!mpCurrentKeyFrame || mbCurrentKeyFrameIsVGGT)
+        return;
+
     // Retrieve neighbor keyframes in covisibility graph
     int nn = 10;
     // For stereo inertial case
@@ -721,6 +737,9 @@ void LocalMapping::CreateNewMapPoints()
 
 void LocalMapping::SearchInNeighbors()
 {
+    if(!mpCurrentKeyFrame || mbCurrentKeyFrameIsVGGT)
+        return;
+
     // Retrieve neighbor keyframes
     int nn = 10;
     if(mbMonocular)
@@ -1151,7 +1170,7 @@ void LocalMapping::KeyFrameCulling()
         count++;
         KeyFrame* pKF = *vit;
 
-        if((pKF->mnId==pKF->GetMap()->GetInitKFid()) || pKF->isBad())
+        if((pKF->mnId==pKF->GetMap()->GetInitKFid()) || pKF->isBad() || pKF->IsVGGTKeyframe())
             continue;
         const vector<MapPoint*> vpMapPoints = pKF->GetMapPointMatches();
 

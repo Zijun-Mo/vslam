@@ -1122,7 +1122,22 @@ void LoopClosing::CorrectLoop()
                 MapPoint* pLoopMP = mvpLoopMatchedMPs[i];
                 MapPoint* pCurMP = mpCurrentKF->GetMapPoint(i);
                 if(pCurMP)
-                    pCurMP->Replace(pLoopMP);
+                {
+                    const bool bCurVGGT = pCurMP->IsVGGTPoint();
+                    const bool bLoopVGGT = pLoopMP->IsVGGTPoint();
+
+                    if(bCurVGGT && !bLoopVGGT)
+                    {
+                        // Keep VGGT point and propagate it to loop observations
+                        pLoopMP->Replace(pCurMP);
+                    }
+                    else if(!bCurVGGT)
+                    {
+                        // Either loop point is VGGT (preferred) or both are ORB
+                        pCurMP->Replace(pLoopMP);
+                    }
+                    // If both are VGGT just keep existing assignments to avoid deleting priors
+                }
                 else
                 {
                     mpCurrentKF->AddMapPoint(pLoopMP,i);

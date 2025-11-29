@@ -162,6 +162,7 @@ class KeyFrame
         ar & mbNotErase;
         ar & mbToBeErased;
         ar & mbBad;
+        ar & mbFromVGGT;
 
         ar & mHalfBaseline;
 
@@ -213,6 +214,8 @@ public:
     Eigen::Vector3f GetTranslation();
     Eigen::Vector3f GetVelocity();
     bool isVelocitySet();
+    void SetVGGTKeyframe(bool flag=true);
+    bool IsVGGTKeyframe();
 
     // Bag of Words Representation
     void ComputeBoW();
@@ -479,6 +482,7 @@ protected:
     bool mbNotErase;
     bool mbToBeErased;
     bool mbBad;    
+    bool mbFromVGGT;
 
     float mHalfBaseline; // Only for visualization
 

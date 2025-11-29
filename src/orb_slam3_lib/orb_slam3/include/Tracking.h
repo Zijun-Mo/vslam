@@ -40,6 +40,7 @@
 #include "GeometricCamera.h"
 
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace ORB_SLAM3
@@ -381,6 +382,7 @@ public:
     Sophus::SE3f mVGGTDeltaT;
     Sophus::SE3f mAccumulatedVGGTMotion;
     bool mbHasVGGTDelta;
+    std::unordered_map<long, MapPoint*> mVGGTTrackIdToMP;
     Sophus::SE3f GrabImageVGGT(const cv::Mat &im, const double &timestamp, 
                                const std::vector<cv::KeyPoint> &vKeys, 
                                const std::vector<long> &vTrackIds,

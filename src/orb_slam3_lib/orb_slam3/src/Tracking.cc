@@ -3932,6 +3932,7 @@ void Tracking::Reset(bool bLocMap)
     mpReferenceKF = static_cast<KeyFrame*>(NULL);
     mpLastKeyFrame = static_cast<KeyFrame*>(NULL);
     mvIniMatches.clear();
+    mVGGTTrackIdToMP.clear();
 
     if(mpViewer)
         mpViewer->Release();
@@ -4021,6 +4022,7 @@ void Tracking::ResetActiveMap(bool bLocMap)
     mpReferenceKF = static_cast<KeyFrame*>(NULL);
     mpLastKeyFrame = static_cast<KeyFrame*>(NULL);
     mvIniMatches.clear();
+    mVGGTTrackIdToMP.clear();
 
     mbVelocity = false;
 
@@ -4177,6 +4179,7 @@ void Tracking::UpdateFrameIMU(const float s, const IMU::Bias &b, KeyFrame* pCurr
 void Tracking::NewDataset()
 {
     mnNumDataset++;
+    mVGGTTrackIdToMP.clear();
 }
 
 int Tracking::GetNumberDataset()
@@ -4480,36 +4483,62 @@ void Tracking::TrackVGGT()
 
 int Tracking::MatchByTrackIds()
 {
-    // std::cout << "[DEBUG] MatchByTrackIds start. LastFrame N: " << mLastFrame.N << ", CurrentFrame N: " << mCurrentFrame.N << std::endl;
     int nMatches = 0;
-    // Build a map from TrackID to MapPoint* from the Last Frame (or Local Map?)
-    // Using LastFrame is faster and sufficient for frame-to-frame
+
+    // Cache last frame associations for quick lookup and to refresh the global track cache
     map<long, MapPoint*> lastFrameMapPoints;
-    for(int i=0; i<mLastFrame.N; i++) {
-        if(mLastFrame.mvpMapPoints[i] && mLastFrame.mvTrackIds[i] != -1) {
-            lastFrameMapPoints[mLastFrame.mvTrackIds[i]] = mLastFrame.mvpMapPoints[i];
-        }
+    const int last_track_count = std::min(mLastFrame.N, static_cast<int>(mLastFrame.mvTrackIds.size()));
+    for(int i = 0; i < last_track_count; ++i)
+    {
+        const long tid = mLastFrame.mvTrackIds[i];
+        MapPoint* pMP = (i < static_cast<int>(mLastFrame.mvpMapPoints.size())) ? mLastFrame.mvpMapPoints[i] : nullptr;
+        if(tid == -1 || !pMP)
+            continue;
+        lastFrameMapPoints[tid] = pMP;
+        if(!pMP->isBad())
+            mVGGTTrackIdToMP[tid] = pMP;
     }
-    // std::cout << "[DEBUG] MatchByTrackIds: Built map with " << lastFrameMapPoints.size() << " points." << std::endl;
 
-    // Assign MapPoints to Current Frame based on Track IDs
-    for(int i=0; i<mCurrentFrame.N; i++) {
-        long tid = mCurrentFrame.mvTrackIds[i];
-        if(tid == -1) continue;
+    const int feature_count = std::min(mCurrentFrame.N, static_cast<int>(mCurrentFrame.mvTrackIds.size()));
+    for(int i = 0; i < feature_count; ++i)
+    {
+        const long tid = mCurrentFrame.mvTrackIds[i];
+        if(tid == -1)
+            continue;
 
-        if(lastFrameMapPoints.count(tid)) {
-            MapPoint* pMP = lastFrameMapPoints[tid];
-            if(pMP && !pMP->isBad()) {
-                mCurrentFrame.mvpMapPoints[i] = pMP;
-                pMP->mbTrackInView = true;
-                nMatches++;
+        MapPoint* pMP = nullptr;
+        auto itLast = lastFrameMapPoints.find(tid);
+        if(itLast != lastFrameMapPoints.end())
+        {
+            pMP = itLast->second;
+        }
+        else
+        {
+            auto itGlobal = mVGGTTrackIdToMP.find(tid);
+            if(itGlobal != mVGGTTrackIdToMP.end())
+            {
+                pMP = itGlobal->second;
+                if(!pMP || pMP->isBad())
+                {
+                    mVGGTTrackIdToMP.erase(itGlobal);
+                    pMP = nullptr;
+                }
             }
         }
-        // Note: If not found in LastFrame, we could search in LocalMap, 
-        // but for now let's stick to simple tracking.
-        // New points will be created in CreateNewKeyFrameVGGT or handled by LocalMapping.
+
+        if(pMP && !pMP->isBad())
+        {
+            if(i < static_cast<int>(mCurrentFrame.mvpMapPoints.size()))
+            {
+                mCurrentFrame.mvpMapPoints[i] = pMP;
+            }
+            pMP->mbTrackInView = true;
+            pMP->IncreaseVisible();
+            mVGGTTrackIdToMP[tid] = pMP;
+            ++nMatches;
+        }
     }
-    // std::cout << "[DEBUG] MatchByTrackIds end. Matches: " << nMatches << std::endl;
+
     return nMatches;
 }
 
@@ -4607,33 +4636,71 @@ void Tracking::MonocularInitializationVGGT()
         
         // Insert KeyFrame in Map
         mpAtlas->GetCurrentMap()->AddKeyFrame(pKFini);
+        pKFini->SetVGGTKeyframe(true);
         
-        // Create MapPoints
-        for(int i=0; i<mCurrentFrame.N; i++)
+        const int total_feats = mCurrentFrame.N;
+        const int vg_points = static_cast<int>(mCurrentFrame.mvVGGT3Dpoints.size());
+        const int color_count = static_cast<int>(mCurrentFrame.mvVGGTTrackColors.size());
+        const int track_count = static_cast<int>(mCurrentFrame.mvTrackIds.size());
+
+        for(int i = 0; i < total_feats; ++i)
         {
-            Eigen::Vector3f x3D;
-            
-            // Use VGGT 3D points if available
-            if(i < (int)mCurrentFrame.mvVGGT3Dpoints.size()) {
-                cv::Point3f p3d = mCurrentFrame.mvVGGT3Dpoints[i];
-                x3D << p3d.x, p3d.y, p3d.z;
-            } else {
-                // Fallback (should not happen if constructor filters correctly)
-                x3D << 0, 0, 1; 
-            }
-            
-            MapPoint* pMP = new MapPoint(x3D, pKFini, mpAtlas->GetCurrentMap());
-            if(i < static_cast<int>(mCurrentFrame.mvVGGTTrackColors.size()))
+            const long track_id = (i < track_count) ? mCurrentFrame.mvTrackIds[i] : -1;
+            MapPoint* pMP = (i < static_cast<int>(mCurrentFrame.mvpMapPoints.size())) ? mCurrentFrame.mvpMapPoints[i] : nullptr;
+
+            if(pMP && !pMP->isBad())
             {
-                pMP->SetColor(mCurrentFrame.mvVGGTTrackColors[i]);
+                pMP->SetVGGTPoint(true);
+                if(i < color_count)
+                    pMP->SetColor(mCurrentFrame.mvVGGTTrackColors[i]);
+                if(track_id >= 0)
+                    mVGGTTrackIdToMP[track_id] = pMP;
+                pMP->AddObservation(pKFini, i);
+                pKFini->AddMapPoint(pMP, i);
+                continue;
             }
-            pMP->AddObservation(pKFini, i);
-            pKFini->AddMapPoint(pMP, i);
-            pMP->ComputeDistinctiveDescriptors();
-            pMP->UpdateNormalAndDepth();
-            
-            mpAtlas->GetCurrentMap()->AddMapPoint(pMP);
-            mCurrentFrame.mvpMapPoints[i] = pMP;
+
+            if(track_id >= 0)
+            {
+                auto it = mVGGTTrackIdToMP.find(track_id);
+                if(it != mVGGTTrackIdToMP.end())
+                {
+                    MapPoint* pCached = it->second;
+                    if(pCached && !pCached->isBad())
+                    {
+                        mCurrentFrame.mvpMapPoints[i] = pCached;
+                        pCached->SetVGGTPoint(true);
+                        if(i < color_count)
+                            pCached->SetColor(mCurrentFrame.mvVGGTTrackColors[i]);
+                        pCached->AddObservation(pKFini, i);
+                        pKFini->AddMapPoint(pCached, i);
+                        continue;
+                    }
+                    mVGGTTrackIdToMP.erase(it);
+                }
+            }
+
+            if(i >= vg_points)
+                continue;
+
+            const cv::Point3f &p3d = mCurrentFrame.mvVGGT3Dpoints[i];
+            if(!std::isfinite(p3d.x) || !std::isfinite(p3d.y) || !std::isfinite(p3d.z))
+                continue;
+
+            Eigen::Vector3f x3D(p3d.x, p3d.y, p3d.z);
+            MapPoint* pNewMP = new MapPoint(x3D, pKFini, mpAtlas->GetCurrentMap());
+            pNewMP->SetVGGTPoint(true);
+            if(i < color_count)
+                pNewMP->SetColor(mCurrentFrame.mvVGGTTrackColors[i]);
+            pNewMP->AddObservation(pKFini, i);
+            pKFini->AddMapPoint(pNewMP, i);
+            pNewMP->ComputeDistinctiveDescriptors();
+            pNewMP->UpdateNormalAndDepth();
+
+            mpAtlas->GetCurrentMap()->AddMapPoint(pNewMP);
+            mCurrentFrame.mvpMapPoints[i] = pNewMP;
+            if(track_id >= 0)
+                mVGGTTrackIdToMP[track_id] = pNewMP;
         }
         
         mpLocalMapper->InsertKeyFrame(pKFini);
@@ -4780,6 +4847,7 @@ void Tracking::CreateNewKeyFrameVGGT()
         return;
 
     KeyFrame* pKF = new KeyFrame(mCurrentFrame, mpAtlas->GetCurrentMap(), mpKeyFrameDB);
+    pKF->SetVGGTKeyframe(true);
 
     if(mpAtlas->isImuInitialized())
         pKF->bImu = true;
@@ -4799,12 +4867,57 @@ void Tracking::CreateNewKeyFrameVGGT()
         mpImuPreintegratedFromLastKF = new IMU::Preintegrated(pKF->GetImuBias(),pKF->mImuCalib);
     }
 
-    // Create MapPoints from VGGT 3D priors when the current frame does not already track them.
     const int vg_points = static_cast<int>(mCurrentFrame.mvVGGT3Dpoints.size());
-    const int total_feats = std::min(mCurrentFrame.N, vg_points);
+    const int track_count = static_cast<int>(mCurrentFrame.mvTrackIds.size());
+    const int color_count = static_cast<int>(mCurrentFrame.mvVGGTTrackColors.size());
+    const int total_feats = mCurrentFrame.N;
+
+    auto reuseFromCache = [&](long track_id) -> MapPoint*
+    {
+        if(track_id < 0)
+            return nullptr;
+        auto it = mVGGTTrackIdToMP.find(track_id);
+        if(it == mVGGTTrackIdToMP.end())
+            return nullptr;
+        MapPoint* cached = it->second;
+        if(!cached || cached->isBad())
+        {
+            mVGGTTrackIdToMP.erase(it);
+            return nullptr;
+        }
+        return cached;
+    };
+
     for(int i = 0; i < total_feats; ++i)
     {
-        if(mCurrentFrame.mvpMapPoints[i])
+        MapPoint* pMP = (i < static_cast<int>(mCurrentFrame.mvpMapPoints.size())) ? mCurrentFrame.mvpMapPoints[i] : nullptr;
+        const long track_id = (i < track_count) ? mCurrentFrame.mvTrackIds[i] : -1;
+
+        if(pMP && !pMP->isBad())
+        {
+            pMP->SetVGGTPoint(true);
+            if(i < color_count)
+                pMP->SetColor(mCurrentFrame.mvVGGTTrackColors[i]);
+            if(track_id >= 0)
+                mVGGTTrackIdToMP[track_id] = pMP;
+            pMP->AddObservation(pKF, i);
+            pKF->AddMapPoint(pMP, i);
+            continue;
+        }
+
+        MapPoint* pCached = reuseFromCache(track_id);
+        if(pCached)
+        {
+            mCurrentFrame.mvpMapPoints[i] = pCached;
+            pCached->SetVGGTPoint(true);
+            if(i < color_count)
+                pCached->SetColor(mCurrentFrame.mvVGGTTrackColors[i]);
+            pCached->AddObservation(pKF, i);
+            pKF->AddMapPoint(pCached, i);
+            continue;
+        }
+
+        if(i >= vg_points)
             continue;
 
         const cv::Point3f &p3d = mCurrentFrame.mvVGGT3Dpoints[i];
@@ -4813,16 +4926,17 @@ void Tracking::CreateNewKeyFrameVGGT()
 
         Eigen::Vector3f x3D(p3d.x, p3d.y, p3d.z);
         MapPoint* pNewMP = new MapPoint(x3D, pKF, mpAtlas->GetCurrentMap());
-        if(i < static_cast<int>(mCurrentFrame.mvVGGTTrackColors.size()))
-        {
+        pNewMP->SetVGGTPoint(true);
+        if(i < color_count)
             pNewMP->SetColor(mCurrentFrame.mvVGGTTrackColors[i]);
-        }
         pNewMP->AddObservation(pKF, i);
         pKF->AddMapPoint(pNewMP, i);
         pNewMP->ComputeDistinctiveDescriptors();
         pNewMP->UpdateNormalAndDepth();
         mpAtlas->AddMapPoint(pNewMP);
         mCurrentFrame.mvpMapPoints[i]=pNewMP;
+        if(track_id >= 0)
+            mVGGTTrackIdToMP[track_id] = pNewMP;
     }
 
     if (mpLocalMapper->insertKeyFrameCallback)
