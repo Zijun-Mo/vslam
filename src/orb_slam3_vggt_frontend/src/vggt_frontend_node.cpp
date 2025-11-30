@@ -5,14 +5,12 @@
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <sensor_msgs/msg/point_cloud.hpp>
 #include <geometry_msgs/msg/pose_array.hpp>
-#include <message_filters/subscriber.h>
-#include <message_filters/sync_policies/approximate_time.h>
-#include <message_filters/synchronizer.h>
 #include <Eigen/Geometry>
 #include <unordered_map>
 #include <cmath>
 #include <cstdint>
 #include <chrono>
+#include <algorithm>
 
 #include "System.h"
 #include "vslam_msgs/msg/system_ptr.hpp"
@@ -28,9 +26,6 @@ public:
     explicit VggtFrontendNode(const rclcpp::NodeOptions & options)
     : Node("vggt_frontend_node", options)
     {
-        last_img_stamp_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
-        last_vggt_stamp_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
-
         // Parameters
         declare_parameter("voc_file", "");
         declare_parameter("settings_file", "");
@@ -147,59 +142,15 @@ public:
             kf_pub_->publish(msg);
         });
 
-        // Subscribers
-        // We need synchronized Image and Tracks
-        // Use rmw_qos_profile_sensor_data for image subscription to match video_reader's QoS if needed
-        // But message_filters usually works with default QoS. 
-        // However, for intra-process comms, we need to be careful.
-        // Let's try to use default QoS for now, but ensure durability is volatile for intra-process.
-        
-        // Use best-effort for camera images, but keep VGGT output reliable to match the publisher
-        auto img_qos = rclcpp::SensorDataQoS();
+        // Subscriber (VGGT output already carries the source image to guarantee sync)
         auto vggt_qos = rclcpp::QoS(rclcpp::KeepLast(10));
         vggt_qos.durability(rclcpp::DurabilityPolicy::Volatile);
         vggt_qos.reliability(rclcpp::ReliabilityPolicy::Reliable);
 
-        // Disable intra-process for message_filters subscriptions; message_filters does not play well
-        // with loaned/intra-process messages in some RMWs.
-        rclcpp::SubscriptionOptions sub_options;
-        sub_options.use_intra_process_comm = rclcpp::IntraProcessSetting::Disable;
-
-        img_sub_.subscribe(this, "/camera/image_raw", img_qos.get_rmw_qos_profile(), sub_options);
-        vggt_sub_.subscribe(this, "/vggt/output", vggt_qos.get_rmw_qos_profile(), sub_options);
-
-        // Extra debug: log when each individual topic is received (throttled)
-        img_sub_.registerCallback([this](const sensor_msgs::msg::Image::ConstSharedPtr & msg){
-            last_img_stamp_ = msg->header.stamp;
-            RCLCPP_INFO_THROTTLE(get_logger(), *this->get_clock(), 2000,
-                "Image received: stamp %.3f", msg->header.stamp.sec + msg->header.stamp.nanosec * 1e-9);
-        });
-        vggt_sub_.registerCallback([this](const vslam_msgs::msg::VggtOutput::ConstSharedPtr & msg){
-            last_vggt_stamp_ = msg->header.stamp;
-            RCLCPP_INFO_THROTTLE(get_logger(), *this->get_clock(), 2000,
-                "VGGT output received: frame_id=%lu stamp %.3f", static_cast<unsigned long>(msg->vggt_frame_id),
-                msg->header.stamp.sec + msg->header.stamp.nanosec * 1e-9);
-        });
-
-        // Approximate time sync policy
-        typedef message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::Image, vslam_msgs::msg::VggtOutput> SyncPolicy;
-        sync_.reset(new message_filters::Synchronizer<SyncPolicy>(SyncPolicy(50), img_sub_, vggt_sub_));
-        sync_->setMaxIntervalDuration(rclcpp::Duration::from_seconds(1.0)); // VGGT publishes delayed relative to images
-        sync_->registerCallback(std::bind(&VggtFrontendNode::SyncCallback, this, std::placeholders::_1, std::placeholders::_2));
-
-        using namespace std::chrono_literals;
-        sync_debug_timer_ = create_wall_timer(2s, [this]() {
-            if(sync_seen_) return;
-            if(last_img_stamp_.nanoseconds() == 0 && last_vggt_stamp_.nanoseconds() == 0)
-            {
-                RCLCPP_WARN(get_logger(), "Sync not fired yet: waiting for both topics");
-                return;
-            }
-            double img_t = last_img_stamp_.seconds();
-            double vggt_t = last_vggt_stamp_.seconds();
-            double delta = (last_img_stamp_ - last_vggt_stamp_).seconds();
-            RCLCPP_WARN(get_logger(), "Sync not fired yet: last img=%.3f last vggt=%.3f delta=%.3f s", img_t, vggt_t, delta);
-        });
+        vggt_sub_ = create_subscription<vslam_msgs::msg::VggtOutput>(
+            "/vggt/output",
+            vggt_qos,
+            std::bind(&VggtFrontendNode::VggtCallback, this, std::placeholders::_1));
 
         RCLCPP_INFO(get_logger(), "VGGT Frontend Node Initialized");
     }
@@ -210,6 +161,7 @@ private:
         uint64_t latest_id{0};
         std::vector<uint64_t> frame_ids;
         std::vector<geometry_msgs::msg::Pose> poses;
+        std::vector<float> visibility_ratios;
 
         bool valid() const { return !poses.empty(); }
     };
@@ -223,25 +175,34 @@ private:
 
     static constexpr int kVGGTQueryStride = 4;
 
-    PoseWindow BuildPoseWindow(uint64_t latest_id, const geometry_msgs::msg::PoseArray &pose_array) const;
+    PoseWindow BuildPoseWindow(uint64_t latest_id,
+                               const geometry_msgs::msg::PoseArray &pose_array,
+                               const std::vector<uint64_t> &keyframe_ids,
+                               const std::vector<float> &visibility_ratios) const;
     PoseDeltaResult ComputePoseDelta(const PoseWindow &previous_window, const PoseWindow &current_window) const;
     static Eigen::Isometry3d PoseMsgToIsometry(const geometry_msgs::msg::Pose &pose);
     static cv::Mat EigenToCvMat(const Eigen::Matrix4d &transform);
 
-    void SyncCallback(const sensor_msgs::msg::Image::ConstSharedPtr& img_msg, 
-                      const vslam_msgs::msg::VggtOutput::ConstSharedPtr& vggt_msg)
+    void VggtCallback(const vslam_msgs::msg::VggtOutput::ConstSharedPtr& vggt_msg)
     {
         if (!mpSystem) return;
 
-        // Visible markers to confirm the sync is firing
-        RCLCPP_INFO_ONCE(get_logger(), "SyncCallback received first synchronized messages");
+        if(vggt_msg->latest_image.data.empty())
+        {
+            RCLCPP_WARN(get_logger(), "VGGT output missing latest_image; skipping frame %lu",
+                        static_cast<unsigned long>(vggt_msg->vggt_frame_id));
+            return;
+        }
+
+        auto img_msg = std::make_shared<sensor_msgs::msg::Image>(vggt_msg->latest_image);
+
+        // Visible markers to confirm data flow
         RCLCPP_INFO_THROTTLE(get_logger(), *this->get_clock(), 3000,
-            "SyncCallback running: img stamp %.3f, vggt_frame_id=%lu, tracks=%zu, poses=%zu",
+            "VggtCallback running: img stamp %.3f, vggt_frame_id=%lu, tracks=%zu, poses=%zu",
             img_msg->header.stamp.sec + img_msg->header.stamp.nanosec * 1e-9,
             static_cast<unsigned long>(vggt_msg->vggt_frame_id),
             vggt_msg->tracks_3d.data.size(),
             vggt_msg->camera_poses.poses.size());
-        sync_seen_ = true;
 
         // 1. Convert Image (both color for visualization and gray for tracking)
         cv_bridge::CvImagePtr cv_ptr_color;
@@ -279,7 +240,6 @@ private:
         // We want the latest frame (S-1)
         int frame_idx = S - 1;
         int offset = frame_idx * N * C;
-        int mask_offset = frame_idx * N;
         
         const auto& data = vggt_msg->tracks_3d.data;
         const auto& mask_data = vggt_msg->tracks_mask.data;
@@ -307,11 +267,33 @@ private:
             }
         }
 
-        PoseWindow current_window = BuildPoseWindow(vggt_msg->vggt_frame_id, vggt_msg->camera_poses);
+        PoseWindow current_window = BuildPoseWindow(
+            vggt_msg->vggt_frame_id,
+            vggt_msg->camera_poses,
+            vggt_msg->keyframe_ids,
+            vggt_msg->visibility_ratios);
         PoseDeltaResult delta_result;
         if(has_prev_pose_window_ && current_window.valid())
         {
             delta_result = ComputePoseDelta(prev_pose_window_, current_window);
+        }
+
+        int overlap_frame_idx = -1;
+        uint64_t overlap_frame_id = 0;
+        if(has_prev_pose_window_ && prev_pose_window_.valid() && current_window.valid())
+        {
+            if(!prev_pose_window_.frame_ids.empty())
+            {
+                overlap_frame_id = prev_pose_window_.frame_ids.back();
+                for(size_t idx = 0; idx < current_window.frame_ids.size(); ++idx)
+                {
+                    if(current_window.frame_ids[idx] == overlap_frame_id)
+                    {
+                        overlap_frame_idx = static_cast<int>(idx);
+                        break;
+                    }
+                }
+            }
         }
 
         if(!has_world_alignment_)
@@ -344,10 +326,6 @@ private:
         v3DPoints.reserve(N);
         vTrackColors.reserve(N);
 
-        const bool consecutive_frame = has_prev_global_tracks_ &&
-            (vggt_msg->vggt_frame_id == last_vggt_frame_id_ + 1);
-        std::vector<int64_t> current_global_ids(N, -1);
-
         const auto &color_layout = vggt_msg->tracks_colors.layout.dim;
         const auto &color_data = vggt_msg->tracks_colors.data;
         const bool has_color = color_layout.size() >= 3 &&
@@ -357,79 +335,109 @@ private:
                                color_data.size() >= static_cast<size_t>(S) * static_cast<size_t>(N) * 3;
         const size_t color_offset = has_color ? static_cast<size_t>(frame_idx) * static_cast<size_t>(N) * 3 : 0;
 
-        for(int i=0; i<N; ++i) {
-            if(mask_data[mask_offset + i] > 0.5) { // Valid
-                // 3D Point
-                float x = data[offset + i*3 + 0];
-                float y = data[offset + i*3 + 1];
-                float z = data[offset + i*3 + 2];
-                
-                // 2D Point: map from query grid to original image coordinates
-                int grid_x = i % downsampled_width;
-                int grid_y = i / downsampled_width;
-                
-                // Scale from preprocessed coordinates to original image
-                float scale_x = static_cast<float>(orig_W) / static_cast<float>(downsampled_width * query_stride);
-                float scale_y = static_cast<float>(orig_H) / static_cast<float>(downsampled_height * query_stride);
-                
-                int u = static_cast<int>((grid_x * query_stride) * scale_x);
-                int v = static_cast<int>((grid_y * query_stride) * scale_y);
-                
-                // Use current image dimensions for bounds checking
-                int W = img_msg->width;
-                int H = img_msg->height;
-                if(u >= W || v >= H)
-                {
-                    continue;
-                }
-                
-                cv::KeyPoint kp;
-                kp.pt = cv::Point2f((float)u, (float)v);
-                
-                vKeys.push_back(kp);
+        auto has_valid_track = [&](int frame_index, int track_idx) -> bool
+        {
+            if(frame_index < 0)
+                return false;
+            const size_t base = static_cast<size_t>(frame_index) * static_cast<size_t>(N);
+            if(base + static_cast<size_t>(track_idx) >= mask_data.size())
+                return false;
+            return mask_data[base + track_idx] > 0.5f;
+        };
 
-                int64_t global_id = -1;
-                if(consecutive_frame && i < static_cast<int>(last_global_track_ids_.size()))
-                {
-                    global_id = last_global_track_ids_[i];
-                }
-                if(global_id < 0)
-                {
-                    global_id = next_global_track_id_++;
-                }
-                current_global_ids[i] = global_id;
+        std::vector<std::vector<uint8_t>> window_visibility_masks(
+            static_cast<size_t>(S), std::vector<uint8_t>(static_cast<size_t>(N), 0));
 
-                vTrackIds.push_back(static_cast<long>(global_id));
-                Eigen::Vector3d local_point(static_cast<double>(x), static_cast<double>(y), static_cast<double>(z));
-                Eigen::Vector3d global_point = world_from_vggt_ * local_point;
-                v3DPoints.emplace_back(static_cast<float>(global_point.x()),
-                                       static_cast<float>(global_point.y()),
-                                       static_cast<float>(global_point.z()));
+        auto count_visible = [](const std::vector<uint8_t> &mask) -> size_t
+        {
+            return std::count(mask.begin(), mask.end(), static_cast<uint8_t>(1));
+        };
 
-                cv::Vec3b track_color(255, 255, 255);
-                if(has_color)
+        for(int frame_it = 0; frame_it < S; ++frame_it)
+        {
+            auto &mask_vec = window_visibility_masks[static_cast<size_t>(frame_it)];
+            for(int i=0; i<N; ++i)
+            {
+                if(has_valid_track(frame_it, i))
                 {
-                    const size_t idx = color_offset + static_cast<size_t>(i) * 3;
-                    if(idx + 2 < color_data.size())
-                    {
-                        // VGGT outputs RGB, cv::Vec3b expects BGR
-                        track_color[0] = color_data[idx + 2]; // B <- R
-                        track_color[1] = color_data[idx + 1]; // G <- G
-                        track_color[2] = color_data[idx + 0]; // R <- B
-                    }
+                    mask_vec[static_cast<size_t>(i)] = 1;
                 }
-                else if(color_for_tracks && v >= 0 && v < color_for_tracks->rows && u >= 0 && u < color_for_tracks->cols)
-                {
-                    // Fallback: sample from the current color image so map points carry RGB
-                    track_color = color_for_tracks->at<cv::Vec3b>(v, u);
-                }
-                vTrackColors.push_back(track_color);
             }
         }
 
-        last_global_track_ids_ = std::move(current_global_ids);
-        last_vggt_frame_id_ = vggt_msg->vggt_frame_id;
-        has_prev_global_tracks_ = true;
+        if(overlap_frame_idx >= 0)
+        {
+            const auto &mask_vec = window_visibility_masks[static_cast<size_t>(overlap_frame_idx)];
+            const size_t overlap_valid = count_visible(mask_vec);
+            const size_t overlap_invalid = static_cast<size_t>(N) - overlap_valid;
+            RCLCPP_INFO_THROTTLE(get_logger(), *this->get_clock(), 2000,
+                                 "[VGGT Frontend] overlap with frame_id=%lu idx=%d: valid=%zu invalid=%zu",
+                                 static_cast<unsigned long>(overlap_frame_id),
+                                 overlap_frame_idx,
+                                 overlap_valid,
+                                 overlap_invalid);
+        }
+
+        for(int i=0; i<N; ++i) {
+            if(!has_valid_track(frame_idx, i))
+                continue;
+
+            // 3D Point
+            float x = data[offset + i*3 + 0];
+            float y = data[offset + i*3 + 1];
+            float z = data[offset + i*3 + 2];
+            
+            // 2D Point: map from query grid to original image coordinates
+            int grid_x = i % downsampled_width;
+            int grid_y = i / downsampled_width;
+            
+            // Scale from preprocessed coordinates to original image
+            float scale_x = static_cast<float>(orig_W) / static_cast<float>(downsampled_width * query_stride);
+            float scale_y = static_cast<float>(orig_H) / static_cast<float>(downsampled_height * query_stride);
+            
+            int u = static_cast<int>((grid_x * query_stride) * scale_x);
+            int v = static_cast<int>((grid_y * query_stride) * scale_y);
+            
+            // Use current image dimensions for bounds checking
+            int W = img_msg->width;
+            int H = img_msg->height;
+            if(u >= W || v >= H)
+            {
+                continue;
+            }
+            
+            cv::KeyPoint kp;
+            kp.pt = cv::Point2f((float)u, (float)v);
+            
+            vKeys.push_back(kp);
+
+            // Track IDs only need to be consistent within the VGGT window, so reuse grid index.
+            vTrackIds.push_back(static_cast<long>(i));
+            Eigen::Vector3d local_point(static_cast<double>(x), static_cast<double>(y), static_cast<double>(z));
+            Eigen::Vector3d global_point = world_from_vggt_ * local_point;
+            v3DPoints.emplace_back(static_cast<float>(global_point.x()),
+                                   static_cast<float>(global_point.y()),
+                                   static_cast<float>(global_point.z()));
+
+            cv::Vec3b track_color(255, 255, 255);
+            if(has_color)
+            {
+                const size_t idx = color_offset + static_cast<size_t>(i) * 3;
+                if(idx + 2 < color_data.size())
+                {
+                    // VGGT outputs RGB, cv::Vec3b expects BGR
+                    track_color[0] = color_data[idx + 2]; // B <- R
+                    track_color[1] = color_data[idx + 1]; // G <- G
+                    track_color[2] = color_data[idx + 0]; // R <- B
+                }
+            }
+            else if(color_for_tracks && v >= 0 && v < color_for_tracks->rows && u >= 0 && u < color_for_tracks->cols)
+            {
+                // Fallback: sample from the current color image so map points carry RGB
+                track_color = color_for_tracks->at<cv::Vec3b>(v, u);
+            }
+            vTrackColors.push_back(track_color);
+        }
 
         double timestamp = img_msg->header.stamp.sec + img_msg->header.stamp.nanosec * 1e-9;
         
@@ -526,7 +534,16 @@ private:
             }
         }
 
-        mpSystem->TrackVGGT(cv_ptr_mono->image, timestamp, vKeys, vTrackIds, v3DPoints, vTrackColors, delta_pose);
+        mpSystem->TrackVGGT(cv_ptr_mono->image,
+                    timestamp,
+                    vKeys,
+                    vTrackIds,
+                    v3DPoints,
+                    vTrackColors,
+                    delta_pose,
+                    current_window.frame_ids,
+                    current_window.visibility_ratios,
+                    window_visibility_masks);
     }
 
     ORB_SLAM3::System* mpSystem = nullptr;
@@ -534,45 +551,76 @@ private:
     rclcpp::TimerBase::SharedPtr sys_pub_timer_;
     rclcpp::Publisher<vslam_msgs::msg::KeyFramePtr>::SharedPtr kf_pub_;
     
-    message_filters::Subscriber<sensor_msgs::msg::Image> img_sub_;
-    message_filters::Subscriber<vslam_msgs::msg::VggtOutput> vggt_sub_;
-    std::shared_ptr<message_filters::Synchronizer<message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::Image, vslam_msgs::msg::VggtOutput>>> sync_;
-    rclcpp::TimerBase::SharedPtr sync_debug_timer_;
-    rclcpp::Time last_img_stamp_;
-    rclcpp::Time last_vggt_stamp_;
-    bool sync_seen_{false};
+    rclcpp::Subscription<vslam_msgs::msg::VggtOutput>::SharedPtr vggt_sub_;
     PoseWindow prev_pose_window_;
     bool has_prev_pose_window_{false};
-    std::vector<int64_t> last_global_track_ids_;
-    uint64_t last_vggt_frame_id_{0};
-    bool has_prev_global_tracks_{false};
-    int64_t next_global_track_id_{0};
     Eigen::Isometry3d world_from_vggt_{Eigen::Isometry3d::Identity()};
     bool has_world_alignment_{false};
 };
 
-    VggtFrontendNode::PoseWindow VggtFrontendNode::BuildPoseWindow(uint64_t latest_id, const geometry_msgs::msg::PoseArray &pose_array) const
+    VggtFrontendNode::PoseWindow VggtFrontendNode::BuildPoseWindow(
+        uint64_t latest_id,
+        const geometry_msgs::msg::PoseArray &pose_array,
+        const std::vector<uint64_t> &keyframe_ids,
+        const std::vector<float> &visibility_ratios) const
     {
         PoseWindow window;
         window.latest_id = latest_id;
         window.poses.assign(pose_array.poses.begin(), pose_array.poses.end());
         window.frame_ids.resize(window.poses.size());
+        window.visibility_ratios.resize(window.poses.size(), 0.0f);
 
         if(window.poses.empty())
         {
             return window;
         }
 
-        const int64_t count = static_cast<int64_t>(window.poses.size());
-        int64_t start_id = static_cast<int64_t>(latest_id) - (count - 1);
-        if(start_id < 0)
+        if(keyframe_ids.size() == window.poses.size())
         {
-            start_id = 0;
+            window.frame_ids = keyframe_ids;
+        }
+        else
+        {
+            const int64_t count = static_cast<int64_t>(window.poses.size());
+            int64_t start_id = static_cast<int64_t>(latest_id) - (count - 1);
+
+            if(start_id >= 0)
+            {
+                for(size_t i = 0; i < window.poses.size(); ++i)
+                {
+                    window.frame_ids[i] = static_cast<uint64_t>(start_id + static_cast<int64_t>(i));
+                }
+            }
+            else
+            {
+                for(size_t i = 0; i < window.poses.size(); ++i)
+                {
+                    int64_t id = static_cast<int64_t>(latest_id) - (count - 1 - static_cast<int64_t>(i));
+                    if(id < 0)
+                    {
+                        id = 0;
+                    }
+                    window.frame_ids[i] = static_cast<uint64_t>(id);
+                }
+            }
         }
 
-        for(size_t i = 0; i < window.poses.size(); ++i)
+        if(!visibility_ratios.empty())
         {
-            window.frame_ids[i] = static_cast<uint64_t>(start_id + static_cast<int64_t>(i));
+            if(visibility_ratios.size() == window.poses.size())
+            {
+                window.visibility_ratios = visibility_ratios;
+            }
+            else if(visibility_ratios.size() > window.poses.size())
+            {
+                window.visibility_ratios.assign(visibility_ratios.end() - window.poses.size(), visibility_ratios.end());
+            }
+            else
+            {
+                const size_t pad = window.poses.size() - visibility_ratios.size();
+                window.visibility_ratios.assign(pad, 0.0f);
+                window.visibility_ratios.insert(window.visibility_ratios.end(), visibility_ratios.begin(), visibility_ratios.end());
+            }
         }
 
         return window;

@@ -5,7 +5,8 @@
     device: "cuda"
     window_size: 8
     image_topic: "/camera/image_raw"
-    min_parallax: 10.0
+    min_parallax: 0.05
+    track_visibility_threshold: 0.3
 
     # ORB-SLAM3 Frontend Parameters
     voc_file: "/home/jun/vslam/src/orb_slam3_lib/orb_slam3/Vocabulary/ORBvoc.txt.bin"
@@ -14,7 +15,7 @@
     override_intrinsics_from_vggt: true
 
     # Video Reader Parameters
-    video_path: "/docs/fern.mp4"
+    video_path: "/docs/myroom.mp4"
     camera_name: "camera"
     use_sensor_data_qos: false
     camera_info_url: "package://video_reader/config/camera_info.yaml"

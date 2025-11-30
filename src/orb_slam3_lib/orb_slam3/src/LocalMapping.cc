@@ -408,7 +408,7 @@ void LocalMapping::MapPointCulling()
 
 void LocalMapping::CreateNewMapPoints()
 {
-    if(!mpCurrentKeyFrame || mbCurrentKeyFrameIsVGGT)
+    if(!mpCurrentKeyFrame)
         return;
 
     // Retrieve neighbor keyframes in covisibility graph
@@ -737,7 +737,7 @@ void LocalMapping::CreateNewMapPoints()
 
 void LocalMapping::SearchInNeighbors()
 {
-    if(!mpCurrentKeyFrame || mbCurrentKeyFrameIsVGGT)
+    if(!mpCurrentKeyFrame)
         return;
 
     // Retrieve neighbor keyframes
@@ -893,6 +893,8 @@ void LocalMapping::DownsampleMapPoints()
     {
         if(!pMP || pMP->isBad())
             continue;
+        if(pMP->IsVGGTPoint())
+            continue; // Keep VGGT priors untouched by downsampling
         vpValidPoints.push_back(pMP);
     }
 

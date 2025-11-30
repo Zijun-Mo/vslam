@@ -279,8 +279,24 @@ MapPoint* MapPoint::GetReplaced()
 
 void MapPoint::Replace(MapPoint* pMP)
 {
-    if(pMP->mnId==this->mnId)
+    if(!pMP || pMP->mnId==this->mnId)
         return;
+
+    const bool bThisVGGT = IsVGGTPoint();
+    const bool bTargetVGGT = pMP->IsVGGTPoint();
+
+    if(bThisVGGT && !bTargetVGGT)
+    {
+        // Keep rigid VGGT priors by replacing the non-VGGT candidate instead
+        pMP->Replace(this);
+        return;
+    }
+
+    if(bThisVGGT && bTargetVGGT)
+    {
+        // Avoid merging two VGGT priors; keep both instances unchanged
+        return;
+    }
 
     int nvisible, nfound;
     map<KeyFrame*,tuple<int,int>> obs;

@@ -18,7 +18,6 @@
 
 
 #include "Tracking.h"
-
 #include "ORBmatcher.h"
 #include "FrameDrawer.h"
 #include "Converter.h"
@@ -35,6 +34,9 @@
 #include <chrono>
 #include <algorithm>
 #include <limits>
+#include <cstddef>
+#include <sstream>
+#include <cmath>
 #include <Eigen/Dense>
 
 
@@ -45,13 +47,36 @@ namespace ORB_SLAM3
 
 namespace {
 
-constexpr int kRegionCols = 20;
-constexpr int kRegionRows = 15;
-constexpr int kRegionCount = kRegionCols * kRegionRows;
-constexpr float kRegionTrackRatio = 0.2f;
-constexpr float kGlobalRegionCoverageRatio = 0.1f;
-constexpr int kMinEffectiveRegions = 30;
-constexpr int kMinSamplesPerRegion = 8;
+std::string FormatFrameInvisibleCounts(const std::vector<uint64_t> &ids,
+                                       const std::vector<std::vector<uint8_t>> &masks,
+                                       size_t max_count = 20)
+{
+    const size_t count = std::min(ids.size(), masks.size());
+    if(count == 0)
+        return "[]";
+
+    auto count_visible = [](const std::vector<uint8_t> &mask) -> int
+    {
+        return static_cast<int>(std::count(mask.begin(), mask.end(), static_cast<uint8_t>(1)));
+    };
+
+    const int latest_visible = count_visible(masks[count - 1]);
+    std::ostringstream oss;
+    oss << "[";
+    const size_t limit = std::min(count, max_count);
+    for(size_t i = 0; i < limit; ++i)
+    {
+        if(i > 0)
+            oss << ", ";
+        const int visible = count_visible(masks[i]);
+        const int invisible = std::max(0, latest_visible - visible);
+        oss << ids[i] << ":" << invisible;
+    }
+    if(count > limit)
+        oss << ", ...";
+    oss << "]";
+    return oss.str();
+}
 
 Sophus::SE3f CvMatToSE3f(const cv::Mat &T)
 {
@@ -3933,6 +3958,11 @@ void Tracking::Reset(bool bLocMap)
     mpLastKeyFrame = static_cast<KeyFrame*>(NULL);
     mvIniMatches.clear();
     mVGGTTrackIdToMP.clear();
+    mVGGTLocalToGlobalTrackIds.clear();
+    mNextVGGTGlobalTrackId = 0;
+    mCurrentVGGTFrameId = 0;
+    mnLastKeyFrameVGGTFrameId = 0;
+    mCurrentVGGTWindowVisibilityMasks.clear();
 
     if(mpViewer)
         mpViewer->Release();
@@ -4023,6 +4053,11 @@ void Tracking::ResetActiveMap(bool bLocMap)
     mpLastKeyFrame = static_cast<KeyFrame*>(NULL);
     mvIniMatches.clear();
     mVGGTTrackIdToMP.clear();
+    mVGGTLocalToGlobalTrackIds.clear();
+    mNextVGGTGlobalTrackId = 0;
+    mCurrentVGGTFrameId = 0;
+    mnLastKeyFrameVGGTFrameId = 0;
+    mCurrentVGGTWindowVisibilityMasks.clear();
 
     mbVelocity = false;
 
@@ -4106,7 +4141,6 @@ void Tracking::InformOnlyTracking(const bool &flag)
 void Tracking::UpdateFrameIMU(const float s, const IMU::Bias &b, KeyFrame* pCurrentKeyFrame)
 {
     Map * pMap = pCurrentKeyFrame->GetMap();
-    unsigned int index = mnFirstFrameId;
     list<ORB_SLAM3::KeyFrame*>::iterator lRit = mlpReferences.begin();
     list<bool>::iterator lbL = mlbLost.begin();
     for(auto lit=mlRelativeFramePoses.begin(),lend=mlRelativeFramePoses.end();lit!=lend;lit++, lRit++, lbL++)
@@ -4180,6 +4214,8 @@ void Tracking::NewDataset()
 {
     mnNumDataset++;
     mVGGTTrackIdToMP.clear();
+    mCurrentVGGTFrameId = 0;
+    mnLastKeyFrameVGGTFrameId = 0;
 }
 
 int Tracking::GetNumberDataset()
@@ -4194,6 +4230,7 @@ int Tracking::GetMatchesInliers()
 
 void Tracking::SaveSubTrajectory(string strNameFile_frames, string strNameFile_kf, string strFolder)
 {
+    (void)strNameFile_kf;
     mpSystem->SaveTrajectoryEuRoC(strFolder + strNameFile_frames);
     //mpSystem->SaveKeyFrameTrajectoryEuRoC(strFolder + strNameFile_kf);
 }
@@ -4280,11 +4317,23 @@ Sophus::SE3f Tracking::GrabImageVGGT(const cv::Mat &im, const double &timestamp,
                                      const std::vector<cv::Point3f> &v3DPoints,
                                      const std::vector<cv::Vec3b> &vTrackColors,
                                      const cv::Mat &T_delta,
+                                     const std::vector<uint64_t> &frame_ids,
+                                     const std::vector<float> &visibility_ratios,
+                                     const std::vector<std::vector<uint8_t>> &window_visibility_masks,
                                      string filename)
 {
     // std::cout << "[DEBUG] Tracking::GrabImageVGGT start." << std::endl;
     mVGGTDeltaT = CvMatToSE3f(T_delta);
     mbHasVGGTDelta = true;
+    UpdateVGGTVisibilityWindow(frame_ids, visibility_ratios);
+    {
+        std::lock_guard<std::mutex> lock(mMutexVGGTVisibility);
+        mCurrentVGGTWindowVisibilityMasks = window_visibility_masks;
+    }
+    if(!frame_ids.empty())
+        mCurrentVGGTFrameId = frame_ids.back();
+    else
+        mCurrentVGGTFrameId = 0;
     mImGray = im;
     if(mImGray.channels()==3)
     {
@@ -4321,6 +4370,55 @@ Sophus::SE3f Tracking::GrabImageVGGT(const cv::Mat &im, const double &timestamp,
     // std::cout << "[DEBUG] TrackVGGT() returned." << std::endl;
 
     return mCurrentFrame.GetPose();
+}
+
+void Tracking::UpdateVGGTVisibilityWindow(const std::vector<uint64_t> &frame_ids,
+                                          const std::vector<float> &visibility_ratios)
+{
+    std::lock_guard<std::mutex> lock(mMutexVGGTVisibility);
+    mLatestVGGTFrameIds = frame_ids;
+    const size_t target = mLatestVGGTFrameIds.size();
+    mLatestVGGTVisibility.assign(target, 0.0f);
+    if(target == 0)
+        return;
+
+    if(visibility_ratios.size() == target)
+    {
+        mLatestVGGTVisibility = visibility_ratios;
+        return;
+    }
+
+    const size_t copy_count = std::min(target, visibility_ratios.size());
+    if(copy_count == 0)
+        return;
+    auto copy_begin = visibility_ratios.end() - static_cast<std::ptrdiff_t>(copy_count);
+    std::copy(copy_begin, visibility_ratios.end(), mLatestVGGTVisibility.end() - static_cast<std::ptrdiff_t>(copy_count));
+}
+
+float Tracking::LookupVisibilityRatio(uint64_t frame_id) const
+{
+    std::lock_guard<std::mutex> lock(mMutexVGGTVisibility);
+    for(size_t i = 0; i < mLatestVGGTFrameIds.size() && i < mLatestVGGTVisibility.size(); ++i)
+    {
+        if(mLatestVGGTFrameIds[i] == frame_id)
+        {
+            return mLatestVGGTVisibility[i];
+        }
+    }
+    return -1.0f;
+}
+
+std::vector<uint8_t> Tracking::GetVisibilityMaskForFrame(uint64_t frame_id) const
+{
+    std::lock_guard<std::mutex> lock(mMutexVGGTVisibility);
+    for(size_t i = 0; i < mLatestVGGTFrameIds.size() && i < mCurrentVGGTWindowVisibilityMasks.size(); ++i)
+    {
+        if(mLatestVGGTFrameIds[i] == frame_id)
+        {
+            return mCurrentVGGTWindowVisibilityMasks[i];
+        }
+    }
+    return {};
 }
 
 void Tracking::TrackVGGT()
@@ -4360,15 +4458,14 @@ void Tracking::TrackVGGT()
         {
             mnFirstFrameId = mCurrentFrame.mnId;
         }
-        // 初始化成功后也要设置 mLastFrame，供下一帧 MatchByTrackIds 使用
+        // 初始化成功后也要设置 mLastFrame，供下一帧继续使用
         mLastFrame = Frame(mCurrentFrame);
         return;
     }
     else
     {
-        // System is initialized. Track Frame.
+        // System is initialized. VGGT frames only update pose; no incremental optimization.
         bool bOK = true;
-        bool bPoseSeededByVGGT = false;
 
         if(mpLastKeyFrame && mbHasVGGTDelta)
         {
@@ -4376,7 +4473,6 @@ void Tracking::TrackVGGT()
             Sophus::SE3f TwcLast = mpLastKeyFrame->GetPoseInverse();
             Sophus::SE3f TwcSeed = mAccumulatedVGGTMotion * TwcLast;
             mCurrentFrame.SetPose(TwcSeed.inverse());
-            bPoseSeededByVGGT = true;
         }
         else{
             if (!mpLastKeyFrame)
@@ -4393,58 +4489,14 @@ void Tracking::TrackVGGT()
                 mCurrentFrame.SetPose(mLastFrame.GetPose());
         }
 
-        // 1. Match by Track IDs
-        // std::cout << "[DEBUG] TrackVGGT: Matching by Track IDs..." << std::endl;
-        const int point_match_count = MatchByTrackIds();
-        // std::cout << "[DEBUG] TrackVGGT: Matches found: " << point_match_count << std::endl;
-        const int nEffectiveRegions = CountEffectiveMatchRegions();
-        const int requiredRegions = std::max(kMinEffectiveRegions,
-                             static_cast<int>(kRegionCount * kGlobalRegionCoverageRatio));
-        // Require spatially distributed support so matches do not collapse into a tiny area.
-        
-        // 2. Pose Optimization
-        // If we have enough matches, optimize pose
-        if(nEffectiveRegions > requiredRegions)
-        {
-            // 统计并同步内点，保持与常规跟踪路径一致
-            int nInliers = 0;
-            for(int i=0; i<mCurrentFrame.N; i++)
-            {
-                if(mCurrentFrame.mvpMapPoints[i])
-                {
-                    nInliers++;
-                    // 与主流程一致：成功跟踪的地图点增加 found 计数
-                    mCurrentFrame.mvpMapPoints[i]->IncreaseFound();
-                }
-            }
-            mnMatchesInliers = nInliers;
-            if(mpLocalMapper)
-                mpLocalMapper->mnMatchesInliers = mnMatchesInliers;
-            if(nInliers < 10)
-                bOK = false;
-        }
-        else
-        {
-            bOK = false;
-        }
+        mnMatchesInliers = 0;
+        if(mpLocalMapper)
+            mpLocalMapper->mnMatchesInliers = 0;
 
-        // 3. Update Local Map (needed for backend)
-        if(bOK)
-        {
-            UpdateLocalMap();
-        }
-        // 4. KeyFrame Decision
-        if(bOK && NeedNewKeyFrameVGGT())
+        // KeyFrame Decision is fully visibility-driven now.
+        if(NeedNewKeyFrameVGGT())
         {
             CreateNewKeyFrameVGGT();
-        }
-
-        // 5. Failure recovery (simplified)
-        if(!bOK)
-        {
-            // mState = LOST; // For now, just keep going or handle lost
-            // In VGGT, maybe we trust the external tracker more?
-            // Or we just reset if lost.
         }
 
         // Update motion model
@@ -4481,148 +4533,6 @@ void Tracking::TrackVGGT()
     }
 }
 
-int Tracking::MatchByTrackIds()
-{
-    int nMatches = 0;
-
-    // Cache last frame associations for quick lookup and to refresh the global track cache
-    map<long, MapPoint*> lastFrameMapPoints;
-    const int last_track_count = std::min(mLastFrame.N, static_cast<int>(mLastFrame.mvTrackIds.size()));
-    for(int i = 0; i < last_track_count; ++i)
-    {
-        const long tid = mLastFrame.mvTrackIds[i];
-        MapPoint* pMP = (i < static_cast<int>(mLastFrame.mvpMapPoints.size())) ? mLastFrame.mvpMapPoints[i] : nullptr;
-        if(tid == -1 || !pMP)
-            continue;
-        lastFrameMapPoints[tid] = pMP;
-        if(!pMP->isBad())
-            mVGGTTrackIdToMP[tid] = pMP;
-    }
-
-    const int feature_count = std::min(mCurrentFrame.N, static_cast<int>(mCurrentFrame.mvTrackIds.size()));
-    for(int i = 0; i < feature_count; ++i)
-    {
-        const long tid = mCurrentFrame.mvTrackIds[i];
-        if(tid == -1)
-            continue;
-
-        MapPoint* pMP = nullptr;
-        auto itLast = lastFrameMapPoints.find(tid);
-        if(itLast != lastFrameMapPoints.end())
-        {
-            pMP = itLast->second;
-        }
-        else
-        {
-            auto itGlobal = mVGGTTrackIdToMP.find(tid);
-            if(itGlobal != mVGGTTrackIdToMP.end())
-            {
-                pMP = itGlobal->second;
-                if(!pMP || pMP->isBad())
-                {
-                    mVGGTTrackIdToMP.erase(itGlobal);
-                    pMP = nullptr;
-                }
-            }
-        }
-
-        if(pMP && !pMP->isBad())
-        {
-            if(i < static_cast<int>(mCurrentFrame.mvpMapPoints.size()))
-            {
-                mCurrentFrame.mvpMapPoints[i] = pMP;
-            }
-            pMP->mbTrackInView = true;
-            pMP->IncreaseVisible();
-            mVGGTTrackIdToMP[tid] = pMP;
-            ++nMatches;
-        }
-    }
-
-    return nMatches;
-}
-
-int Tracking::CountEffectiveMatchRegions() const
-{
-    const std::vector<cv::KeyPoint>* key_source = &mCurrentFrame.mvKeysUn;
-    if(key_source->empty())
-    {
-        key_source = &mCurrentFrame.mvKeys;
-    }
-    if(key_source->empty() || mCurrentFrame.mvTrackIds.empty())
-    {
-        return 0;
-    }
-
-    float min_x = std::numeric_limits<float>::max();
-    float max_x = std::numeric_limits<float>::lowest();
-    float min_y = std::numeric_limits<float>::max();
-    float max_y = std::numeric_limits<float>::lowest();
-    for(const auto &kp : *key_source)
-    {
-        min_x = std::min(min_x, kp.pt.x);
-        max_x = std::max(max_x, kp.pt.x);
-        min_y = std::min(min_y, kp.pt.y);
-        max_y = std::max(max_y, kp.pt.y);
-    }
-
-    const float span_x = std::max(1e-3f, max_x - min_x);
-    const float span_y = std::max(1e-3f, max_y - min_y);
-    if(span_x <= 1e-3f || span_y <= 1e-3f)
-    {
-        return 0;
-    }
-
-    const float inv_cell_width = static_cast<float>(kRegionCols) / span_x;
-    const float inv_cell_height = static_cast<float>(kRegionRows) / span_y;
-
-    std::vector<int> region_total(kRegionCount, 0);
-    std::vector<int> region_tracked(kRegionCount, 0);
-
-    const size_t feature_count = std::min(key_source->size(), mCurrentFrame.mvTrackIds.size());
-    const bool has_outlier_flags = mCurrentFrame.mvbOutlier.size() == feature_count;
-
-    for(size_t i = 0; i < feature_count; ++i)
-    {
-        if(mCurrentFrame.mvTrackIds[i] == -1)
-        {
-            continue;
-        }
-
-        const auto &kp = (*key_source)[i];
-        int col = static_cast<int>((kp.pt.x - min_x) * inv_cell_width);
-        int row = static_cast<int>((kp.pt.y - min_y) * inv_cell_height);
-        col = std::max(0, std::min(kRegionCols - 1, col));
-        row = std::max(0, std::min(kRegionRows - 1, row));
-        const int idx = row * kRegionCols + col;
-
-        region_total[idx]++;
-        const bool has_map_point = i < mCurrentFrame.mvpMapPoints.size() && mCurrentFrame.mvpMapPoints[i];
-        const bool not_outlier = !has_outlier_flags || !mCurrentFrame.mvbOutlier[i];
-        if(has_map_point && not_outlier)
-        {
-            region_tracked[idx]++;
-        }
-    }
-
-    int effective_regions = 0;
-    for(int idx = 0; idx < kRegionCount; ++idx)
-    {
-        if(region_total[idx] < kMinSamplesPerRegion)
-        {
-            continue;
-        }
-        const float ratio = static_cast<float>(region_tracked[idx]) /
-                            static_cast<float>(region_total[idx]);
-        if(ratio >= kRegionTrackRatio)
-        {
-            ++effective_regions;
-        }
-    }
-
-    return effective_regions;
-}
-
 void Tracking::MonocularInitializationVGGT()
 {
     // Simple initialization:
@@ -4643,9 +4553,49 @@ void Tracking::MonocularInitializationVGGT()
         const int color_count = static_cast<int>(mCurrentFrame.mvVGGTTrackColors.size());
         const int track_count = static_cast<int>(mCurrentFrame.mvTrackIds.size());
 
+        std::unordered_map<long, long> nextLocalToGlobal;
+        nextLocalToGlobal.reserve(track_count);
+        int reused_global_ids = 0;
+        int new_global_ids = 0;
+        std::vector<uint8_t> prev_visibility_mask = GetVisibilityMaskForFrame(mnLastKeyFrameVGGTFrameId);
+        const size_t overlap_mask_size = prev_visibility_mask.size();
+        auto visible_in_prev = [&](long local_id) -> bool
+        {
+            if(local_id < 0)
+                return false;
+            const size_t idx = static_cast<size_t>(local_id);
+            return idx < overlap_mask_size && prev_visibility_mask[idx] > 0;
+        };
+        auto resolveGlobalId = [&](long local_id) -> long
+        {
+            if(local_id < 0)
+                return -1;
+            auto it_cached = nextLocalToGlobal.find(local_id);
+            if(it_cached != nextLocalToGlobal.end())
+                return it_cached->second;
+            long global_id = -1;
+            if(visible_in_prev(local_id))
+            {
+                auto it_prev = mVGGTLocalToGlobalTrackIds.find(local_id);
+                if(it_prev != mVGGTLocalToGlobalTrackIds.end())
+                {
+                    global_id = it_prev->second;
+                    ++reused_global_ids;
+                }
+            }
+            if(global_id < 0)
+            {
+                global_id = mNextVGGTGlobalTrackId++;
+                ++new_global_ids;
+            }
+            nextLocalToGlobal[local_id] = global_id;
+            return global_id;
+        };
+
         for(int i = 0; i < total_feats; ++i)
         {
             const long track_id = (i < track_count) ? mCurrentFrame.mvTrackIds[i] : -1;
+            const long global_id = resolveGlobalId(track_id);
             MapPoint* pMP = (i < static_cast<int>(mCurrentFrame.mvpMapPoints.size())) ? mCurrentFrame.mvpMapPoints[i] : nullptr;
 
             if(pMP && !pMP->isBad())
@@ -4653,16 +4603,16 @@ void Tracking::MonocularInitializationVGGT()
                 pMP->SetVGGTPoint(true);
                 if(i < color_count)
                     pMP->SetColor(mCurrentFrame.mvVGGTTrackColors[i]);
-                if(track_id >= 0)
-                    mVGGTTrackIdToMP[track_id] = pMP;
+                if(global_id >= 0)
+                    mVGGTTrackIdToMP[global_id] = pMP;
                 pMP->AddObservation(pKFini, i);
                 pKFini->AddMapPoint(pMP, i);
                 continue;
             }
 
-            if(track_id >= 0)
+            if(global_id >= 0)
             {
-                auto it = mVGGTTrackIdToMP.find(track_id);
+                auto it = mVGGTTrackIdToMP.find(global_id);
                 if(it != mVGGTTrackIdToMP.end())
                 {
                     MapPoint* pCached = it->second;
@@ -4699,15 +4649,29 @@ void Tracking::MonocularInitializationVGGT()
 
             mpAtlas->GetCurrentMap()->AddMapPoint(pNewMP);
             mCurrentFrame.mvpMapPoints[i] = pNewMP;
-            if(track_id >= 0)
-                mVGGTTrackIdToMP[track_id] = pNewMP;
+            if(global_id >= 0)
+                mVGGTTrackIdToMP[global_id] = pNewMP;
         }
+
+          mVGGTLocalToGlobalTrackIds = std::move(nextLocalToGlobal);
+        std::vector<uint64_t> window_frame_ids;
+        std::vector<std::vector<uint8_t>> window_visibility_masks;
+        {
+            std::lock_guard<std::mutex> lock(mMutexVGGTVisibility);
+            window_frame_ids = mLatestVGGTFrameIds;
+            window_visibility_masks = mCurrentVGGTWindowVisibilityMasks;
+        }
+          std::cerr << "[VGGT] KF init global track IDs -> reused=" << reused_global_ids
+              << ", new=" << new_global_ids
+              << ", prev_frame_id=" << mnLastKeyFrameVGGTFrameId
+              << ", window_invisible=" << FormatFrameInvisibleCounts(window_frame_ids, window_visibility_masks) << std::endl;
         
         mpLocalMapper->InsertKeyFrame(pKFini);
         
         // 设置最后一个关键帧
         mpLastKeyFrame = pKFini;
         mnLastKeyFrameId = mCurrentFrame.mnId;
+        mnLastKeyFrameVGGTFrameId = mCurrentVGGTFrameId;
         mpReferenceKF = pKFini;
         
         // 初始化VGGT累积运动为单位矩阵
@@ -4727,114 +4691,35 @@ bool Tracking::NeedNewKeyFrameVGGT()
     if(mpLocalMapper->isStopped() || mpLocalMapper->stopRequested())
         return false;
     
-    // Require minimum frame gap from last KF
     if(!mpLastKeyFrame)
-        return mCurrentFrame.N > 100;
-    
+        return mCurrentFrame.N > 0;
+
     const int frames_since_kf = mCurrentFrame.mnId - mnLastKeyFrameId;
-    if(frames_since_kf < 5)  // At least 5 frames between KFs
-        return false;
-    
-    // Compute regional coverage for tracked and new points
-    const std::vector<cv::KeyPoint>* key_source = &mCurrentFrame.mvKeysUn;
-    if(key_source->empty())
-        key_source = &mCurrentFrame.mvKeys;
-    if(key_source->empty() || mCurrentFrame.mvTrackIds.empty())
-        return false;
-    
-    float min_x = std::numeric_limits<float>::max();
-    float max_x = std::numeric_limits<float>::lowest();
-    float min_y = std::numeric_limits<float>::max();
-    float max_y = std::numeric_limits<float>::lowest();
-    for(const auto &kp : *key_source)
+    const uint64_t last_kf_vggt_id = mnLastKeyFrameVGGTFrameId;
+    const float last_visibility = LookupVisibilityRatio(last_kf_vggt_id);
+
+    if(last_visibility >= 0.0f)
     {
-        min_x = std::min(min_x, kp.pt.x);
-        max_x = std::max(max_x, kp.pt.x);
-        min_y = std::min(min_y, kp.pt.y);
-        max_y = std::max(max_y, kp.pt.y);
+        if(last_visibility < 0.3f)
+        {
+            std::cerr << "[VGGT] Force keyframe (visibility=" << last_visibility
+                      << ") for VGGT frame " << last_kf_vggt_id << std::endl;
+            return true;
+        }
+        if(last_visibility < 0.7f)
+        {
+            std::cerr << "[VGGT] Create keyframe (visibility=" << last_visibility
+                      << ") for VGGT frame " << last_kf_vggt_id << std::endl;
+            return true;
+        }
     }
-    
-    const float span_x = std::max(1e-3f, max_x - min_x);
-    const float span_y = std::max(1e-3f, max_y - min_y);
-    if(span_x <= 1e-3f || span_y <= 1e-3f)
-        return false;
-    
-    const float inv_cell_width = static_cast<float>(kRegionCols) / span_x;
-    const float inv_cell_height = static_cast<float>(kRegionRows) / span_y;
-    
-    std::vector<int> region_total(kRegionCount, 0);
-    std::vector<int> region_tracked(kRegionCount, 0);
-    std::vector<int> region_new(kRegionCount, 0);
-    
-    const size_t feature_count = std::min(key_source->size(), mCurrentFrame.mvTrackIds.size());
-    
-    for(size_t i = 0; i < feature_count; ++i)
+
+    if(frames_since_kf >= 7)
     {
-        if(mCurrentFrame.mvTrackIds[i] == -1)
-            continue;
-        
-        const auto &kp = (*key_source)[i];
-        int col = static_cast<int>((kp.pt.x - min_x) * inv_cell_width);
-        int row = static_cast<int>((kp.pt.y - min_y) * inv_cell_height);
-        col = std::max(0, std::min(kRegionCols - 1, col));
-        row = std::max(0, std::min(kRegionRows - 1, row));
-        const int idx = row * kRegionCols + col;
-        
-        region_total[idx]++;
-        
-        const bool has_map_point = i < mCurrentFrame.mvpMapPoints.size() && 
-                                   mCurrentFrame.mvpMapPoints[i] && 
-                                   !mCurrentFrame.mvpMapPoints[i]->isBad();
-        if(has_map_point)
-            region_tracked[idx]++;
-        else
-            region_new[idx]++;
-    }
-    
-    // Count regions with sufficient tracking and regions with new points
-    int tracked_regions = 0;
-    int new_regions = 0;
-    for(int idx = 0; idx < kRegionCount; ++idx)
-    {
-        if(region_total[idx] < kMinSamplesPerRegion)
-            continue;
-        
-        const float tracked_ratio = static_cast<float>(region_tracked[idx]) / 
-                                    static_cast<float>(region_total[idx]);
-        const float new_ratio = static_cast<float>(region_new[idx]) / 
-                               static_cast<float>(region_total[idx]);
-        
-        if(tracked_ratio >= kRegionTrackRatio)
-            tracked_regions++;
-        if(new_ratio >= kRegionTrackRatio)  // Reuse same ratio for new points
-            new_regions++;
-    }
-    
-    const int min_tracked_regions = static_cast<int>(kRegionCount * 0.15f);  // 15% coverage
-    const int min_new_regions = static_cast<int>(kRegionCount * 0.10f);      // 10% new area
-    
-    // Condition 1: Too few tracked regions (losing map coverage)
-    if(tracked_regions < min_tracked_regions)
+        std::cerr << "[VGGT] Create keyframe: exceeded 7-frame gap (" << frames_since_kf << ")" << std::endl;
         return true;
-    
-    // Condition 2: Many new regions with potential MapPoints
-    if(new_regions > min_new_regions && tracked_regions < static_cast<int>(kRegionCount * 0.5f))
-        return true;
-    
-    // Condition 3: Forced insertion after max frames
-    if(frames_since_kf >= 30)  // Max 30 frames between KFs
-        return true;
-    
-    // Condition 4: Check motion magnitude from VGGT delta
-    if(mbHasVGGTDelta)
-    {
-        const float translation_norm = mVGGTDeltaT.translation().norm();
-        const float rotation_angle = mVGGTDeltaT.so3().log().norm();
-        // Insert KF if significant motion (>10cm translation or >5deg rotation)
-        if(translation_norm > 0.1f || rotation_angle > 0.087f)
-            return mpLocalMapper->AcceptKeyFrames();
     }
-    
+
     return false;
 }
 
@@ -4872,11 +4757,50 @@ void Tracking::CreateNewKeyFrameVGGT()
     const int color_count = static_cast<int>(mCurrentFrame.mvVGGTTrackColors.size());
     const int total_feats = mCurrentFrame.N;
 
-    auto reuseFromCache = [&](long track_id) -> MapPoint*
+    std::unordered_map<long, long> nextLocalToGlobal;
+    nextLocalToGlobal.reserve(track_count);
+    int reused_global_ids = 0;
+    int new_global_ids = 0;
+    std::vector<uint8_t> prev_visibility_mask = GetVisibilityMaskForFrame(mnLastKeyFrameVGGTFrameId);
+    const size_t overlap_mask_size = prev_visibility_mask.size();
+    auto visible_in_prev = [&](long local_id) -> bool
     {
-        if(track_id < 0)
+        if(local_id < 0)
+            return false;
+        const size_t idx = static_cast<size_t>(local_id);
+        return idx < overlap_mask_size && prev_visibility_mask[idx] > 0;
+    };
+    auto resolveGlobalId = [&](long local_id) -> long
+    {
+        if(local_id < 0)
+            return -1;
+        auto it_cached = nextLocalToGlobal.find(local_id);
+        if(it_cached != nextLocalToGlobal.end())
+            return it_cached->second;
+        long global_id = -1;
+        if(visible_in_prev(local_id))
+        {
+            auto it_prev = mVGGTLocalToGlobalTrackIds.find(local_id);
+            if(it_prev != mVGGTLocalToGlobalTrackIds.end())
+            {
+                global_id = it_prev->second;
+                ++reused_global_ids;
+            }
+        }
+        if(global_id < 0)
+        {
+            global_id = mNextVGGTGlobalTrackId++;
+            ++new_global_ids;
+        }
+        nextLocalToGlobal[local_id] = global_id;
+        return global_id;
+    };
+
+    auto reuseFromGlobal = [&](long global_id) -> MapPoint*
+    {
+        if(global_id < 0)
             return nullptr;
-        auto it = mVGGTTrackIdToMP.find(track_id);
+        auto it = mVGGTTrackIdToMP.find(global_id);
         if(it == mVGGTTrackIdToMP.end())
             return nullptr;
         MapPoint* cached = it->second;
@@ -4892,20 +4816,21 @@ void Tracking::CreateNewKeyFrameVGGT()
     {
         MapPoint* pMP = (i < static_cast<int>(mCurrentFrame.mvpMapPoints.size())) ? mCurrentFrame.mvpMapPoints[i] : nullptr;
         const long track_id = (i < track_count) ? mCurrentFrame.mvTrackIds[i] : -1;
+        const long global_id = resolveGlobalId(track_id);
 
         if(pMP && !pMP->isBad())
         {
             pMP->SetVGGTPoint(true);
             if(i < color_count)
                 pMP->SetColor(mCurrentFrame.mvVGGTTrackColors[i]);
-            if(track_id >= 0)
-                mVGGTTrackIdToMP[track_id] = pMP;
+            if(global_id >= 0)
+                mVGGTTrackIdToMP[global_id] = pMP;
             pMP->AddObservation(pKF, i);
             pKF->AddMapPoint(pMP, i);
             continue;
         }
 
-        MapPoint* pCached = reuseFromCache(track_id);
+        MapPoint* pCached = reuseFromGlobal(global_id);
         if(pCached)
         {
             mCurrentFrame.mvpMapPoints[i] = pCached;
@@ -4935,9 +4860,22 @@ void Tracking::CreateNewKeyFrameVGGT()
         pNewMP->UpdateNormalAndDepth();
         mpAtlas->AddMapPoint(pNewMP);
         mCurrentFrame.mvpMapPoints[i]=pNewMP;
-        if(track_id >= 0)
-            mVGGTTrackIdToMP[track_id] = pNewMP;
+        if(global_id >= 0)
+            mVGGTTrackIdToMP[global_id] = pNewMP;
     }
+
+    mVGGTLocalToGlobalTrackIds = std::move(nextLocalToGlobal);
+    std::vector<uint64_t> window_frame_ids;
+    std::vector<std::vector<uint8_t>> window_visibility_masks;
+    {
+        std::lock_guard<std::mutex> lock(mMutexVGGTVisibility);
+        window_frame_ids = mLatestVGGTFrameIds;
+        window_visibility_masks = mCurrentVGGTWindowVisibilityMasks;
+    }
+    std::cerr << "[VGGT] KF global track IDs -> reused=" << reused_global_ids
+              << ", new=" << new_global_ids
+              << ", prev_frame_id=" << mnLastKeyFrameVGGTFrameId
+              << ", window_invisible=" << FormatFrameInvisibleCounts(window_frame_ids, window_visibility_masks) << std::endl;
 
     if (mpLocalMapper->insertKeyFrameCallback)
     {
@@ -4953,6 +4891,7 @@ void Tracking::CreateNewKeyFrameVGGT()
 
     mnLastKeyFrameId = mCurrentFrame.mnId;
     mpLastKeyFrame = pKF;
+    mnLastKeyFrameVGGTFrameId = mCurrentVGGTFrameId;
     mAccumulatedVGGTMotion = Sophus::SE3f();
     
     std::cerr << "[VGGT KF] New KeyFrame created: " << pKF->mnId 

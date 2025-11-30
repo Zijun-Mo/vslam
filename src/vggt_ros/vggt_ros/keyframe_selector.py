@@ -7,6 +7,7 @@ class KeyframeSelector:
         Args:
             window_size (int): Number of keyframes to keep in the window.
             min_parallax (float): Minimum average pixel displacement (optical flow) to select a new keyframe.
+                                  Values <= 1 are treated as a fraction of the image diagonal (e.g. 0.1 = 10%).
         """
         self.window_size = window_size
         self.min_parallax = min_parallax
@@ -32,12 +33,20 @@ class KeyframeSelector:
             
         # Calculate parallax relative to the last keyframe
         flow_magnitude = self.calculate_parallax(self.last_keyframe_gray, gray)
-        
-        if flow_magnitude >= self.min_parallax:
+        threshold = self._parallax_threshold(cv_image.shape)
+
+        if flow_magnitude >= threshold:
             self.add_keyframe(cv_image, header, gray)
             return True # New keyframe added
             
         return False # Frame skipped (not enough parallax)
+
+    def _parallax_threshold(self, image_shape):
+        height, width = image_shape[0], image_shape[1]
+        if self.min_parallax <= 1.0:
+            diag = (height**2 + width**2) ** 0.5
+            return self.min_parallax * diag
+        return self.min_parallax
 
     def add_keyframe(self, cv_image, header, gray):
         self.keyframes.append((cv_image, header))

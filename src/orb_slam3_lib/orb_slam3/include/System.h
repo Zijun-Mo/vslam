@@ -131,7 +131,10 @@ public:
                            const std::vector<cv::Point3f> &v3DPoints,
                            const std::vector<cv::Vec3b> &vTrackColors,
                            const cv::Mat &T_delta,
-                           string filename="");
+                           const std::vector<uint64_t> &frame_ids,
+                           const std::vector<float> &visibility_ratios,
+                           const std::vector<std::vector<uint8_t>> &window_visibility_masks,
+                               string filename="");
 
     // This stops local mapping thread (map building) and performs only camera tracking.
     void ActivateLocalizationMode();

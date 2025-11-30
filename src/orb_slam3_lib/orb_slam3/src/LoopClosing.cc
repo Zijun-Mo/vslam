@@ -227,6 +227,11 @@ void LoopClosing::Run()
                     vnPR_TypeRecogn.push_back(0);
 
                     Verbose::PrintMess("*Loop detected", Verbose::VERBOSITY_QUIET);
+                    std::cerr << "[VGGT] Loop detected: current_kf=" << (mpCurrentKF ? mpCurrentKF->mnId : -1)
+                              << ", matched_kf=" << (mpLoopMatchedKF ? mpLoopMatchedKF->mnId : -1)
+                              << ", coincidences=" << mnLoopNumCoincidences
+                              << ", not_found=" << mnLoopNumNotFound
+                              << std::endl;
 
                     mg2oLoopScw = mg2oLoopSlw; //*mvg2oSim3LoopTcw[nCurrentIndex];
                     if(mpCurrentKF->GetMap()->IsInertial())

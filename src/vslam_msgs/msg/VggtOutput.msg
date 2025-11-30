@@ -1,6 +1,12 @@
 std_msgs/Header header
 uint64 vggt_frame_id
 geometry_msgs/PoseArray camera_poses
+# Optional list of keyframe IDs corresponding to camera_poses order
+uint64[] keyframe_ids
+# Visibility ratios for each camera pose (normalized by latest frame visibility)
+float32[] visibility_ratios
+# Latest raw image (same frame as camera_poses[-1])
+sensor_msgs/Image latest_image
 # Dense 3D tracks tensor with shape (S, N, 3) where N = query_grid_height * query_grid_width
 std_msgs/Float32MultiArray tracks_3d
 # Validity mask with shape (S, N)
