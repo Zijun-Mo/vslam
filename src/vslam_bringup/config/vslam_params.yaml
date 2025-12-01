@@ -13,6 +13,7 @@
     settings_file: "/home/jun/vslam/src/orb_slam3_lib/orb_slam3/config/Monocular/EuRoC.yaml"
     use_viewer: true
     override_intrinsics_from_vggt: true
+    enable_vggt_phase2: true
 
     # Video Reader Parameters
     video_path: "/docs/myroom.mp4"

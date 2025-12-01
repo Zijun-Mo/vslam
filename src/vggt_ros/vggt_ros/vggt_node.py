@@ -412,16 +412,25 @@ class VGGTNode(Node):
 
         # Create MultiArray for tracks_3d
         tracks_msg = Float32MultiArray()
-        
+
         # Define layout
         dim_s = MultiArrayDimension(label="S", size=S, stride=S*N*3)
         dim_n = MultiArrayDimension(label="N", size=N, stride=N*3)
         dim_c = MultiArrayDimension(label="C", size=3, stride=3)
         tracks_msg.layout.dim = [dim_s, dim_n, dim_c]
-        
+
         # Flatten data
         tracks_msg.data = tracks_3d.flatten().tolist()
         output_msg.tracks_3d = tracks_msg
+
+        # Create MultiArray for tracks_2d (preprocessed image coords)
+        tracks2d_msg = Float32MultiArray()
+        dim_s_2d = MultiArrayDimension(label="S", size=S, stride=S*N*2)
+        dim_n_2d = MultiArrayDimension(label="N", size=N, stride=N*2)
+        dim_c_2d = MultiArrayDimension(label="C", size=2, stride=2)
+        tracks2d_msg.layout.dim = [dim_s_2d, dim_n_2d, dim_c_2d]
+        tracks2d_msg.data = tracks.reshape(-1).tolist()
+        output_msg.tracks_2d = tracks2d_msg
         
         # Create MultiArray for tracks_mask
         mask_msg = Float32MultiArray()

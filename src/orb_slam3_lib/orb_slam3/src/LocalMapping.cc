@@ -135,6 +135,17 @@ void LocalMapping::Run()
                 if(mpAtlas->KeyFramesInMap()>2)
                 {
 
+                    Sophus::SE3f poseBeforeLBA;
+                    if(mbCurrentKeyFrameIsVGGT)
+                    {
+                        poseBeforeLBA = mpCurrentKeyFrame->GetPose();
+                        const Eigen::Vector3f t = poseBeforeLBA.translation();
+                        std::cerr << "[VGGT LM] Before LBA KF " << mpCurrentKeyFrame->mnId
+                                  << " t=" << t.transpose()
+                                  << " yaw_pitch_roll_mag=" << poseBeforeLBA.so3().log().norm()
+                                  << std::endl;
+                    }
+
                     if(mbInertial && mpCurrentKeyFrame->GetMap()->isImuInitialized())
                     {
                         float dist = (mpCurrentKeyFrame->mPrevKF->GetCameraCenter() - mpCurrentKeyFrame->GetCameraCenter()).norm() +
@@ -162,6 +173,18 @@ void LocalMapping::Run()
                     {
                         Optimizer::LocalBundleAdjustment(mpCurrentKeyFrame,&mbAbortBA, mpCurrentKeyFrame->GetMap(),num_FixedKF_BA,num_OptKF_BA,num_MPs_BA,num_edges_BA);
                         b_doneLBA = true;
+                    }
+
+                    if(mbCurrentKeyFrameIsVGGT)
+                    {
+                        Sophus::SE3f poseAfterLBA = mpCurrentKeyFrame->GetPose();
+                        Sophus::SE3f delta = poseBeforeLBA.inverse() * poseAfterLBA;
+                        const float trans_delta = delta.translation().norm();
+                        const float rot_delta = delta.so3().log().norm();
+                        std::cerr << "[VGGT LM] After LBA KF " << mpCurrentKeyFrame->mnId
+                                  << " |Δt|=" << trans_delta
+                                  << " |Δrot|=" << rot_delta
+                                  << std::endl;
                     }
 
                 }

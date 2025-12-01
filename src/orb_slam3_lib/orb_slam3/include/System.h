@@ -134,7 +134,14 @@ public:
                            const std::vector<uint64_t> &frame_ids,
                            const std::vector<float> &visibility_ratios,
                            const std::vector<std::vector<uint8_t>> &window_visibility_masks,
-                               string filename="");
+                           const std::vector<cv::Mat> &window_pose_twcs,
+                           const std::vector<std::vector<cv::Point2f>> &window_tracks_2d,
+                           int query_grid_width,
+                           int query_grid_height,
+                           int query_stride,
+                           int original_image_width,
+                           int original_image_height,
+                           string filename="");
 
     // This stops local mapping thread (map building) and performs only camera tracking.
     void ActivateLocalizationMode();

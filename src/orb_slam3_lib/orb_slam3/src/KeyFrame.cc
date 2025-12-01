@@ -198,6 +198,34 @@ bool KeyFrame::IsVGGTKeyframe()
     return mbFromVGGT;
 }
 
+void KeyFrame::SetVGGTTrackMetadata(const std::vector<long>& global_track_ids,
+                                    const std::vector<char>& is_new_flags,
+                                    const std::vector<Eigen::Vector3f>& points_in_camera)
+{
+    unique_lock<mutex> lock(mMutexFeatures);
+    mvVGGTGlobalTrackIds = global_track_ids;
+    mvVGGTIsNewTrack = is_new_flags;
+    mvVGGTPointsInCamera = points_in_camera;
+}
+
+std::vector<long> KeyFrame::GetVGGTGlobalTrackIds() const
+{
+    unique_lock<mutex> lock(mMutexFeatures);
+    return mvVGGTGlobalTrackIds;
+}
+
+std::vector<char> KeyFrame::GetVGGTIsNewFlags() const
+{
+    unique_lock<mutex> lock(mMutexFeatures);
+    return mvVGGTIsNewTrack;
+}
+
+std::vector<Eigen::Vector3f> KeyFrame::GetVGGTPointsInCamera() const
+{
+    unique_lock<mutex> lock(mMutexFeatures);
+    return mvVGGTPointsInCamera;
+}
+
 void KeyFrame::AddConnection(KeyFrame *pKF, const int &weight)
 {
     {

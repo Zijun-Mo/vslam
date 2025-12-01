@@ -159,6 +159,59 @@ namespace ORB_SLAM3 {
         _jacobianOplusXj = projectJac * SE3deriv;
     }
 
+    EdgeVGGTDistance::EdgeVGGTDistance()
+        : BaseBinaryEdge<3, Eigen::Vector3d, g2o::VertexSBAPointXYZ, g2o::VertexSE3Expmap>()
+    {
+    }
+
+    bool EdgeVGGTDistance::read(std::istream& is)
+    {
+        for(int i = 0; i < 3; ++i)
+            is >> _measurement[i];
+        for(int i = 0; i < 3; ++i)
+            for(int j = i; j < 3; ++j)
+            {
+                is >> information()(i,j);
+                if(i != j)
+                    information()(j,i) = information()(i,j);
+            }
+        return true;
+    }
+
+    bool EdgeVGGTDistance::write(std::ostream& os) const
+    {
+        for(int i = 0; i < 3; ++i)
+            os << measurement()[i] << " ";
+        for(int i = 0; i < 3; ++i)
+            for(int j = i; j < 3; ++j)
+                os << " " << information()(i,j);
+        return os.good();
+    }
+
+    void EdgeVGGTDistance::computeError()
+    {
+        const g2o::VertexSBAPointXYZ* point = static_cast<const g2o::VertexSBAPointXYZ*>(_vertices[0]);
+        const g2o::VertexSE3Expmap* pose = static_cast<const g2o::VertexSE3Expmap*>(_vertices[1]);
+        Eigen::Vector3d predicted = pose->estimate().map(point->estimate());
+        _error = predicted - _measurement;
+    }
+
+    void EdgeVGGTDistance::linearizeOplus()
+    {
+        g2o::VertexSBAPointXYZ* point = static_cast<g2o::VertexSBAPointXYZ*>(_vertices[0]);
+        g2o::VertexSE3Expmap* pose = static_cast<g2o::VertexSE3Expmap*>(_vertices[1]);
+        const Eigen::Vector3d Pw = point->estimate();
+        const g2o::SE3Quat& Tcw = pose->estimate();
+        Eigen::Vector3d xyz = Tcw.map(Pw);
+        _jacobianOplusXi = Tcw.rotation().toRotationMatrix();
+
+        Eigen::Matrix<double,3,6> SE3deriv;
+        SE3deriv << 0.f, xyz[2], -xyz[1], 1.f, 0.f, 0.f,
+                -xyz[2], 0.f, xyz[0], 0.f, 1.f, 0.f,
+                xyz[1], -xyz[0], 0.f, 0.f, 0.f, 1.f;
+        _jacobianOplusXj = SE3deriv;
+    }
+
     EdgeSE3ProjectXYZToBody::EdgeSE3ProjectXYZToBody() : BaseBinaryEdge<2, Eigen::Vector2d, g2o::VertexSBAPointXYZ, g2o::VertexSE3Expmap>() {
     }
 

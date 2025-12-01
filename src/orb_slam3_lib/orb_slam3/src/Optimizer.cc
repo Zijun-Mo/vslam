@@ -16,28 +16,20 @@
 * If not, see <http://www.gnu.org/licenses/>.
 */
 
-
 #include "Optimizer.h"
-
-
-#include <complex>
-
-#include <Eigen/StdVector>
-#include <Eigen/Dense>
-#include <unsupported/Eigen/MatrixFunctions>
-
-#include "Thirdparty/g2o/g2o/core/sparse_block_matrix.h"
-#include "Thirdparty/g2o/g2o/core/block_solver.h"
-#include "Thirdparty/g2o/g2o/core/optimization_algorithm_levenberg.h"
-#include "Thirdparty/g2o/g2o/core/optimization_algorithm_gauss_newton.h"
-#include "Thirdparty/g2o/g2o/solvers/linear_solver_eigen.h"
-#include "Thirdparty/g2o/g2o/types/types_six_dof_expmap.h"
 #include "Thirdparty/g2o/g2o/core/robust_kernel_impl.h"
 #include "Thirdparty/g2o/g2o/solvers/linear_solver_dense.h"
 #include "G2oTypes.h"
 #include "Converter.h"
 
 #include<mutex>
+#include<unordered_set>
+#include<cmath>
+#include<atomic>
+#include<limits>
+
+#include <opencv2/imgproc.hpp>
+#include <opencv2/highgui.hpp>
 
 #include "OptimizableTypes.h"
 
@@ -47,6 +39,544 @@ namespace ORB_SLAM3
 bool sortByVal(const pair<MapPoint*, int> &a, const pair<MapPoint*, int> &b)
 {
     return (a.second < b.second);
+}
+
+namespace
+{
+std::atomic<bool> g_enable_vggt_phase2{true};
+
+struct VGGTPriorObservation
+{
+    MapPoint* pMP{nullptr};
+    Eigen::Vector3d camPoint{Eigen::Vector3d::Zero()};
+    bool isNew{true};
+    long globalId{-1};
+};
+
+std::vector<VGGTPriorObservation> CollectVGGTPriors(KeyFrame* pKF, Map* pTargetMap)
+{
+    std::vector<VGGTPriorObservation> result;
+    if(!pKF || !pTargetMap)
+        return result;
+
+    const std::vector<MapPoint*> vpMatches = pKF->GetMapPointMatches();
+    const std::vector<long> vGlobalIds = pKF->GetVGGTGlobalTrackIds();
+    const std::vector<char> vIsNewFlags = pKF->GetVGGTIsNewFlags();
+    const std::vector<Eigen::Vector3f> vCamPoints = pKF->GetVGGTPointsInCamera();
+
+    if(vpMatches.empty() || vCamPoints.empty())
+        return result;
+
+    result.reserve(vpMatches.size());
+    std::unordered_set<MapPoint*> usedPoints;
+    usedPoints.reserve(vpMatches.size());
+    double total_cam_mp_dist = 0.0;
+    int dist_samples = 0;
+    const Sophus::SE3f Tcw = pKF->GetPose();
+
+    for(size_t i = 0; i < vpMatches.size(); ++i)
+    {
+        MapPoint* pMP = vpMatches[i];
+        if(!pMP || pMP->isBad())
+            continue;
+        if(pMP->GetMap() != pTargetMap)
+            continue;
+        if(!pMP->IsVGGTPoint())
+            continue;
+        if(i >= vCamPoints.size())
+            continue;
+        const Eigen::Vector3f& cam = vCamPoints[i];
+        if(!std::isfinite(cam[0]) || !std::isfinite(cam[1]) || !std::isfinite(cam[2]))
+            continue;
+        if(!usedPoints.insert(pMP).second)
+            continue;
+
+        VGGTPriorObservation obs;
+        obs.pMP = pMP;
+        obs.camPoint = cam.cast<double>();
+        obs.isNew = (i < vIsNewFlags.size()) ? (vIsNewFlags[i] != 0) : true;
+        obs.globalId = (i < vGlobalIds.size()) ? vGlobalIds[i] : -1;
+        result.push_back(obs);
+
+        const Eigen::Vector3f Pw = pMP->GetWorldPos();
+        const Eigen::Vector3f Pc = Tcw * Pw;
+        total_cam_mp_dist += (Pc - cam).norm();
+        if((Pc - cam).norm() >= 1e-5) ++dist_samples;
+    }
+
+    if(dist_samples > 0)
+    {
+        const double avg_dist = total_cam_mp_dist / static_cast<double>(dist_samples);
+        std::cerr << "[VGGT Prior] KF " << pKF->mnId
+                  << " avg_cam_mp_dist=" << avg_dist
+                  << " samples=" << dist_samples << std::endl;
+    }
+
+    return result;
+}
+
+Sophus::SE3f RunVGGTPhase1(const Sophus::SE3f& initialPose,
+                           const std::vector<VGGTPriorObservation>& reusedObs,
+                           bool* pbStopFlag,
+                           double& chi2_before,
+                           double& chi2_after,
+                           int& edge_count)
+{
+    edge_count = static_cast<int>(reusedObs.size());
+    if(reusedObs.empty())
+    {
+        chi2_before = 0.0;
+        chi2_after = 0.0;
+        return initialPose;
+    }
+
+    g2o::SparseOptimizer optimizer;
+    auto* linearSolver = new g2o::LinearSolverEigen<g2o::BlockSolver_6_3::PoseMatrixType>();
+    auto* solver_ptr = new g2o::BlockSolver_6_3(linearSolver);
+    auto* solver = new g2o::OptimizationAlgorithmLevenberg(solver_ptr);
+    optimizer.setAlgorithm(solver);
+    optimizer.setVerbose(false);
+    if(pbStopFlag)
+        optimizer.setForceStopFlag(pbStopFlag);
+
+    g2o::VertexSE3Expmap* vPose = new g2o::VertexSE3Expmap();
+    g2o::SE3Quat Tcw(initialPose.unit_quaternion().cast<double>(), initialPose.translation().cast<double>());
+    vPose->setEstimate(Tcw);
+    vPose->setId(0);
+    optimizer.addVertex(vPose);
+
+    const double thHuberVGGT = std::sqrt(7.815);
+    int nextId = 1;
+    for(const auto& obs : reusedObs)
+    {
+        g2o::VertexSBAPointXYZ* vPoint = new g2o::VertexSBAPointXYZ();
+        vPoint->setEstimate(obs.pMP->GetWorldPos().cast<double>());
+        vPoint->setId(nextId);
+        vPoint->setFixed(true);
+        vPoint->setMarginalized(false);
+        optimizer.addVertex(vPoint);
+
+        EdgeVGGTDistance* e = new EdgeVGGTDistance();
+        e->setVertex(0, vPoint);
+        e->setVertex(1, vPose);
+        e->setMeasurement(obs.camPoint);
+        e->setInformation(Eigen::Matrix3d::Identity());
+        auto* rk = new g2o::RobustKernelHuber;
+        rk->setDelta(thHuberVGGT);
+        e->setRobustKernel(rk);
+        optimizer.addEdge(e);
+
+        ++nextId;
+    }
+
+    optimizer.initializeOptimization();
+    optimizer.computeActiveErrors();
+    chi2_before = optimizer.chi2();
+    optimizer.optimize(10);
+    optimizer.computeActiveErrors();
+    chi2_after = optimizer.chi2();
+
+    g2o::VertexSE3Expmap* vPoseOpt = static_cast<g2o::VertexSE3Expmap*>(optimizer.vertex(0));
+    g2o::SE3Quat Tcw_opt = vPoseOpt->estimate();
+    return Sophus::SE3f(Tcw_opt.rotation().cast<float>(), Tcw_opt.translation().cast<float>());
+}
+
+Sophus::SE3f RunVGGTPhase2(KeyFrame* pKF,
+                           const std::vector<VGGTPriorObservation>& observations,
+                           const Sophus::SE3f& initialPose,
+                           bool* pbStopFlag,
+                           Map* pMap,
+                           double& chi2_before,
+                           double& chi2_after,
+                           int& edge_count)
+{
+    edge_count = static_cast<int>(observations.size());
+    if(observations.empty())
+    {
+        chi2_before = 0.0;
+        chi2_after = 0.0;
+        return initialPose;
+    }
+
+    g2o::SparseOptimizer optimizer;
+    auto* linearSolver = new g2o::LinearSolverEigen<g2o::BlockSolver_6_3::PoseMatrixType>();
+    auto* solver_ptr = new g2o::BlockSolver_6_3(linearSolver);
+    auto* solver = new g2o::OptimizationAlgorithmLevenberg(solver_ptr);
+    optimizer.setAlgorithm(solver);
+    optimizer.setVerbose(false);
+    if(pbStopFlag)
+        optimizer.setForceStopFlag(pbStopFlag);
+
+    g2o::VertexSE3Expmap* vPose = new g2o::VertexSE3Expmap();
+    g2o::SE3Quat Tcw(initialPose.unit_quaternion().cast<double>(), initialPose.translation().cast<double>());
+    vPose->setEstimate(Tcw);
+    vPose->setId(0);
+    optimizer.addVertex(vPose);
+
+    const double thHuberVGGT = std::sqrt(7.815);
+    const Sophus::SE3d Tcw_d = initialPose.cast<double>();
+    const Sophus::SE3d Twc_d = Tcw_d.inverse();
+
+    std::vector<int> pointVertexIds;
+    pointVertexIds.reserve(observations.size());
+
+    int nextId = 1;
+    for(size_t i = 0; i < observations.size(); ++i)
+    {
+        const auto& obs = observations[i];
+        g2o::VertexSBAPointXYZ* vPoint = new g2o::VertexSBAPointXYZ();
+        Eigen::Vector3d initWorld;
+        if(obs.isNew)
+        {
+            initWorld = Twc_d * obs.camPoint;
+        }
+        else
+        {
+            initWorld = obs.pMP->GetWorldPos().cast<double>();
+        }
+        vPoint->setEstimate(initWorld);
+        vPoint->setId(nextId);
+        vPoint->setFixed(false);
+        vPoint->setMarginalized(true);
+        optimizer.addVertex(vPoint);
+
+        EdgeVGGTDistance* e = new EdgeVGGTDistance();
+        e->setVertex(0, vPoint);
+        e->setVertex(1, vPose);
+        e->setMeasurement(obs.camPoint);
+        const double weight = obs.isNew ? 0.5 : 1.0;
+        e->setInformation(Eigen::Matrix3d::Identity() * weight);
+        auto* rk = new g2o::RobustKernelHuber;
+        rk->setDelta(thHuberVGGT);
+        e->setRobustKernel(rk);
+        optimizer.addEdge(e);
+
+        pointVertexIds.push_back(nextId);
+        ++nextId;
+    }
+
+    optimizer.initializeOptimization();
+    optimizer.computeActiveErrors();
+    chi2_before = optimizer.chi2();
+    optimizer.optimize(15);
+    optimizer.computeActiveErrors();
+    chi2_after = optimizer.chi2();
+
+    g2o::VertexSE3Expmap* vPoseOpt = static_cast<g2o::VertexSE3Expmap*>(optimizer.vertex(0));
+    g2o::SE3Quat Tcw_opt = vPoseOpt->estimate();
+    Sophus::SE3f Tcw_final(Tcw_opt.rotation().cast<float>(), Tcw_opt.translation().cast<float>());
+
+    {
+        unique_lock<mutex> lock(pMap->mMutexMapUpdate);
+        pKF->SetPose(Tcw_final);
+        for(size_t i = 0; i < pointVertexIds.size(); ++i)
+        {
+            const auto& obs = observations[i];
+            MapPoint* pMP = obs.pMP;
+            if(!pMP || pMP->isBad())
+                continue;
+            auto* vPoint = static_cast<g2o::VertexSBAPointXYZ*>(optimizer.vertex(pointVertexIds[i]));
+            const Eigen::Vector3d Pw = vPoint->estimate();
+            pMP->SetWorldPos(Pw.cast<float>());
+            pMP->UpdateNormalAndDepth();
+        }
+        pMap->IncreaseChangeIndex();
+    }
+
+    return Tcw_final;
+}
+
+void ApplyVGGTPhase1Result(KeyFrame* pKF,
+                           const std::vector<VGGTPriorObservation>& observations,
+                           const Sophus::SE3f& phase1Pose,
+                           Map* pMap)
+{
+    if(!pKF || !pMap)
+        return;
+
+    const Sophus::SE3f Twc = phase1Pose.inverse();
+    unique_lock<mutex> lock(pMap->mMutexMapUpdate);
+    pKF->SetPose(phase1Pose);
+    for(const auto& obs : observations)
+    {
+        if(!obs.isNew)
+            continue;
+        MapPoint* pMP = obs.pMP;
+        if(!pMP || pMP->isBad())
+            continue;
+        const Eigen::Vector3f Pw = Twc * obs.camPoint.cast<float>();
+        pMP->SetWorldPos(Pw);
+        pMP->UpdateNormalAndDepth();
+    }
+    pMap->IncreaseChangeIndex();
+}
+
+void VisualizeVGGTPhase1(const std::vector<VGGTPriorObservation>& reused,
+                         const std::vector<VGGTPriorObservation>& observations,
+                         const Sophus::SE3f& initialPose,
+                         const Sophus::SE3f& phase1Pose)
+{
+    if(observations.empty())
+        return;
+
+    std::vector<Eigen::Vector2f> reused_xz;
+    std::vector<Eigen::Vector2f> pre_xz;
+    std::vector<Eigen::Vector2f> post_xz;
+    reused_xz.reserve(reused.size());
+    pre_xz.reserve(observations.size());
+    post_xz.reserve(observations.size());
+
+    const Sophus::SE3f Twc_before = initialPose.inverse();
+    const Sophus::SE3f Twc_after = phase1Pose.inverse();
+
+    auto append_xz = [](const Eigen::Vector3f &Pw, std::vector<Eigen::Vector2f> &dst)
+    {
+        dst.emplace_back(Pw.x(), Pw.z());
+    };
+
+    for(const auto& obs : reused)
+    {
+        if(!obs.pMP)
+            continue;
+        const Eigen::Vector3f Pw = obs.pMP->GetWorldPos();
+        append_xz(Pw, reused_xz);
+    }
+
+    for(const auto& obs : observations)
+    {
+        const Eigen::Vector3f Pw_before = Twc_before * obs.camPoint.cast<float>();
+        const Eigen::Vector3f Pw_after = Twc_after * obs.camPoint.cast<float>();
+        append_xz(Pw_before, pre_xz);
+        append_xz(Pw_after, post_xz);
+    }
+
+    if(reused_xz.empty() && pre_xz.empty() && post_xz.empty())
+        return;
+
+    auto update_bounds = [](const Eigen::Vector2f &pt, float &min_x, float &max_x, float &min_z, float &max_z)
+    {
+        min_x = std::min(min_x, pt.x());
+        max_x = std::max(max_x, pt.x());
+        min_z = std::min(min_z, pt.y());
+        max_z = std::max(max_z, pt.y());
+    };
+
+    float min_x = std::numeric_limits<float>::max();
+    float min_z = std::numeric_limits<float>::max();
+    float max_x = std::numeric_limits<float>::lowest();
+    float max_z = std::numeric_limits<float>::lowest();
+
+    auto accumulate_bounds = [&](const std::vector<Eigen::Vector2f> &pts)
+    {
+        for(const auto& pt : pts)
+            update_bounds(pt, min_x, max_x, min_z, max_z);
+    };
+    accumulate_bounds(reused_xz);
+    accumulate_bounds(pre_xz);
+    accumulate_bounds(post_xz);
+
+    const Eigen::Vector3f cam_before = Twc_before.translation();
+    const Eigen::Vector3f cam_after = Twc_after.translation();
+    update_bounds(Eigen::Vector2f(cam_before.x(), cam_before.z()), min_x, max_x, min_z, max_z);
+    update_bounds(Eigen::Vector2f(cam_after.x(), cam_after.z()), min_x, max_x, min_z, max_z);
+
+    const float range_x = std::max(max_x - min_x, 1e-3f);
+    const float range_z = std::max(max_z - min_z, 1e-3f);
+    const int img_size = 900;
+    cv::Mat canvas(img_size, img_size, CV_8UC3, cv::Scalar(20, 20, 20));
+
+    auto project = [&](const Eigen::Vector2f &pt) -> cv::Point
+    {
+        const float u = (pt.x() - min_x) / range_x;
+        const float v = (pt.y() - min_z) / range_z;
+        int px = static_cast<int>(std::round(u * (img_size - 1)));
+        int py = static_cast<int>(std::round((1.0f - v) * (img_size - 1)));
+        return cv::Point(px, py);
+    };
+
+    auto draw_points = [&](const std::vector<Eigen::Vector2f> &pts, const cv::Scalar &color)
+    {
+        for(const auto& pt : pts)
+        {
+            cv::circle(canvas, project(pt), 2, color, cv::FILLED, cv::LINE_AA);
+        }
+    };
+
+    draw_points(reused_xz, cv::Scalar(0, 0, 255));      // Red for reused priors
+    draw_points(pre_xz, cv::Scalar(0, 255, 255));       // Yellow for pre-optimization KF
+    draw_points(post_xz, cv::Scalar(255, 0, 0));        // Blue for post-optimization KF
+
+    const float arrow_len = 0.1f * std::max(range_x, range_z);
+    auto draw_pose = [&](const Sophus::SE3f &Twc, const cv::Scalar &color)
+    {
+        const Eigen::Vector3f pos = Twc.translation();
+        Eigen::Vector3f dir3 = Twc.rotationMatrix().col(2);
+        Eigen::Vector2f dir(dir3.x(), dir3.z());
+        if(dir.norm() < 1e-4f)
+            dir = Eigen::Vector2f(1.f, 0.f);
+        dir.normalize();
+        Eigen::Vector2f base(pos.x(), pos.z());
+        Eigen::Vector2f tip = base + dir * arrow_len;
+        cv::Point p_base = project(base);
+        cv::Point p_tip = project(tip);
+        cv::arrowedLine(canvas, p_base, p_tip, color, 2, cv::LINE_AA, 0, 0.25);
+        cv::circle(canvas, p_base, 4, color, cv::FILLED, cv::LINE_AA);
+    };
+
+    draw_pose(Twc_before, cv::Scalar(0, 255, 0));   // Green for original pose
+    draw_pose(Twc_after, cv::Scalar(255, 255, 255)); // White for optimized pose
+
+    const cv::Scalar axis_color(120, 120, 120);
+    if(min_z <= 0.f && max_z >= 0.f)
+    {
+        Eigen::Vector2f axis_start(min_x, 0.f);
+        Eigen::Vector2f axis_end(max_x, 0.f);
+        cv::line(canvas, project(axis_start), project(axis_end), axis_color, 1, cv::LINE_AA);
+        cv::putText(canvas, "X", project(Eigen::Vector2f(max_x, 0.f)) + cv::Point(-15, -5),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.5, axis_color, 1, cv::LINE_AA);
+    }
+    if(min_x <= 0.f && max_x >= 0.f)
+    {
+        Eigen::Vector2f axis_start(0.f, min_z);
+        Eigen::Vector2f axis_end(0.f, max_z);
+        cv::line(canvas, project(axis_start), project(axis_end), axis_color, 1, cv::LINE_AA);
+        cv::putText(canvas, "Z", project(Eigen::Vector2f(0.f, max_z)) + cv::Point(5, 5),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.5, axis_color, 1, cv::LINE_AA);
+    }
+
+    const int font = cv::FONT_HERSHEY_SIMPLEX;
+    const double font_scale = 0.6;
+    const int thickness = 1;
+    int baseline = 0;
+    auto draw_label = [&](const std::string &text, const cv::Scalar &color, int y_offset)
+    {
+        cv::Size text_size = cv::getTextSize(text, font, font_scale, thickness, &baseline);
+        cv::rectangle(canvas,
+                      cv::Point(15, y_offset - text_size.height - 6),
+                      cv::Point(20 + text_size.width, y_offset + 6),
+                      cv::Scalar(40, 40, 40),
+                      cv::FILLED);
+        cv::putText(canvas, text, cv::Point(20, y_offset), font, font_scale, color, thickness, cv::LINE_AA);
+    };
+
+    draw_label("Reused priors (red)", cv::Scalar(0, 0, 255), 30);
+    draw_label("Pre phase1 KF (yellow)", cv::Scalar(0, 255, 255), 55);
+    draw_label("Post phase1 KF (blue)", cv::Scalar(255, 0, 0), 80);
+    draw_label("Initial pose (green)", cv::Scalar(0, 255, 0), 105);
+    draw_label("Phase1 pose (white)", cv::Scalar(255, 255, 255), 130);
+
+    cv::imshow("VGGT_Phase1_Debug", canvas);
+    cv::waitKey(1);
+}
+
+bool RunVGGTLBALocal(KeyFrame* pKF,
+                     bool* pbStopFlag,
+                     Map* pMap,
+                     int& num_fixedKF,
+                     int& num_OptKF,
+                     int& num_MPs,
+                     int& num_edges)
+{
+    auto observations = CollectVGGTPriors(pKF, pMap);
+    if(observations.empty())
+        return false;
+
+    std::vector<VGGTPriorObservation> reused;
+    reused.reserve(observations.size());
+    for(const auto& obs : observations)
+    {
+        if(!obs.isNew)
+            reused.push_back(obs);
+    }
+
+    const Sophus::SE3f initialPose = pKF->GetPose();
+    double phase1_before = 0.0;
+    double phase1_after = 0.0;
+    int phase1_edges = 0;
+
+    const bool phase2_enabled = g_enable_vggt_phase2.load();
+
+    if(!reused.empty())
+    {
+        const Sophus::SE3f phase1Pose = RunVGGTPhase1(initialPose, reused, pbStopFlag, phase1_before, phase1_after, phase1_edges);
+        std::cerr << "[VGGT LBA][Phase1] KF " << pKF->mnId
+                  << " reused=" << reused.size()
+                  << " chi2_before=" << phase1_before
+                  << " chi2_after=" << phase1_after << std::endl;
+
+        // VisualizeVGGTPhase1(reused, observations, initialPose, phase1Pose);
+
+        if(pbStopFlag && *pbStopFlag)
+        {
+            num_fixedKF = 0;
+            num_OptKF = 1;
+            num_MPs = observations.size();
+            num_edges = phase1_edges;
+            return true;
+        }
+
+        if(!phase2_enabled)
+        {
+            std::cerr << "[VGGT LBA] Phase2 disabled, applying phase1 pose only" << std::endl;
+            ApplyVGGTPhase1Result(pKF, observations, phase1Pose, pMap);
+            num_fixedKF = 0;
+            num_OptKF = 1;
+            num_MPs = reused.size();
+            num_edges = phase1_edges;
+            return true;
+        }
+
+        double phase2_before = 0.0;
+        double phase2_after = 0.0;
+        int phase2_edges = 0;
+        RunVGGTPhase2(pKF, observations, phase1Pose, pbStopFlag, pMap, phase2_before, phase2_after, phase2_edges);
+        std::cerr << "[VGGT LBA][Phase2] KF " << pKF->mnId
+                  << " points=" << observations.size()
+                  << " chi2_before=" << phase2_before
+                  << " chi2_after=" << phase2_after << std::endl;
+
+        num_fixedKF = 0;
+        num_OptKF = 1;
+        num_MPs = observations.size();
+        num_edges = phase2_edges;
+        return true;
+    }
+    else
+    {
+        std::cerr << "[VGGT LBA][Phase1] KF " << pKF->mnId << " skipped (no reused tracks)" << std::endl;
+
+        if(!phase2_enabled)
+        {
+            std::cerr << "[VGGT LBA] Phase2 disabled and no reused tracks -> fallback to classic BA" << std::endl;
+            return false;
+        }
+
+        double phase2_before = 0.0;
+        double phase2_after = 0.0;
+        int phase2_edges = 0;
+        RunVGGTPhase2(pKF, observations, initialPose, pbStopFlag, pMap, phase2_before, phase2_after, phase2_edges);
+        std::cerr << "[VGGT LBA][Phase2] KF " << pKF->mnId
+                  << " points=" << observations.size()
+                  << " chi2_before=" << phase2_before
+                  << " chi2_after=" << phase2_after << std::endl;
+
+        num_fixedKF = 0;
+        num_OptKF = 1;
+        num_MPs = observations.size();
+        num_edges = phase2_edges;
+        return true;
+    }
+}
+}
+
+void Optimizer::SetVGGTPhase2Enabled(bool enabled)
+{
+    g_enable_vggt_phase2.store(enabled);
+}
+
+bool Optimizer::IsVGGTPhase2Enabled()
+{
+    return g_enable_vggt_phase2.load();
 }
 
 void Optimizer::GlobalBundleAdjustemnt(Map* pMap, int nIterations, bool* pbStopFlag, const unsigned long nLoopKF, const bool bRobust)
@@ -1183,6 +1713,13 @@ int Optimizer::PoseOptimization(Frame *pFrame)
 
 void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool* pbStopFlag, Map* pMap, int& num_fixedKF, int& num_OptKF, int& num_MPs, int& num_edges)
 {
+    if(pKF && pKF->IsVGGTKeyframe())
+    {
+        if(RunVGGTLBALocal(pKF, pbStopFlag, pMap, num_fixedKF, num_OptKF, num_MPs, num_edges))
+            return;
+        std::cerr << "[VGGT LBA] KF " << pKF->mnId << " falling back to classic BA" << std::endl;
+    }
+
     // Local KeyFrames: First Breath Search from Current Keyframe
     list<KeyFrame*> lLocalKeyFrames;
 

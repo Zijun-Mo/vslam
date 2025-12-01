@@ -9,6 +9,9 @@ float32[] visibility_ratios
 sensor_msgs/Image latest_image
 # Dense 3D tracks tensor with shape (S, N, 3) where N = query_grid_height * query_grid_width
 std_msgs/Float32MultiArray tracks_3d
+# Dense 2D tracks tensor with shape (S, N, 2) in preprocessed image coordinates
+# (aligned with tracks_mask layout)
+std_msgs/Float32MultiArray tracks_2d
 # Validity mask with shape (S, N)
 std_msgs/Float32MultiArray tracks_mask
 # Per-track RGB colors stored as uint8 with layout (S, N, 3)

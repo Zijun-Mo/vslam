@@ -13,6 +13,7 @@
 #include <algorithm>
 
 #include "System.h"
+#include "Optimizer.h"
 #include "vslam_msgs/msg/system_ptr.hpp"
 #include "vslam_msgs/msg/key_frame_ptr.hpp"
 #include "vslam_msgs/msg/vggt_output.hpp"
@@ -30,6 +31,7 @@ public:
         declare_parameter("voc_file", "");
         declare_parameter("settings_file", "");
         declare_parameter("use_viewer", true);
+        declare_parameter("enable_vggt_phase2", true);
         // Camera intrinsic override parameters (optional). If provided (fx>0) we will generate a temp YAML and call ChangeCalibration.
         declare_parameter("camera.fx", 0.0);
         declare_parameter("camera.fy", 0.0);
@@ -51,6 +53,7 @@ public:
         std::string settings_file = get_parameter("settings_file").as_string();
         bool use_viewer = get_parameter("use_viewer").as_bool();
         bool override_from_vggt = get_parameter("override_intrinsics_from_vggt").as_bool();
+        bool enable_vggt_phase2 = get_parameter("enable_vggt_phase2").as_bool();
 
         if (voc_file.empty() || settings_file.empty()) {
             RCLCPP_ERROR(get_logger(), "Please provide voc_file and settings_file parameters");
@@ -61,6 +64,10 @@ public:
         // Initialize System with bStartThreads = false (we only run Tracking here)
         // Note: We use MONOCULAR sensor type as base, but we will use TrackVGGT
         mpSystem = new ORB_SLAM3::System(voc_file, settings_file, ORB_SLAM3::System::MONOCULAR, use_viewer, 0, "", false);
+
+        ORB_SLAM3::Optimizer::SetVGGTPhase2Enabled(enable_vggt_phase2);
+        RCLCPP_INFO(get_logger(), "VGGT phase2 optimization %s",
+                enable_vggt_phase2 ? "enabled" : "disabled");
 
         // Optional intrinsic override after System construction
         double fx = get_parameter("camera.fx").as_double();
@@ -134,7 +141,7 @@ public:
         // This is crucial: When Tracking creates a KF, it calls LocalMapper->InsertKeyFrame.
         // We need to intercept this if LocalMapper is in another node?
         // WAIT: In the split architecture, mpSystem->mpLocalMapper is likely a stub or we need to 
-        // ensure the callback is set on the *local* instance which then publishes.
+        // ensure the callback is set on the *local* instance which Visualizethen publishes.
         // The 'orb_slam3_tracking' node did this:
         mpSystem->mpLocalMapper->SetInsertKeyFrameCallback([this](ORB_SLAM3::KeyFrame* pKF) {
             auto msg = vslam_msgs::msg::KeyFramePtr();
@@ -278,6 +285,51 @@ private:
             delta_result = ComputePoseDelta(prev_pose_window_, current_window);
         }
 
+        std::vector<cv::Mat> window_pose_twcs;
+        window_pose_twcs.reserve(current_window.poses.size());
+        for(const auto &pose_msg : current_window.poses)
+        {
+            Eigen::Isometry3d Twc = PoseMsgToIsometry(pose_msg);
+            window_pose_twcs.push_back(EigenToCvMat(Twc.matrix()));
+        }
+
+        std::vector<std::vector<cv::Point2f>> window_tracks_2d;
+        bool tracks2d_ok = false;
+        const auto &tracks2d_layout = vggt_msg->tracks_2d.layout.dim;
+        const auto &tracks2d_data = vggt_msg->tracks_2d.data;
+        if(tracks2d_layout.size() >= 3)
+        {
+            const int layout_S = static_cast<int>(tracks2d_layout[0].size);
+            const int layout_N = static_cast<int>(tracks2d_layout[1].size);
+            const int layout_C = static_cast<int>(tracks2d_layout[2].size);
+            const size_t expected = static_cast<size_t>(S) * static_cast<size_t>(N) * 2;
+            if(layout_S == S && layout_N == N && layout_C >= 2 && tracks2d_data.size() >= expected)
+            {
+                window_tracks_2d.resize(static_cast<size_t>(S));
+                for(int frame_it = 0; frame_it < S; ++frame_it)
+                {
+                    auto &frame_vec = window_tracks_2d[static_cast<size_t>(frame_it)];
+                    frame_vec.reserve(static_cast<size_t>(N));
+                    const size_t base = static_cast<size_t>(frame_it) * static_cast<size_t>(N) * 2;
+                    for(int i = 0; i < N; ++i)
+                    {
+                        const size_t idx = base + static_cast<size_t>(i) * 2;
+                        const float u = tracks2d_data[idx + 0];
+                        const float v = tracks2d_data[idx + 1];
+                        frame_vec.emplace_back(u, v);
+                    }
+                }
+                tracks2d_ok = true;
+            }
+        }
+        if(!tracks2d_ok)
+        {
+            window_tracks_2d.clear();
+            RCLCPP_ERROR_THROTTLE(get_logger(), *this->get_clock(), 2000,
+                                  "[VGGT Frontend] tracks_2d layout mismatch (S=%d N=%d dims=%zu data=%zu)",
+                                  S, N, tracks2d_layout.size(), tracks2d_data.size());
+        }
+
         int overlap_frame_idx = -1;
         uint64_t overlap_frame_id = 0;
         if(has_prev_pose_window_ && prev_pose_window_.valid() && current_window.valid())
@@ -414,10 +466,9 @@ private:
             // Track IDs only need to be consistent within the VGGT window, so reuse grid index.
             vTrackIds.push_back(static_cast<long>(i));
             Eigen::Vector3d local_point(static_cast<double>(x), static_cast<double>(y), static_cast<double>(z));
-            Eigen::Vector3d global_point = world_from_vggt_ * local_point;
-            v3DPoints.emplace_back(static_cast<float>(global_point.x()),
-                                   static_cast<float>(global_point.y()),
-                                   static_cast<float>(global_point.z()));
+            v3DPoints.emplace_back(static_cast<float>(local_point.x()),
+                                   static_cast<float>(local_point.y()),
+                                   static_cast<float>(local_point.z()));
 
             cv::Vec3b track_color(255, 255, 255);
             if(has_color)
@@ -535,15 +586,22 @@ private:
         }
 
         mpSystem->TrackVGGT(cv_ptr_mono->image,
-                    timestamp,
-                    vKeys,
-                    vTrackIds,
-                    v3DPoints,
-                    vTrackColors,
-                    delta_pose,
-                    current_window.frame_ids,
-                    current_window.visibility_ratios,
-                    window_visibility_masks);
+            timestamp,
+            vKeys,
+            vTrackIds,
+            v3DPoints,
+            vTrackColors,
+            delta_pose,
+            current_window.frame_ids,
+            current_window.visibility_ratios,
+            window_visibility_masks,
+            window_pose_twcs,
+            window_tracks_2d,
+            downsampled_width,
+            downsampled_height,
+            query_stride,
+            orig_W,
+            orig_H);
     }
 
     ORB_SLAM3::System* mpSystem = nullptr;

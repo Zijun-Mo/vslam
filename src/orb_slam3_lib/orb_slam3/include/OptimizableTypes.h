@@ -143,6 +143,17 @@ public:
     g2o::SE3Quat mTrl;
 };
 
+class EdgeVGGTDistance : public g2o::BaseBinaryEdge<3, Eigen::Vector3d, g2o::VertexSBAPointXYZ, g2o::VertexSE3Expmap>
+{
+public:
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    EdgeVGGTDistance();
+    bool read(std::istream& is) override;
+    bool write(std::ostream& os) const override;
+    void computeError() override;
+    void linearizeOplus() override;
+};
+
 class VertexSim3Expmap : public g2o::BaseVertex<7, g2o::Sim3>
 {
 public:
