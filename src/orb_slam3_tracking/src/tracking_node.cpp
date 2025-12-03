@@ -3,8 +3,10 @@
 #include <cv_bridge/cv_bridge.h>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/imu.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
 
 #include "System.h"
+#include "Tracking.h"
 #include "vslam_msgs/msg/system_ptr.hpp"
 #include "vslam_msgs/msg/key_frame_ptr.hpp"
 
@@ -61,6 +63,8 @@ public:
 
             // Publisher for KeyFramePtr
             kf_pub_ = create_publisher<vslam_msgs::msg::KeyFramePtr>("keyframe_data", 100);
+            // Pose publisher (world frame -> camera pose)
+            pose_pub_ = create_publisher<geometry_msgs::msg::PoseStamped>("/vslam/pose", 100);
 
             // Set callback to intercept KeyFrame insertion
             mpSystem->mpLocalMapper->SetInsertKeyFrameCallback([this](ORB_SLAM3::KeyFrame* pKF) {
@@ -96,13 +100,35 @@ private:
         // Track
         // We use the timestamp from the message
         double timestamp = msg->header.stamp.sec + msg->header.stamp.nanosec * 1e-9;
-        mpSystem->TrackMonocular(cv_ptr->image, timestamp);
+        Sophus::SE3f Tcw = mpSystem->TrackMonocular(cv_ptr->image, timestamp);
+
+        const int state = mpSystem->GetTrackingState();
+        if(state == ORB_SLAM3::Tracking::OK || state == ORB_SLAM3::Tracking::OK_KLT)
+        {
+            Sophus::SE3f Twc = Tcw.inverse();
+            const Eigen::Vector3f t = Twc.translation();
+            const Eigen::Quaternionf q = Twc.unit_quaternion();
+
+            geometry_msgs::msg::PoseStamped pose_msg;
+            pose_msg.header.stamp = msg->header.stamp;
+            pose_msg.header.frame_id = "map";
+            pose_msg.pose.position.x = static_cast<double>(t.x());
+            pose_msg.pose.position.y = static_cast<double>(t.y());
+            pose_msg.pose.position.z = static_cast<double>(t.z());
+            pose_msg.pose.orientation.x = static_cast<double>(q.x());
+            pose_msg.pose.orientation.y = static_cast<double>(q.y());
+            pose_msg.pose.orientation.z = static_cast<double>(q.z());
+            pose_msg.pose.orientation.w = static_cast<double>(q.w());
+
+            pose_pub_->publish(pose_msg);
+        }
     }
 
     ORB_SLAM3::System* mpSystem = nullptr;
     rclcpp::Publisher<vslam_msgs::msg::SystemPtr>::SharedPtr sys_pub_;
     rclcpp::TimerBase::SharedPtr sys_pub_timer_;
     rclcpp::Publisher<vslam_msgs::msg::KeyFramePtr>::SharedPtr kf_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_pub_;
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr img_sub_;
 };
 

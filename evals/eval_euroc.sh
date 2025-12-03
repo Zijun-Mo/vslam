@@ -4,7 +4,15 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-data_root="${DATA_ROOT:-$repo_root}"
+# DATA_ROOT 优先级：环境变量 DATA_ROOT -> ~/MASt3R-SLAM -> 仓库根
+default_root="$HOME/MASt3R-SLAM"
+if [ -n "${DATA_ROOT:-}" ]; then
+    data_root="${DATA_ROOT}"
+elif [ -d "$default_root" ]; then
+    data_root="$default_root"
+else
+    data_root="$repo_root"
+fi
 dataset_path="${data_root%/}/datasets/euroc/"
 gt_path="${data_root%/}/groundtruths/euroc/"
 

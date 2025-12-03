@@ -17,13 +17,13 @@ def generate_launch_description():
     
     voc_file_arg = DeclareLaunchArgument(
         'voc_file',
-        default_value='/home/jun/vslam/src/orb_slam3_lib/orb_slam3/Vocabulary/ORBvoc.txt.bin',
+        default_value='/home/firefly/aiaa2205final/vslam/src/orb_slam3_lib/orb_slam3/Vocabulary/ORBvoc.txt.bin',
         description='Path to vocabulary file'
     )
 
     settings_file_arg = DeclareLaunchArgument(
         'settings_file',
-        default_value='/home/jun/vslam/src/orb_slam3_lib/orb_slam3/config/Monocular/EuRoC.yaml',
+        default_value='/home/firefly/aiaa2205final/vslam/src/orb_slam3_lib/orb_slam3/config/Monocular/EuRoC.yaml',
         description='Path to settings file'
     )
 
