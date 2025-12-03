@@ -1635,6 +1635,16 @@ Sophus::SE3f System::TrackVGGT(const cv::Mat &im, const double &timestamp,
                                const std::vector<cv::Point3f> &v3DPoints,
                                const std::vector<cv::Vec3b> &vTrackColors,
                                const cv::Mat &T_delta,
+                               const std::vector<uint64_t> &frame_ids,
+                               const std::vector<float> &visibility_ratios,
+                               const std::vector<std::vector<uint8_t>> &window_visibility_masks,
+                               const std::vector<cv::Mat> &window_pose_twcs,
+                               const std::vector<std::vector<cv::Point2f>> &window_tracks_2d,
+                               int query_grid_width,
+                               int query_grid_height,
+                               int query_stride,
+                               int original_image_width,
+                               int original_image_height,
                                string filename)
 {
     // std::cout << "[DEBUG] System::TrackVGGT called. Timestamp: " << timestamp << ", Keys: " << vKeys.size() << std::endl;
@@ -1684,7 +1694,24 @@ Sophus::SE3f System::TrackVGGT(const cv::Mat &im, const double &timestamp,
         }
     }
 
-    Sophus::SE3f Tcw = mpTracker->GrabImageVGGT(im, timestamp, vKeys, vTrackIds, v3DPoints, vTrackColors, T_delta, filename);
+    Sophus::SE3f Tcw = mpTracker->GrabImageVGGT(im,
+                                                timestamp,
+                                                vKeys,
+                                                vTrackIds,
+                                                v3DPoints,
+                                                vTrackColors,
+                                                T_delta,
+                                                frame_ids,
+                                                visibility_ratios,
+                                                window_visibility_masks,
+                                                window_pose_twcs,
+                                                window_tracks_2d,
+                                                query_grid_width,
+                                                query_grid_height,
+                                                query_stride,
+                                                original_image_width,
+                                                original_image_height,
+                                                filename);
 
     unique_lock<mutex> lock2(mMutexState);
     mTrackingState = mpTracker->mState;

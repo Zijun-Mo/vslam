@@ -40,7 +40,11 @@
 #include "GeometricCamera.h"
 
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
+#include <deque>
+#include <cstdint>
+#include <vector>
 
 namespace ORB_SLAM3
 {
@@ -381,18 +385,66 @@ public:
     Sophus::SE3f mVGGTDeltaT;
     Sophus::SE3f mAccumulatedVGGTMotion;
     bool mbHasVGGTDelta;
+    uint64_t mCurrentVGGTFrameId{0};
+    uint64_t mnLastKeyFrameVGGTFrameId{0};
+    std::unordered_map<long, MapPoint*> mVGGTTrackIdToMP;
+    long mNextVGGTGlobalTrackId{0};
+    int mCurrentVGGTGridWidth{0};
+    int mCurrentVGGTGridHeight{0};
+    int mCurrentVGGTGridStride{1};
+    int mCurrentVGGTImageWidth{0};
+    int mCurrentVGGTImageHeight{0};
+    std::unordered_map<uint32_t, std::vector<long>> mVGGTGridCellToGlobalIds;
+    std::unordered_map<uint32_t, std::unordered_set<long>> mVGGTGridCellConsumed;
     Sophus::SE3f GrabImageVGGT(const cv::Mat &im, const double &timestamp, 
                                const std::vector<cv::KeyPoint> &vKeys, 
                                const std::vector<long> &vTrackIds,
                                const std::vector<cv::Point3f> &v3DPoints,
                                const std::vector<cv::Vec3b> &vTrackColors,
                                const cv::Mat &T_delta,
+                               const std::vector<uint64_t> &frame_ids,
+                               const std::vector<float> &visibility_ratios,
+                               const std::vector<std::vector<uint8_t>> &window_visibility_masks,
+                               const std::vector<cv::Mat> &window_pose_twcs,
+                               const std::vector<std::vector<cv::Point2f>> &window_tracks_2d,
+                               int query_grid_width,
+                               int query_grid_height,
+                               int query_stride,
+                               int original_image_width,
+                               int original_image_height,
                                string filename);
-    
+
+    void UpdateVGGTVisibilityWindow(const std::vector<uint64_t> &frame_ids,
+                                    const std::vector<float> &visibility_ratios);
+    float LookupVisibilityRatio(uint64_t frame_id) const;
+    std::vector<uint64_t> mLatestVGGTFrameIds;
+    std::vector<float> mLatestVGGTVisibility;
+    std::vector<std::vector<uint8_t>> mCurrentVGGTWindowVisibilityMasks;
+    std::vector<Sophus::SE3f> mCurrentVGGTWindowTwc;
+    std::vector<std::vector<cv::Point2f>> mCurrentVGGTWindowTracks2d;
+    std::vector<cv::Point2f> mCurrentVGGT2DTracks;
+    std::unordered_map<uint64_t, std::vector<cv::Point2f>> mVGGTFrameIdToTracks2d;
+    std::deque<uint64_t> mVGGTTrackCacheOrder;
+    static constexpr size_t kMaxVGGTTrackedFrames = 64;
+    mutable std::mutex mMutexVGGTVisibility;
+    bool mbCurrentVGGTPointsConverted{false};
+
+    std::vector<uint8_t> GetVisibilityMaskForFrame(uint64_t frame_id) const;
+    bool ComputeVGGTWindowRelativePose(uint64_t ref_frame_id, uint64_t target_frame_id, Sophus::SE3f &T_target_ref) const;
+    bool LookupVGGTWindowPose(uint64_t frame_id, Sophus::SE3f &Twc) const;
+    void ConvertCurrentVGGTPointsToWorld(const Sophus::SE3f &TwcSeed);
+    void UpdateVGGTTrackCache(const std::vector<uint64_t> &frame_ids,
+                              const std::vector<std::vector<cv::Point2f>> &window_tracks_2d);
+    bool LookupVGGTTrack2D(uint64_t frame_id, long local_track_id, cv::Point2f &pt) const;
+    bool EncodeVGGTGridCell(long track_id, const cv::KeyPoint* keypoint, uint32_t &cell_code, uint64_t reference_frame_id = 0) const;
+    long LookupVGGTGridGlobalId(uint32_t cell_code);
+    void RebuildVGGTGridIndex(const std::vector<uint32_t>& cells,
+                              const std::vector<long>& globalIds);
+    void ResetVGGTGridConsumption();
+    void InsertVGGTGridMapping(uint32_t cell_code, long global_id);
+
 protected:
     void TrackVGGT();
-    int MatchByTrackIds();
-    int CountEffectiveMatchRegions() const;
     void MonocularInitializationVGGT();
     bool NeedNewKeyFrameVGGT();
     void CreateNewKeyFrameVGGT();

@@ -179,6 +179,7 @@ protected:
     KeyFrame* mpCurrentKeyFrame;
 
     std::list<MapPoint*> mlpRecentAddedMapPoints;
+    bool mbCurrentKeyFrameIsVGGT;
 
     std::mutex mMutexNewKFs;
 

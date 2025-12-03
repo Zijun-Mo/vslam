@@ -31,7 +31,7 @@ MapPoint::MapPoint():
     mnFirstKFid(0), mnFirstFrame(0), nObs(0), mnTrackReferenceForFrame(0),
     mnLastFrameSeen(0), mnBALocalForKF(0), mnFuseCandidateForKF(0), mnLoopPointForKF(0), mnCorrectedByKF(0),
     mnCorrectedReference(0), mnBAGlobalForKF(0), mnVisible(1), mnFound(1),
-    mColor(255,255,255), mbHasColor(false), mbBad(false), mpReplaced(static_cast<MapPoint*>(NULL))
+    mColor(255,255,255), mbHasColor(false), mbFromVGGT(false), mbBad(false), mpReplaced(static_cast<MapPoint*>(NULL))
 {
     mpReplaced = static_cast<MapPoint*>(NULL);
 }
@@ -39,9 +39,9 @@ MapPoint::MapPoint():
 MapPoint::MapPoint(const Eigen::Vector3f &Pos, KeyFrame *pRefKF, Map* pMap):
     mnFirstKFid(pRefKF->mnId), mnFirstFrame(pRefKF->mnFrameId), nObs(0), mnTrackReferenceForFrame(0),
     mnLastFrameSeen(0), mnBALocalForKF(0), mnFuseCandidateForKF(0), mnLoopPointForKF(0), mnCorrectedByKF(0),
-    mnCorrectedReference(0), mnBAGlobalForKF(0), mpRefKF(pRefKF), mnVisible(1), mnFound(1),
-    mColor(255,255,255), mbHasColor(false), mbBad(false), mpReplaced(static_cast<MapPoint*>(NULL)), mfMinDistance(0), mfMaxDistance(0), mpMap(pMap),
-    mnOriginMapId(pMap->GetId())
+    mnCorrectedReference(0), mnBAGlobalForKF(0), mnOriginMapId(pMap->GetId()), mpRefKF(pRefKF), mnVisible(1), mnFound(1),
+    mColor(255,255,255), mbHasColor(false), mbFromVGGT(false), mbBad(false),
+    mpReplaced(static_cast<MapPoint*>(NULL)), mfMinDistance(0), mfMaxDistance(0), mpMap(pMap)
 {
     SetWorldPos(Pos);
 
@@ -58,9 +58,9 @@ MapPoint::MapPoint(const Eigen::Vector3f &Pos, KeyFrame *pRefKF, Map* pMap):
 MapPoint::MapPoint(const double invDepth, cv::Point2f uv_init, KeyFrame* pRefKF, KeyFrame* pHostKF, Map* pMap):
     mnFirstKFid(pRefKF->mnId), mnFirstFrame(pRefKF->mnFrameId), nObs(0), mnTrackReferenceForFrame(0),
     mnLastFrameSeen(0), mnBALocalForKF(0), mnFuseCandidateForKF(0), mnLoopPointForKF(0), mnCorrectedByKF(0),
-    mnCorrectedReference(0), mnBAGlobalForKF(0), mpRefKF(pRefKF), mnVisible(1), mnFound(1),
-    mColor(255,255,255), mbHasColor(false), mbBad(false), mpReplaced(static_cast<MapPoint*>(NULL)), mfMinDistance(0), mfMaxDistance(0), mpMap(pMap),
-    mnOriginMapId(pMap->GetId())
+    mnCorrectedReference(0), mnBAGlobalForKF(0), mnOriginMapId(pMap->GetId()), mpRefKF(pRefKF), mnVisible(1), mnFound(1),
+    mColor(255,255,255), mbHasColor(false), mbFromVGGT(false), mbBad(false),
+    mpReplaced(static_cast<MapPoint*>(NULL)), mfMinDistance(0), mfMaxDistance(0), mpMap(pMap)
 {
     mInvDepth=invDepth;
     mInitU=(double)uv_init.x;
@@ -78,8 +78,9 @@ MapPoint::MapPoint(const double invDepth, cv::Point2f uv_init, KeyFrame* pRefKF,
 MapPoint::MapPoint(const Eigen::Vector3f &Pos, Map* pMap, Frame* pFrame, const int &idxF):
     mnFirstKFid(-1), mnFirstFrame(pFrame->mnId), nObs(0), mnTrackReferenceForFrame(0), mnLastFrameSeen(0),
     mnBALocalForKF(0), mnFuseCandidateForKF(0),mnLoopPointForKF(0), mnCorrectedByKF(0),
-    mnCorrectedReference(0), mnBAGlobalForKF(0), mpRefKF(static_cast<KeyFrame*>(NULL)), mnVisible(1),
-    mnFound(1), mColor(255,255,255), mbHasColor(false), mbBad(false), mpReplaced(NULL), mpMap(pMap), mnOriginMapId(pMap->GetId())
+    mnCorrectedReference(0), mnBAGlobalForKF(0), mnOriginMapId(pMap->GetId()), mpRefKF(static_cast<KeyFrame*>(NULL)),
+    mnVisible(1), mnFound(1), mColor(255,255,255), mbHasColor(false), mbFromVGGT(false),
+    mbBad(false), mpReplaced(NULL), mpMap(pMap)
 {
     SetWorldPos(Pos);
 
@@ -257,6 +258,18 @@ bool MapPoint::HasColor()
     return mbHasColor;
 }
 
+void MapPoint::SetVGGTPoint(bool flag)
+{
+    unique_lock<mutex> lock(mMutexFeatures);
+    mbFromVGGT = flag;
+}
+
+bool MapPoint::IsVGGTPoint()
+{
+    unique_lock<mutex> lock(mMutexFeatures);
+    return mbFromVGGT;
+}
+
 MapPoint* MapPoint::GetReplaced()
 {
     unique_lock<mutex> lock1(mMutexFeatures);
@@ -266,8 +279,24 @@ MapPoint* MapPoint::GetReplaced()
 
 void MapPoint::Replace(MapPoint* pMP)
 {
-    if(pMP->mnId==this->mnId)
+    if(!pMP || pMP->mnId==this->mnId)
         return;
+
+    const bool bThisVGGT = IsVGGTPoint();
+    const bool bTargetVGGT = pMP->IsVGGTPoint();
+
+    if(bThisVGGT && !bTargetVGGT)
+    {
+        // Keep rigid VGGT priors by replacing the non-VGGT candidate instead
+        pMP->Replace(this);
+        return;
+    }
+
+    if(bThisVGGT && bTargetVGGT)
+    {
+        // Avoid merging two VGGT priors; keep both instances unchanged
+        return;
+    }
 
     int nvisible, nfound;
     map<KeyFrame*,tuple<int,int>> obs;
@@ -571,8 +600,10 @@ void MapPoint::PrintObservations()
     {
         KeyFrame* pKFi = mit->first;
         tuple<int,int> indexes = mit->second;
-        int leftIndex = get<0>(indexes), rightIndex = get<1>(indexes);
-        cout << "--OBS in KF " << pKFi->mnId << " in map " << pKFi->GetMap()->GetId() << endl;
+        int leftIndex = get<0>(indexes);
+        int rightIndex = get<1>(indexes);
+        cout << "--OBS in KF " << pKFi->mnId << " in map " << pKFi->GetMap()->GetId()
+             << " (L=" << leftIndex << ", R=" << rightIndex << ")" << endl;
     }
 }
 

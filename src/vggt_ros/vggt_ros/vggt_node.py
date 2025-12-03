@@ -10,16 +10,21 @@ import numpy as np
 import torch
 import sys
 import os
+from pathlib import Path
 import glob
 from collections import deque
 from PIL import Image as PILImage
 from torchvision import transforms as TF
+import cv2
 
 from vggt_ros.keyframe_selector import KeyframeSelector
 from vggt_ros.geometry_utils import compute_3d_tracks
 
-# Add vggt to python path
-sys.path.append(os.path.expanduser('~/aiaa2205final/vslam/vggt'))  # Adjust this path as necessary
+# Add vggt to python path without hard-coding absolute path
+repo_root = Path(__file__).resolve().parents[3]
+vggt_path = repo_root / 'vggt'
+if vggt_path.is_dir():
+    sys.path.append(str(vggt_path))
 
 from vggt.models.vggt import VGGT
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
@@ -33,13 +38,15 @@ class VGGTNode(Node):
         self.declare_parameter('device', 'cuda')
         self.declare_parameter('window_size', 8)
         self.declare_parameter('image_topic', '/camera/image_raw')
-        self.declare_parameter('min_parallax', 10.0) # Pixels
+        self.declare_parameter('min_parallax', 0.1) # 0-1 => fraction of image diagonal
+        self.declare_parameter('track_visibility_threshold', 0.5)
         
         self.model_name = self.get_parameter('model_name').get_parameter_value().string_value
         self.device = self.get_parameter('device').get_parameter_value().string_value
         self.window_size = self.get_parameter('window_size').get_parameter_value().integer_value
         self.image_topic = self.get_parameter('image_topic').get_parameter_value().string_value
         self.min_parallax = self.get_parameter('min_parallax').get_parameter_value().double_value
+        self.track_visibility_threshold = self.get_parameter('track_visibility_threshold').get_parameter_value().double_value
         
         if self.device == 'cuda' and not torch.cuda.is_available():
             self.get_logger().warn('CUDA not available, using CPU')
@@ -187,7 +194,16 @@ class VGGTNode(Node):
         # Note: This is heavy and blocks the main thread. In production, move to a separate thread.
         try:
             # Get window from selector
-            current_images, current_headers = self.keyframe_selector.get_window()
+            current_keyframes = list(self.keyframe_selector.keyframes)
+            current_images = [kf[0] for kf in current_keyframes]
+            current_headers = [kf[1] for kf in current_keyframes]
+            current_keyframe_ids = []
+            for kf in current_keyframes:
+                kf_id = self.keyframe_id_map.get(id(kf))
+                if kf_id is None:
+                    self.get_logger().warn("Missing keyframe id mapping; defaulting to 0")
+                    kf_id = 0
+                current_keyframe_ids.append(int(kf_id))
             
             processed_images = []
             transforms = []
@@ -196,14 +212,15 @@ class VGGTNode(Node):
                 processed_images.append(img_tensor)
                 transforms.append(transform)
             
-            # Stack
-            images_tensor = torch.stack(processed_images).to(self.device)
+            # Stack (keep original order) and create reversed copy for inference
+            images_tensor = torch.stack(processed_images)
+            images_tensor_for_model = torch.flip(images_tensor, dims=[0]).to(self.device)
             
             dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
             
             with torch.no_grad():
                 with torch.cuda.amp.autocast(dtype=dtype):
-                    images_batch = images_tensor[None] # Add batch dim (1, S, 3, H, W)
+                    images_batch = images_tensor_for_model[None] # Add batch dim (1, S, 3, H, W)
                     
                     # Generate grid query points
                     _, _, _, H, W = images_batch.shape
@@ -239,11 +256,11 @@ class VGGTNode(Node):
                         self.inference_times.clear()
                     
                     # Extract results
-                    pose_enc = predictions["pose_enc"]
+                    pose_enc = torch.flip(predictions["pose_enc"], dims=[1])
                     extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images_batch.shape[-2:])
                     
-                    depth_map = predictions["depth"]
-                    track_list = predictions["track"]
+                    depth_map = torch.flip(predictions["depth"], dims=[1])
+                    track_tensor = torch.flip(predictions["track"], dims=[1])
                     
                     # Unproject points
                     point_map_by_unprojection = unproject_depth_map_to_point_map(depth_map.squeeze(0), 
@@ -252,7 +269,7 @@ class VGGTNode(Node):
                     
                     # Compute 3D tracks efficiently on GPU
                     tracks_3d_world, tracks_valid_mask = compute_3d_tracks(
-                        track_list[-1].squeeze(0), # (S, N, 2)
+                        track_tensor.squeeze(0),    # (S, N, 2)
                         depth_map.squeeze(0),      # (S, H, W, 1)
                         intrinsic.squeeze(0),      # (S, 3, 3)
                         extrinsic.squeeze(0)       # (S, 4, 4)
@@ -278,27 +295,52 @@ class VGGTNode(Node):
                     return tensor.float().cpu().numpy()
                 return tensor.cpu().numpy()
             
+            raw_vis = predictions.get("vis")
+            if raw_vis is not None:
+                raw_vis = torch.flip(raw_vis, dims=[1])
+            tracks_vis = None
+            if raw_vis is not None:
+                try:
+                    vis_tensor = raw_vis.squeeze(0)
+                except Exception:
+                    vis_tensor = raw_vis
+                tracks_vis = to_numpy(vis_tensor)
+            tracks_3d_world_np = to_numpy(tracks_3d_world)
+            depth_valid_mask_np = to_numpy(tracks_valid_mask)
+            combined_mask = depth_valid_mask_np.astype(bool)
+            if tracks_vis is not None:
+                vis_mask = (tracks_vis > self.track_visibility_threshold)
+                if vis_mask.shape == combined_mask.shape:
+                    combined_mask = np.logical_and(combined_mask, vis_mask)
+                else:
+                    self.get_logger().warn(
+                        f"tracks_vis shape {vis_mask.shape} does not match depth mask {combined_mask.shape}; falling back to depth-only mask"
+                    )
+
             self.publish_results(
                 point_map_by_unprojection,
                 to_numpy(extrinsic.squeeze(0)),
                 to_numpy(intrinsic.squeeze(0)),
                 to_numpy(depth_map.squeeze(0)),
-                to_numpy(track_list[-1].squeeze(0)),
-                to_numpy(tracks_3d_world),
-                to_numpy(tracks_valid_mask),
+                to_numpy(track_tensor.squeeze(0)),
+                tracks_3d_world_np,
+                combined_mask.astype(np.float32),
                 current_headers,
                 transforms,
                 query_grid_width,
                 query_grid_height,
                 stride,
-                current_images
+                current_images,
+                current_keyframe_ids
             )
             # After publishing results, attach intrinsic average to last published message via stored fields
             
         except Exception as e:
             self.get_logger().error(f'Inference failed: {e}')
 
-    def publish_results(self, points, extrinsic, intrinsic, depth, tracks, tracks_3d, tracks_mask, headers, transforms, query_grid_width, query_grid_height, query_stride, current_images):
+    def publish_results(self, points, extrinsic, intrinsic, depth, tracks, tracks_3d, tracks_mask,
+                        headers, transforms, query_grid_width, query_grid_height, query_stride,
+                        current_images, current_keyframe_ids):
         # Use the header of the last frame for the point cloud and poses?
         # Or use the map frame.
         # Usually SLAM systems publish in a fixed frame (e.g. "map" or "odom").
@@ -338,30 +380,57 @@ class VGGTNode(Node):
             pose_array_msg.poses.append(pose)
         
         output_msg.camera_poses = pose_array_msg
+        output_msg.keyframe_ids = [int(k) for k in current_keyframe_ids]
         
         # 2. Tracks 3D (Dense MultiArray)
         # tracks_3d: (S, N, 3) where N = H*W
         # tracks_mask: (S, N)
         
         S, N, _ = tracks_3d.shape
+        if len(current_keyframe_ids) != S:
+            self.get_logger().warn(
+                f"current_keyframe_ids size {len(current_keyframe_ids)} mismatches pose window {S}; padding/truncating")
+            if len(current_keyframe_ids) < S:
+                pad = [0] * (S - len(current_keyframe_ids))
+                current_keyframe_ids = pad + list(current_keyframe_ids)
+            else:
+                current_keyframe_ids = current_keyframe_ids[-S:]
         # Assuming N = H * W, we need to know H and W to reconstruct the grid.
         # We can get H, W from the last image in headers or transforms?
         # Or just pass them.
         # In run_inference_and_publish, we generated grid from H, W.
         # Let's assume N is correct.
         
+        # Compute visibility ratios per frame relative to the latest frame
+        visibility_counts = tracks_mask.reshape(S, N).sum(axis=1).astype(float)
+        latest_visible = float(visibility_counts[-1]) if visibility_counts.size > 0 else 0.0
+        if latest_visible <= 1e-6:
+            visibility_ratios = [0.0 for _ in range(S)]
+        else:
+            visibility_ratios = (visibility_counts / latest_visible).tolist()
+        output_msg.visibility_ratios = [float(max(0.0, min(1.0, r))) for r in visibility_ratios]
+
         # Create MultiArray for tracks_3d
         tracks_msg = Float32MultiArray()
-        
+
         # Define layout
         dim_s = MultiArrayDimension(label="S", size=S, stride=S*N*3)
         dim_n = MultiArrayDimension(label="N", size=N, stride=N*3)
         dim_c = MultiArrayDimension(label="C", size=3, stride=3)
         tracks_msg.layout.dim = [dim_s, dim_n, dim_c]
-        
+
         # Flatten data
         tracks_msg.data = tracks_3d.flatten().tolist()
         output_msg.tracks_3d = tracks_msg
+
+        # Create MultiArray for tracks_2d (preprocessed image coords)
+        tracks2d_msg = Float32MultiArray()
+        dim_s_2d = MultiArrayDimension(label="S", size=S, stride=S*N*2)
+        dim_n_2d = MultiArrayDimension(label="N", size=N, stride=N*2)
+        dim_c_2d = MultiArrayDimension(label="C", size=2, stride=2)
+        tracks2d_msg.layout.dim = [dim_s_2d, dim_n_2d, dim_c_2d]
+        tracks2d_msg.data = tracks.reshape(-1).tolist()
+        output_msg.tracks_2d = tracks2d_msg
         
         # Create MultiArray for tracks_mask
         mask_msg = Float32MultiArray()
@@ -387,11 +456,27 @@ class VGGTNode(Node):
         output_msg.query_grid_height = query_grid_height
         output_msg.query_stride = query_stride
         
-        # Set original image dimensions (from the last keyframe)
+        # Set original image dimensions (from the last keyframe) and embed latest image
+        latest_image_msg = Image()
+        latest_header = headers[-1] if headers else common_header
+        latest_image_msg.header = latest_header
         if current_images:
             orig_img = current_images[-1]
             output_msg.original_image_height = orig_img.shape[0]
             output_msg.original_image_width = orig_img.shape[1]
+            try:
+                if orig_img.ndim == 3 and orig_img.shape[2] == 3:
+                    latest_bgr = cv2.cvtColor(orig_img, cv2.COLOR_RGB2BGR)
+                else:
+                    latest_bgr = orig_img
+            except Exception:
+                latest_bgr = orig_img
+            latest_image_msg = self.bridge.cv2_to_imgmsg(latest_bgr, encoding='bgr8')
+            latest_image_msg.header = latest_header
+        else:
+            output_msg.original_image_height = 0
+            output_msg.original_image_width = 0
+        output_msg.latest_image = latest_image_msg
 
         # Fill intrinsic average
         if self.intrinsic_sum is not None and self.intrinsic_count > 0:

@@ -95,6 +95,7 @@ class MapPoint
         ar & mColor[1];
         ar & mColor[2];
         ar & mbHasColor;
+        ar & mbFromVGGT;
         //ar & mnVisible;
         //ar & mnFound;
 
@@ -164,6 +165,8 @@ public:
     void SetColor(const cv::Vec3b &color);
     cv::Vec3b GetColor();
     bool HasColor();
+    void SetVGGTPoint(bool flag=true);
+    bool IsVGGTPoint();
 
     void PreSave(set<KeyFrame*>& spKF,set<MapPoint*>& spMP);
     void PostLoad(map<long unsigned int, KeyFrame*>& mpKFid, map<long unsigned int, MapPoint*>& mpMPid);
@@ -243,6 +246,7 @@ protected:
     // Optional RGB color used for visualization
     cv::Vec3b mColor;
     bool mbHasColor;
+    bool mbFromVGGT;
 
      // Bad flag (we do not currently erase MapPoint from memory)
      bool mbBad;

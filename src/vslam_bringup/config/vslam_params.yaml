@@ -5,16 +5,18 @@
     device: "cuda"
     window_size: 2
     image_topic: "/camera/image_raw"
-    min_parallax: 10.0
+    min_parallax: 0.05
+    track_visibility_threshold: 0.3
 
     # ORB-SLAM3 Frontend Parameters
     voc_file: "/home/firefly/aiaa2205final/vslam/src/orb_slam3_lib/orb_slam3/Vocabulary/ORBvoc.txt.bin"
     settings_file: "/home/firefly/aiaa2205final/vslam/src/orb_slam3_lib/orb_slam3/config/Monocular/EuRoC.yaml"
     use_viewer: true
     override_intrinsics_from_vggt: true
+    enable_vggt_phase2: true
 
     # Video Reader Parameters
     video_path: "/docs/great_wall.mp4"
     camera_name: "video_camera"
-    use_sensor_data_qos: true
+    use_sensor_data_qos: false
     camera_info_url: "package://video_reader/config/camera_info.yaml"

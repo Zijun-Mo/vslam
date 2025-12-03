@@ -162,6 +162,7 @@ class KeyFrame
         ar & mbNotErase;
         ar & mbToBeErased;
         ar & mbBad;
+        ar & mbFromVGGT;
 
         ar & mHalfBaseline;
 
@@ -213,6 +214,14 @@ public:
     Eigen::Vector3f GetTranslation();
     Eigen::Vector3f GetVelocity();
     bool isVelocitySet();
+    void SetVGGTKeyframe(bool flag=true);
+    bool IsVGGTKeyframe();
+    void SetVGGTTrackMetadata(const std::vector<long>& global_track_ids,
+                              const std::vector<char>& is_new_flags,
+                              const std::vector<Eigen::Vector3f>& points_in_camera);
+    std::vector<long> GetVGGTGlobalTrackIds() const;
+    std::vector<char> GetVGGTIsNewFlags() const;
+    std::vector<Eigen::Vector3f> GetVGGTPointsInCamera() const;
 
     // Bag of Words Representation
     void ComputeBoW();
@@ -479,6 +488,10 @@ protected:
     bool mbNotErase;
     bool mbToBeErased;
     bool mbBad;    
+    bool mbFromVGGT;
+    std::vector<long> mvVGGTGlobalTrackIds;
+    std::vector<char> mvVGGTIsNewTrack;
+    std::vector<Eigen::Vector3f> mvVGGTPointsInCamera;
 
     float mHalfBaseline; // Only for visualization
 
@@ -498,7 +511,7 @@ protected:
     // Mutex
     std::mutex mMutexPose; // for pose, velocity and biases
     std::mutex mMutexConnections;
-    std::mutex mMutexFeatures;
+    mutable std::mutex mMutexFeatures;
     std::mutex mMutexMap;
 
 public:
