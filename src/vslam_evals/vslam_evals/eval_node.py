@@ -1,5 +1,6 @@
 import csv
 import os
+from pathlib import Path
 from typing import List, Tuple
 
 import numpy as np
@@ -189,13 +190,28 @@ class EvalNode(Node):
         self.write_csv(n, rmse, mean, median, std, max_err, min_err)
 
     def write_csv(self, n: int, rmse: float, mean: float, median: float, std: float, max_err: float, min_err: float) -> None:
-        # Place logs at workspace root: <repo>/logs/evals_tum.csv
-        logs_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "logs"))
-        os.makedirs(logs_dir, exist_ok=True)
-        csv_path = os.path.join(logs_dir, "evals_tum.csv")
-        write_header = not os.path.exists(csv_path)
+        # Place logs under repo: <repo>/evals/logs/evals_tum.csv
+        # Try env override first; otherwise walk up to find a parent containing "evals" dir.
+        env_dir = os.getenv("VSLAM_EVAL_LOG_DIR")
+        if env_dir:
+            logs_dir_path = Path(env_dir)
+        else:
+            here = Path(__file__).resolve()
+            # Default to cwd/evals/logs
+            logs_dir_path = Path.cwd() / "evals" / "logs"
+            last_found = None
+            for parent in here.parents:
+                candidate = parent / "evals"
+                if candidate.is_dir():
+                    last_found = candidate
+            if last_found is not None:
+                logs_dir_path = last_found / "logs"
+
+        logs_dir_path.mkdir(parents=True, exist_ok=True)
+        csv_path = logs_dir_path / "evals_tum.csv"
+        write_header = not csv_path.exists()
         row = [self.seq_name, self.run_id, n, rmse, mean, median, std, max_err, min_err]
-        with open(csv_path, "a", newline="", encoding="utf-8") as f:
+        with csv_path.open("a", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             if write_header:
                 writer.writerow(["seq_name", "run_id", "N", "rmse", "mean", "median", "std", "max", "min"])

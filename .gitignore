@@ -7,3 +7,4 @@ log/
 .vscode/
 .python-version
 .clangd
+evals/logs/
