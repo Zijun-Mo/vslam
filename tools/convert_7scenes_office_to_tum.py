@@ -2,8 +2,8 @@
 """
 Convert 7-Scenes pose files (T_wc) to TUM groundtruth format.
 
-Expected layout:
-    {data_root}/7-scenes/{scene}/seq-XX/frame-*.pose.txt
+Expected layout (customizable via --dataset_dir):
+    {data_root}/{dataset_dir}/{scene}/seq-XX/frame-*.pose.txt
 
 Each pose.txt contains a 4x4 Twc matrix (camera -> world).
 The script writes groundtruth.txt inside each seq-XX directory with lines:
@@ -99,10 +99,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Convert 7-Scenes poses to TUM format groundtruth.")
     parser.add_argument("--data_root", required=True, type=Path, help="Path to dataset root")
     parser.add_argument("--scene", required=True, help="Scene name, e.g., office")
+    parser.add_argument(
+        "--dataset_dir",
+        default="7-scenes",
+        help="Folder name for 7-Scenes dataset under data_root (default: 7-scenes)",
+    )
     parser.add_argument("--fps", type=float, default=30.0, help="Frame rate used to assign timestamps (default: 30.0)")
     args = parser.parse_args()
 
-    scene_dir = args.data_root / "7-scenes" / args.scene
+    scene_dir = args.data_root / args.dataset_dir / args.scene
     if not scene_dir.is_dir():
         print(f"[error] Scene directory not found: {scene_dir}", file=sys.stderr)
         sys.exit(1)

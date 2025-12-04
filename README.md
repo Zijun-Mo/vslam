@@ -188,15 +188,18 @@ ros2 launch vslam_evals eval_tum.launch.py \
 ```bash
 python tools/convert_7scenes_office_to_tum.py \
   --data_root /home/firefly/MASt3R-SLAM/datasets \
-  --scene office \
+  --dataset_dir 7-scenes \   # 若目录名为 7scenes 则改为 7scenes
+  --scene office \           # 替换为实际场景：chess/fire/fireplace/head/pumpkin/redkitchen 等
   --fps 30.0
 ```
 2) 运行评估  
 ```bash
 ros2 launch vslam_evals eval_7scenes_office.launch.py \
-  scene:=office \
-  seq:=seq-01 \
-  data_root:=/home/firefly/MASt3R-SLAM/datasets
+  scene:=office \            # 替换为同上场景
+  seq:=seq-01 \              # 对应序列
+  data_root:=/home/firefly/MASt3R-SLAM/datasets \
+  dataset_dir:=7-scenes \    # 目录名若为 7scenes 则改为 7scenes
+  play_rate:=1.0             # 可选，调整播放倍速，CSV 会记录
 ```
 链路：`seven_scenes_player` 播放 -> `vslam_bringup` (VGGT+ORB) -> `eval_node` 计算 ATE -> 写 `evals_7scenes.csv`。
 

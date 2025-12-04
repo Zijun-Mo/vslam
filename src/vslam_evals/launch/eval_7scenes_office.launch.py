@@ -22,6 +22,11 @@ def generate_launch_description():
         default_value="/DATA_ROOT",
         description="Dataset root containing 7-scenes/<scene>/<seq>",
     )
+    dataset_dir_arg = DeclareLaunchArgument(
+        "dataset_dir",
+        default_value="7-scenes",
+        description="Folder name for 7-Scenes dataset (e.g., 7-scenes or 7scenes)",
+    )
     play_rate_arg = DeclareLaunchArgument(
         "play_rate",
         default_value="1.0",
@@ -31,9 +36,10 @@ def generate_launch_description():
     scene = LaunchConfiguration("scene")
     seq = LaunchConfiguration("seq")
     data_root = LaunchConfiguration("data_root")
+    dataset_dir = LaunchConfiguration("dataset_dir")
     play_rate = LaunchConfiguration("play_rate")
 
-    seq_root = PathJoinSubstitution([data_root, "7-scenes", scene, seq])
+    seq_root = PathJoinSubstitution([data_root, dataset_dir, scene, seq])
     gt_path = PathJoinSubstitution([seq_root, "groundtruth.txt"])
 
     seven_scenes_player = Node(
@@ -81,6 +87,7 @@ def generate_launch_description():
             scene_arg,
             seq_arg,
             data_root_arg,
+            dataset_dir_arg,
             play_rate_arg,
             seven_scenes_player,
             vslam_system,
