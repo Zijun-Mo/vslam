@@ -21,6 +21,8 @@ src/
   video_reader/            # 视频读入与摄像头参数示例
   vslam_bringup/           # 系统级 launch / 参数汇总
   vslam_msgs/              # 自定义消息类型 (KeyFramePtr 等)
+  vslam_evals/             # 在线评估节点与 launch（TUM/7-Scenes，ATE 统计与日志）
+tools/                     # 数据与评估工具脚本（如 7-Scenes->TUM GT 转换）
 vggt/                      # 原始 VGGT Python 包及训练/示例脚本
 ```
 
@@ -35,6 +37,12 @@ vggt/                      # 原始 VGGT Python 包及训练/示例脚本
                                                   (ORB Mapping)
                                                         │
                                                  地图 / 回环 / 优化
+                                                        │
+                                                 /vslam/pose
+                                                        │
+                                              (vslam_evals EvalNode)
+                                                        │
+                         ATE 评估 & CSV 日志 (TUM / 7-Scenes，可指定 log 文件)
 ```
 VGGT 提供即时几何初值，可作为 ORB-SLAM3 关键帧插入与姿态初始化的辅助；同时支持在低纹理、少视图或单帧场景下提升初始化质量与鲁棒性。用户可根据需求：
 1. 仅运行 VGGT 前端做快速几何推理（深度 / 点 / 位姿）。
@@ -159,6 +167,38 @@ python vggt/demo_colmap.py --scene_dir /YOUR/SCENE_DIR/ --use_ba --max_query_pts
 python vggt/demo_gradio.py        # 浏览器交互
 python vggt/demo_viser.py --image_folder path/to/images
 ```
+
+### 6.7 在线评估 (vslam_evals)
+核心组件
+- `vslam_evals/eval_node.py`：订阅 `/vslam/pose`，接收 `/dataset_done` 后计算 ATE (Umeyama 对齐) 并写 CSV。参数：`groundtruth_path`、`max_time_diff`、`align_scale`、`seq_name`（可选，默认从 GT 推断）、`play_rate`（记录用）、`log_filename`（默认 `evals_tum.csv`）。日志优先写 `VSLAM_EVAL_LOG_DIR`，否则写安装目录 `share/vslam_evals/logs`，再回退到源码 `src/vslam_evals/logs`/当前目录。
+- `vslam_evals/seven_scenes_player_node.py`：按 `seq_root` 播放 7-Scenes `*.color.png`，发布 `/camera/image_raw`，播放结束发布 `/dataset_done`。
+- 自定义日志：TUM 评估使用 `evals_tum.csv`；7-Scenes launch 传 `log_filename=evals_7scenes.csv`，保存在上述日志目录。
+
+TUM 在线评估
+```bash
+ros2 launch vslam_evals eval_tum.launch.py \
+  seq:=rgbd_dataset_freiburg1_room \
+  data_root:=/home/firefly/MASt3R-SLAM/datasets \
+  play_rate:=0.3   # 可选
+```
+链路：`tum_player` 播放 -> `vslam_bringup` (VGGT+ORB) -> `eval_node` 计算 ATE -> 写 `evals_tum.csv`。
+
+7-Scenes 在线评估
+1) 生成 GT（每个序列一次）  
+```bash
+python tools/convert_7scenes_office_to_tum.py \
+  --data_root /home/firefly/MASt3R-SLAM/datasets \
+  --scene office \
+  --fps 30.0
+```
+2) 运行评估  
+```bash
+ros2 launch vslam_evals eval_7scenes_office.launch.py \
+  scene:=office \
+  seq:=seq-01 \
+  data_root:=/home/firefly/MASt3R-SLAM/datasets
+```
+链路：`seven_scenes_player` 播放 -> `vslam_bringup` (VGGT+ORB) -> `eval_node` 计算 ATE -> 写 `evals_7scenes.csv`。
 
 ## 7. 性能与资源
 VGGT 前端在单卡（例如 A100/H100）可在百帧级输入下数秒内聚合；内存随帧数线性增长。若需更快注意编译 Flash Attention 3。
