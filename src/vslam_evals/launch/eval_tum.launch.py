@@ -13,12 +13,12 @@ def generate_launch_description():
     )
     play_rate_arg = DeclareLaunchArgument(
         "play_rate",
-        default_value="0.3",
+        default_value="0.2",
         description="Playback rate multiplier for tum_player (lower -> slower playback, more frames covered)",
     )
     data_root_arg = DeclareLaunchArgument(
         "data_root",
-        default_value="/home/firefly/MASt3R-SLAM/datasets",
+        default_value="/home/jun/vslam/datasets",
         description="Root directory containing TUM sequences (expects <data_root>/tum/<seq>)",
     )
 

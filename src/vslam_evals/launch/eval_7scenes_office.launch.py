@@ -22,10 +22,16 @@ def generate_launch_description():
         default_value="/DATA_ROOT",
         description="Dataset root containing 7-scenes/<scene>/<seq>",
     )
+    play_rate_arg = DeclareLaunchArgument(
+        "play_rate",
+        default_value="0.1",
+        description="Playback rate multiplier for SevenScenesPlayer (default: 1.0)",
+    )
 
     scene = LaunchConfiguration("scene")
     seq = LaunchConfiguration("seq")
     data_root = LaunchConfiguration("data_root")
+    play_rate = LaunchConfiguration("play_rate")
 
     seq_root = PathJoinSubstitution([data_root, "7-scenes", scene, seq])
     gt_path = PathJoinSubstitution([seq_root, "groundtruth.txt"])
@@ -38,7 +44,7 @@ def generate_launch_description():
             {
                 "seq_root": seq_root,
                 "fps": 30.0,
-                "play_rate": 1.0,
+                "play_rate": play_rate,
             }
         ],
         output="screen",
@@ -64,6 +70,7 @@ def generate_launch_description():
                 "align_scale": True,
                 "seq_name": [scene, "/", seq],
                 "log_filename": "evals_7scenes.csv",
+                "play_rate": play_rate,
             }
         ],
         output="screen",
@@ -74,6 +81,7 @@ def generate_launch_description():
             scene_arg,
             seq_arg,
             data_root_arg,
+            play_rate_arg,
             seven_scenes_player,
             vslam_system,
             eval_node,

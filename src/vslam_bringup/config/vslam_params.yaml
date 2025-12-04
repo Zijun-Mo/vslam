@@ -3,15 +3,15 @@
     # VGGT Tracker Parameters
     model_name: "facebook/VGGT-1B"
     device: "cuda"
-    window_size: 2
+    window_size: 9
     image_topic: "/camera/image_raw"
     min_parallax: 0.05
     track_visibility_threshold: 0.3
 
     # ORB-SLAM3 Frontend Parameters
-    voc_file: "/home/firefly/aiaa2205final/vslam/src/orb_slam3_lib/orb_slam3/Vocabulary/ORBvoc.txt.bin"
-    settings_file: "/home/firefly/aiaa2205final/vslam/src/orb_slam3_lib/orb_slam3/config/Monocular/EuRoC.yaml"
-    use_viewer: true
+    voc_file: "/home/jun/vslam/src/orb_slam3_lib/orb_slam3/Vocabulary/ORBvoc.txt.bin"
+    settings_file: "/home/jun/vslam/src/orb_slam3_lib/orb_slam3/config/Monocular/EuRoC.yaml"
+    use_viewer: false
     override_intrinsics_from_vggt: true
     enable_vggt_phase2: true
 
