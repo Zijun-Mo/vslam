@@ -121,9 +121,11 @@ class EvalNode(Node):
         self.declare_parameter("groundtruth_path", "")
         self.declare_parameter("max_time_diff", 0.02)
         self.declare_parameter("align_scale", True)
-        self.declare_parameter("seq_name", "tum_seq")
+        # Optional seq name; if empty, inferred from groundtruth_path
+        self.declare_parameter("seq_name", "")
         self.declare_parameter("run_id", "run_001")
         self.declare_parameter("play_rate", 1.0)
+        self.declare_parameter("log_filename", "evals_tum.csv")
 
         self.groundtruth_path = self.get_parameter("groundtruth_path").get_parameter_value().string_value
         self.max_time_diff = float(self.get_parameter("max_time_diff").get_parameter_value().double_value)
@@ -131,6 +133,7 @@ class EvalNode(Node):
         self.seq_name = self.get_parameter("seq_name").get_parameter_value().string_value
         self.run_id = self.get_parameter("run_id").get_parameter_value().string_value
         self.play_rate = self._get_float_param("play_rate", 1.0)
+        self.log_filename = self.get_parameter("log_filename").get_parameter_value().string_value or "evals_tum.csv"
 
         if not self.groundtruth_path or not os.path.exists(self.groundtruth_path):
             self.get_logger().warn(f"groundtruth_path not set or not found: {self.groundtruth_path}")
@@ -202,9 +205,10 @@ class EvalNode(Node):
             logs_dir_path = Path.cwd() / "logs"
             logs_dir_path.mkdir(parents=True, exist_ok=True)
 
-        csv_path = logs_dir_path / "evals_tum.csv"
+        csv_path = logs_dir_path / self.log_filename
         write_header = not csv_path.exists()
-        row = [self.seq_name, self.run_id, self.play_rate, n, rmse, mean, median, std, max_err, min_err]
+        seq_name = self.seq_name if self.seq_name else self._infer_seq_name()
+        row = [seq_name, self.run_id, self.play_rate, n, rmse, mean, median, std, max_err, min_err]
         with csv_path.open("a", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             if write_header:
@@ -248,6 +252,18 @@ class EvalNode(Node):
             return float(param.value)
         except Exception:
             return float(default)
+
+    def _infer_seq_name(self) -> str:
+        """Infer seq_name from groundtruth_path if parameter not provided."""
+        if self.groundtruth_path:
+            try:
+                p = Path(self.groundtruth_path)
+                if p.name.lower().startswith("groundtruth"):
+                    return p.parent.name
+                return p.stem
+            except Exception:
+                pass
+        return ""
 
 
 def main(args=None) -> None:

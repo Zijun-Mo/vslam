@@ -23,6 +23,7 @@ setup(
     entry_points={
         'console_scripts': [
             'eval_node = vslam_evals.eval_node:main',
+            'seven_scenes_player = vslam_evals.seven_scenes_player_node:main',
         ],
     },
 )
