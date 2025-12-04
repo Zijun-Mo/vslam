@@ -9,6 +9,7 @@ from builtin_interfaces.msg import Time
 from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
 from std_msgs.msg import Empty
+from ament_index_python.packages import PackageNotFoundError, get_package_share_directory
 
 
 def load_tum_trajectory(path: str) -> List[Tuple[float, float, float, float, float, float, float, float]]:
@@ -122,12 +123,14 @@ class EvalNode(Node):
         self.declare_parameter("align_scale", True)
         self.declare_parameter("seq_name", "tum_seq")
         self.declare_parameter("run_id", "run_001")
+        self.declare_parameter("play_rate", 1.0)
 
         self.groundtruth_path = self.get_parameter("groundtruth_path").get_parameter_value().string_value
         self.max_time_diff = float(self.get_parameter("max_time_diff").get_parameter_value().double_value)
         self.align_scale = self.get_parameter("align_scale").get_parameter_value().bool_value
         self.seq_name = self.get_parameter("seq_name").get_parameter_value().string_value
         self.run_id = self.get_parameter("run_id").get_parameter_value().string_value
+        self.play_rate = self._get_float_param("play_rate", 1.0)
 
         if not self.groundtruth_path or not os.path.exists(self.groundtruth_path):
             self.get_logger().warn(f"groundtruth_path not set or not found: {self.groundtruth_path}")
@@ -190,32 +193,61 @@ class EvalNode(Node):
         self.write_csv(n, rmse, mean, median, std, max_err, min_err)
 
     def write_csv(self, n: int, rmse: float, mean: float, median: float, std: float, max_err: float, min_err: float) -> None:
-        # Place logs under repo: <repo>/evals/logs/evals_tum.csv
-        # Try env override first; otherwise walk up to find a parent containing "evals" dir.
-        env_dir = os.getenv("VSLAM_EVAL_LOG_DIR")
-        if env_dir:
-            logs_dir_path = Path(env_dir)
-        else:
-            here = Path(__file__).resolve()
-            # Default to cwd/evals/logs
-            logs_dir_path = Path.cwd() / "evals" / "logs"
-            last_found = None
-            for parent in here.parents:
-                candidate = parent / "evals"
-                if candidate.is_dir():
-                    last_found = candidate
-            if last_found is not None:
-                logs_dir_path = last_found / "logs"
+        # Preferred location: <share>/vslam_evals/logs/evals_tum.csv
+        logs_dir_path = self._resolve_logs_dir()
+        try:
+            logs_dir_path.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            self.get_logger().warn(f"Failed to create logs dir at {logs_dir_path}: {exc}; falling back to cwd/logs")
+            logs_dir_path = Path.cwd() / "logs"
+            logs_dir_path.mkdir(parents=True, exist_ok=True)
 
-        logs_dir_path.mkdir(parents=True, exist_ok=True)
         csv_path = logs_dir_path / "evals_tum.csv"
         write_header = not csv_path.exists()
-        row = [self.seq_name, self.run_id, n, rmse, mean, median, std, max_err, min_err]
+        row = [self.seq_name, self.run_id, self.play_rate, n, rmse, mean, median, std, max_err, min_err]
         with csv_path.open("a", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             if write_header:
-                writer.writerow(["seq_name", "run_id", "N", "rmse", "mean", "median", "std", "max", "min"])
+                writer.writerow(
+                    ["seq_name", "run_id", "play_rate", "N", "rmse", "mean", "median", "std", "max", "min"]
+                )
             writer.writerow(row)
+
+    @staticmethod
+    def _resolve_logs_dir() -> Path:
+        env_dir = os.getenv("VSLAM_EVAL_LOG_DIR")
+        if env_dir:
+            return Path(env_dir)
+
+        # Prefer source tree logs path if running from a workspace
+        here = Path(__file__).resolve()
+        for parent in here.parents:
+            candidate_pkg = parent / "src" / "vslam_evals"
+            if candidate_pkg.is_dir():
+                return candidate_pkg / "logs"
+
+        # Prefer package share location so logs sit under vslam_evals/logs
+        try:
+            share_dir = Path(get_package_share_directory("vslam_evals"))
+            return share_dir / "logs"
+        except (PackageNotFoundError, Exception):
+            pass
+
+        # Fallback: source tree package root (where package.xml/setup.py live)
+        for parent in here.parents:
+            if (parent / "package.xml").is_file() and (parent / "setup.py").is_file():
+                return parent / "logs"
+
+        # Final fallback: cwd/logs
+        return Path.cwd() / "logs"
+
+    def _get_float_param(self, name: str, default: float) -> float:
+        """Return parameter as float, tolerating string inputs from launch substitutions."""
+        try:
+            param = self.get_parameter(name)
+            return float(param.value)
+        except Exception:
+            return float(default)
 
 
 def main(args=None) -> None:
