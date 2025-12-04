@@ -65,6 +65,7 @@ def generate_launch_description():
                 "align_scale": True,
                 "seq_name": seq,
                 "run_id": "run_001",
+                "play_rate": play_rate,
             }
         ],
         output="screen",
