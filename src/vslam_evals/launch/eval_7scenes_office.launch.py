@@ -24,7 +24,7 @@ def generate_launch_description():
     )
     play_rate_arg = DeclareLaunchArgument(
         "play_rate",
-        default_value="0.1",
+        default_value="1.0",
         description="Playback rate multiplier for SevenScenesPlayer (default: 1.0)",
     )
 
