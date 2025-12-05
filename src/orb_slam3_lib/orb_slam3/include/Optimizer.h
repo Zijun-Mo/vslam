@@ -26,7 +26,7 @@
 #include "LoopClosing.h"
 #include "Frame.h"
 
-#include <math.h>
+#include <cmath>
 
 #include "Thirdparty/g2o/g2o/types/types_seven_dof_expmap.h"
 #include "Thirdparty/g2o/g2o/core/sparse_block_matrix.h"
@@ -43,6 +43,15 @@ namespace ORB_SLAM3
 
 class LoopClosing;
 
+struct VGGTDenseBAConfig
+{
+    double reused_point_weight{1.0};
+    double new_point_weight{0.25};
+    double huber_delta{std::sqrt(7.815)};
+    double phase2_voxel_size{0.1};      // spatial hash resolution for Phase2 plane search (meters)
+    double phase2_search_radius{0.5};   // neighbor search radius for Phase2 (meters)
+};
+
 class Optimizer
 {
 public:
@@ -57,6 +66,8 @@ public:
     void static LocalBundleAdjustment(KeyFrame* pKF, bool *pbStopFlag, Map *pMap, int& num_fixedKF, int& num_OptKF, int& num_MPs, int& num_edges);
     static void SetVGGTPhase2Enabled(bool enabled);
     static bool IsVGGTPhase2Enabled();
+    static void SetVGGTDenseBAConfig(const VGGTDenseBAConfig& config);
+    static void SetVGGTDenseConfig(const VGGTDenseConfig& config);
 
     int static PoseOptimization(Frame* pFrame);
     int static PoseInertialOptimizationLastKeyFrame(Frame* pFrame, bool bRecInit = false);

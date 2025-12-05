@@ -44,6 +44,7 @@ public:
     Atlas* mpAtlas;
 
     void DrawMapPoints();
+    void DrawVGGTDenseCloud(bool onlyActiveMap, size_t maxPoints, float pointSizeOverride);
     void DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const bool bDrawInertialGraph, const bool bDrawOptLba);
     void DrawCurrentCamera(pangolin::OpenGlMatrix &Twc);
     void SetCurrentCameraPose(const Sophus::SE3f &Tcw);
@@ -55,6 +56,8 @@ public:
     void AddFramePose(const Sophus::SE3f &Tcw, bool isKeyFrame);
     void DrawFrameTrajectory();
     void ClearFrameTrajectory();
+
+    float GetPointSize() const { return mPointSize; }
 
 private:
 

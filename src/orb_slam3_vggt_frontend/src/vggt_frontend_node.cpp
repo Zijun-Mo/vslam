@@ -15,7 +15,11 @@
 #include <cstdint>
 #include <chrono>
 #include <algorithm>
+#include <functional>
+#include <mutex>
+#include <optional>
 
+#include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include "System.h"
 #include "Tracking.h"
 #include "Optimizer.h"
@@ -37,6 +41,15 @@ public:
         declare_parameter("settings_file", "");
         declare_parameter("use_viewer", true);
         declare_parameter("enable_vggt_phase2", true);
+        declare_parameter("dense.voxel_size", 0.03);
+        declare_parameter("dense.min_points_per_voxel", 4);
+        declare_parameter("dense.max_range", 8.0);
+        declare_parameter("dense.phase2_radius", 0.5);
+        declare_parameter("dense.color_consistency", 30.0);
+        declare_parameter("dense.depth_consistency", 0.5);
+        declare_parameter("dense.ba.reused_weight", 1.0);
+        declare_parameter("dense.ba.new_weight", 0.25);
+        declare_parameter("dense.ba.huber_delta", std::sqrt(7.815));
         // Camera intrinsic override parameters (optional). If provided (fx>0) we will generate a temp YAML and call ChangeCalibration.
         declare_parameter("camera.fx", 0.0);
         declare_parameter("camera.fy", 0.0);
@@ -73,6 +86,45 @@ public:
         ORB_SLAM3::Optimizer::SetVGGTPhase2Enabled(enable_vggt_phase2);
         RCLCPP_INFO(get_logger(), "VGGT phase2 optimization %s",
                 enable_vggt_phase2 ? "enabled" : "disabled");
+
+        ORB_SLAM3::VGGTDenseConfig dense_cfg;
+        dense_cfg.voxel_size = static_cast<float>(get_parameter("dense.voxel_size").as_double());
+        dense_cfg.min_points_per_voxel = get_parameter("dense.min_points_per_voxel").as_int();
+        dense_cfg.max_range = static_cast<float>(get_parameter("dense.max_range").as_double());
+        dense_cfg.color_consistency = static_cast<float>(get_parameter("dense.color_consistency").as_double());
+        dense_cfg.depth_consistency = static_cast<float>(get_parameter("dense.depth_consistency").as_double());
+        dense_cfg_ = dense_cfg;
+        if(mpSystem && mpSystem->mpTracker)
+        {
+            mpSystem->mpTracker->SetVGGTDenseConfig(dense_cfg_);
+            ORB_SLAM3::Optimizer::SetVGGTDenseConfig(dense_cfg_);
+            RCLCPP_INFO(get_logger(),
+                "VGGT dense fusion: voxel=%.3f, min_pts=%d, range=%.2f, color=%.2f, depth=%.2f",
+                dense_cfg_.voxel_size,
+                dense_cfg_.min_points_per_voxel,
+                dense_cfg_.max_range,
+                dense_cfg_.color_consistency,
+                dense_cfg_.depth_consistency);
+        }
+
+        ORB_SLAM3::VGGTDenseBAConfig dense_ba_cfg;
+        dense_ba_cfg.reused_point_weight = get_parameter("dense.ba.reused_weight").as_double();
+        dense_ba_cfg.new_point_weight = get_parameter("dense.ba.new_weight").as_double();
+        dense_ba_cfg.huber_delta = get_parameter("dense.ba.huber_delta").as_double();
+        dense_ba_cfg.phase2_voxel_size = dense_cfg.voxel_size; // align Phase2 voxel with fusion
+        dense_ba_cfg.phase2_search_radius = get_parameter("dense.phase2_radius").as_double();
+        dense_ba_cfg_ = dense_ba_cfg;
+        ORB_SLAM3::Optimizer::SetVGGTDenseBAConfig(dense_ba_cfg_);
+        RCLCPP_INFO(get_logger(),
+            "VGGT dense BA: reused_w=%.3f, new_w=%.3f, huber=%.3f, voxel=%.3f, radius=%.3f",
+            dense_ba_cfg_.reused_point_weight,
+            dense_ba_cfg_.new_point_weight,
+            dense_ba_cfg_.huber_delta,
+            dense_ba_cfg_.phase2_voxel_size,
+            dense_ba_cfg_.phase2_search_radius);
+
+        param_callback_ = this->add_on_set_parameters_callback(
+            std::bind(&VggtFrontendNode::OnParametersUpdated, this, std::placeholders::_1));
 
         // Optional intrinsic override after System construction
         double fx = get_parameter("camera.fx").as_double();
@@ -170,6 +222,8 @@ public:
     }
 
 private:
+    rcl_interfaces::msg::SetParametersResult OnParametersUpdated(const std::vector<rclcpp::Parameter> &params);
+
     struct PoseWindow
     {
         uint64_t latest_id{0};
@@ -210,14 +264,6 @@ private:
 
         auto img_msg = std::make_shared<sensor_msgs::msg::Image>(vggt_msg->latest_image);
 
-        // Visible markers to confirm data flow
-        RCLCPP_INFO_THROTTLE(get_logger(), *this->get_clock(), 3000,
-            "VggtCallback running: img stamp %.3f, vggt_frame_id=%lu, tracks=%zu, poses=%zu",
-            img_msg->header.stamp.sec + img_msg->header.stamp.nanosec * 1e-9,
-            static_cast<unsigned long>(vggt_msg->vggt_frame_id),
-            vggt_msg->tracks_3d.data.size(),
-            vggt_msg->camera_poses.poses.size());
-
         // 1. Convert Image (both color for visualization and gray for tracking)
         cv_bridge::CvImagePtr cv_ptr_color;
         cv_bridge::CvImagePtr cv_ptr_mono;
@@ -257,6 +303,11 @@ private:
         
         const auto& data = vggt_msg->tracks_3d.data;
         const auto& mask_data = vggt_msg->tracks_mask.data;
+        const auto& window_cloud_data = vggt_msg->window_point_cloud.data;
+        if(!window_cloud_data.empty() && window_cloud_data.size() % 6 != 0)
+        {
+            RCLCPP_WARN(get_logger(), "window_point_cloud size %zu is not divisible by 6", window_cloud_data.size());
+        }
         
         // Use query grid dimensions from VGGT output
         int downsampled_width = static_cast<int>(vggt_msg->query_grid_width);
@@ -337,24 +388,6 @@ private:
                                   S, N, tracks2d_layout.size(), tracks2d_data.size());
         }
 
-        int overlap_frame_idx = -1;
-        uint64_t overlap_frame_id = 0;
-        if(has_prev_pose_window_ && prev_pose_window_.valid() && current_window.valid())
-        {
-            if(!prev_pose_window_.frame_ids.empty())
-            {
-                overlap_frame_id = prev_pose_window_.frame_ids.back();
-                for(size_t idx = 0; idx < current_window.frame_ids.size(); ++idx)
-                {
-                    if(current_window.frame_ids[idx] == overlap_frame_id)
-                    {
-                        overlap_frame_idx = static_cast<int>(idx);
-                        break;
-                    }
-                }
-            }
-        }
-
         if(!has_world_alignment_)
         {
             world_from_vggt_.setIdentity();
@@ -407,11 +440,6 @@ private:
         std::vector<std::vector<uint8_t>> window_visibility_masks(
             static_cast<size_t>(S), std::vector<uint8_t>(static_cast<size_t>(N), 0));
 
-        auto count_visible = [](const std::vector<uint8_t> &mask) -> size_t
-        {
-            return std::count(mask.begin(), mask.end(), static_cast<uint8_t>(1));
-        };
-
         for(int frame_it = 0; frame_it < S; ++frame_it)
         {
             auto &mask_vec = window_visibility_masks[static_cast<size_t>(frame_it)];
@@ -422,19 +450,6 @@ private:
                     mask_vec[static_cast<size_t>(i)] = 1;
                 }
             }
-        }
-
-        if(overlap_frame_idx >= 0)
-        {
-            const auto &mask_vec = window_visibility_masks[static_cast<size_t>(overlap_frame_idx)];
-            const size_t overlap_valid = count_visible(mask_vec);
-            const size_t overlap_invalid = static_cast<size_t>(N) - overlap_valid;
-            RCLCPP_INFO_THROTTLE(get_logger(), *this->get_clock(), 2000,
-                                 "[VGGT Frontend] overlap with frame_id=%lu idx=%d: valid=%zu invalid=%zu",
-                                 static_cast<unsigned long>(overlap_frame_id),
-                                 overlap_frame_idx,
-                                 overlap_valid,
-                                 overlap_invalid);
         }
 
         for(int i=0; i<N; ++i) {
@@ -608,7 +623,8 @@ private:
             downsampled_height,
             query_stride,
             orig_W,
-            orig_H);
+            orig_H,
+            window_cloud_data);
         const int state = mpSystem->GetTrackingState();
         if(state == ORB_SLAM3::Tracking::OK || state == ORB_SLAM3::Tracking::OK_KLT)
         {
@@ -630,6 +646,11 @@ private:
             pose_pub_->publish(pose_msg);
         }
     }
+
+    std::mutex config_mutex_;
+    ORB_SLAM3::VGGTDenseConfig dense_cfg_;
+    ORB_SLAM3::VGGTDenseBAConfig dense_ba_cfg_;
+    rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_callback_;
 
     ORB_SLAM3::System* mpSystem = nullptr;
     rclcpp::Publisher<vslam_msgs::msg::SystemPtr>::SharedPtr sys_pub_;
@@ -790,6 +811,156 @@ private:
             }
         }
         return mat;
+    }
+
+    rcl_interfaces::msg::SetParametersResult VggtFrontendNode::OnParametersUpdated(const std::vector<rclcpp::Parameter> &params)
+    {
+        rcl_interfaces::msg::SetParametersResult result;
+        bool dense_changed = false;
+        bool ba_changed = false;
+        ORB_SLAM3::VGGTDenseConfig dense_snapshot;
+        ORB_SLAM3::VGGTDenseBAConfig ba_snapshot;
+
+        auto extract_double = [](const rclcpp::Parameter &param) -> std::optional<double>
+        {
+            if(param.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE)
+                return param.as_double();
+            if(param.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER)
+                return static_cast<double>(param.as_int());
+            return std::nullopt;
+        };
+
+        auto extract_int = [](const rclcpp::Parameter &param) -> std::optional<int>
+        {
+            if(param.get_type() == rclcpp::ParameterType::PARAMETER_INTEGER)
+                return param.as_int();
+            if(param.get_type() == rclcpp::ParameterType::PARAMETER_DOUBLE)
+                return static_cast<int>(std::lround(param.as_double()));
+            return std::nullopt;
+        };
+
+        {
+            std::lock_guard<std::mutex> lock(config_mutex_);
+            for(const auto &param : params)
+            {
+                const std::string &name = param.get_name();
+
+                if(name == "dense.voxel_size")
+                {
+                    if(auto value = extract_double(param))
+                    {
+                        dense_cfg_.voxel_size = static_cast<float>(std::max(1e-4, *value));
+                        dense_changed = true;
+                        // Keep Phase2 voxel in sync with fusion voxel
+                        dense_ba_cfg_.phase2_voxel_size = dense_cfg_.voxel_size;
+                        ba_changed = true;
+                    }
+                }
+                else if(name == "dense.min_points_per_voxel")
+                {
+                    if(auto value = extract_int(param))
+                    {
+                        dense_cfg_.min_points_per_voxel = std::max(1, *value);
+                        dense_changed = true;
+                    }
+                }
+                else if(name == "dense.max_range")
+                {
+                    if(auto value = extract_double(param))
+                    {
+                        dense_cfg_.max_range = static_cast<float>(std::max(0.0, *value));
+                        dense_changed = true;
+                    }
+                }
+                else if(name == "dense.color_consistency")
+                {
+                    if(auto value = extract_double(param))
+                    {
+                        dense_cfg_.color_consistency = static_cast<float>(std::max(0.0, *value));
+                        dense_changed = true;
+                    }
+                }
+                else if(name == "dense.depth_consistency")
+                {
+                    if(auto value = extract_double(param))
+                    {
+                        dense_cfg_.depth_consistency = static_cast<float>(std::max(0.0, *value));
+                        dense_changed = true;
+                    }
+                }
+                else if(name == "dense.ba.reused_weight")
+                {
+                    if(auto value = extract_double(param))
+                    {
+                        dense_ba_cfg_.reused_point_weight = std::max(1e-6, *value);
+                        ba_changed = true;
+                    }
+                }
+                else if(name == "dense.ba.new_weight")
+                {
+                    if(auto value = extract_double(param))
+                    {
+                        dense_ba_cfg_.new_point_weight = std::max(1e-6, *value);
+                        ba_changed = true;
+                    }
+                }
+                else if(name == "dense.ba.huber_delta")
+                {
+                    if(auto value = extract_double(param))
+                    {
+                        dense_ba_cfg_.huber_delta = std::max(1e-6, *value);
+                        ba_changed = true;
+                    }
+                }
+                else if(name == "dense.phase2_radius")
+                {
+                    if(auto value = extract_double(param))
+                    {
+                        dense_ba_cfg_.phase2_search_radius = std::max(1e-4, *value);
+                        ba_changed = true;
+                    }
+                }
+            }
+
+            if(dense_changed)
+                dense_snapshot = dense_cfg_;
+            if(ba_changed)
+                ba_snapshot = dense_ba_cfg_;
+        }
+
+        if(dense_changed)
+        {
+            if(mpSystem && mpSystem->mpTracker)
+            {
+                mpSystem->mpTracker->SetVGGTDenseConfig(dense_snapshot);
+                ORB_SLAM3::Optimizer::SetVGGTDenseConfig(dense_snapshot);
+                RCLCPP_INFO(get_logger(),
+                            "[Dynamic] VGGT dense fusion updated: voxel=%.3f, min_pts=%d, range=%.2f, color=%.2f, depth=%.2f",
+                            dense_snapshot.voxel_size,
+                            dense_snapshot.min_points_per_voxel,
+                            dense_snapshot.max_range,
+                            dense_snapshot.color_consistency,
+                            dense_snapshot.depth_consistency);
+            }
+            else
+            {
+                RCLCPP_WARN(get_logger(), "System not ready; deferred dense fusion parameter update");
+            }
+        }
+
+        if(ba_changed)
+        {
+            ORB_SLAM3::Optimizer::SetVGGTDenseBAConfig(ba_snapshot);
+            RCLCPP_INFO(get_logger(),
+                        "[Dynamic] VGGT dense BA updated: reused_w=%.3f, new_w=%.3f, huber=%.3f",
+                        ba_snapshot.reused_point_weight,
+                        ba_snapshot.new_point_weight,
+                        ba_snapshot.huber_delta);
+        }
+
+        result.successful = true;
+        result.reason = "VGGT dense parameters refreshed";
+        return result;
     }
 
 } // namespace orb_slam3_vggt_frontend

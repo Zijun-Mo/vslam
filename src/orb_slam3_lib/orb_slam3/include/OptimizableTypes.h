@@ -154,6 +154,26 @@ public:
     void linearizeOplus() override;
 };
 
+struct PointPlaneMeasurement
+{
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    Eigen::Vector3d camPoint{Eigen::Vector3d::Zero()};
+    Eigen::Vector3d planeCenter{Eigen::Vector3d::Zero()};
+    Eigen::Vector3d planeNormal{Eigen::Vector3d::Zero()};
+};
+
+// Pose-only point-to-plane edge for VGGT dense ICP-style residuals.
+class EdgeSE3PointToPlaneOnlyPose : public g2o::BaseUnaryEdge<1, PointPlaneMeasurement, g2o::VertexSE3Expmap>
+{
+public:
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    EdgeSE3PointToPlaneOnlyPose();
+    bool read(std::istream& is) override;
+    bool write(std::ostream& os) const override;
+    void computeError() override;
+    void linearizeOplus() override;
+};
+
 class VertexSim3Expmap : public g2o::BaseVertex<7, g2o::Sim3>
 {
 public:

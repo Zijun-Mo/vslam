@@ -135,17 +135,6 @@ void LocalMapping::Run()
                 if(mpAtlas->KeyFramesInMap()>2)
                 {
 
-                    Sophus::SE3f poseBeforeLBA;
-                    if(mbCurrentKeyFrameIsVGGT)
-                    {
-                        poseBeforeLBA = mpCurrentKeyFrame->GetPose();
-                        const Eigen::Vector3f t = poseBeforeLBA.translation();
-                        std::cerr << "[VGGT LM] Before LBA KF " << mpCurrentKeyFrame->mnId
-                                  << " t=" << t.transpose()
-                                  << " yaw_pitch_roll_mag=" << poseBeforeLBA.so3().log().norm()
-                                  << std::endl;
-                    }
-
                     if(mbInertial && mpCurrentKeyFrame->GetMap()->isImuInitialized())
                     {
                         float dist = (mpCurrentKeyFrame->mPrevKF->GetCameraCenter() - mpCurrentKeyFrame->GetCameraCenter()).norm() +
@@ -177,14 +166,8 @@ void LocalMapping::Run()
 
                     if(mbCurrentKeyFrameIsVGGT)
                     {
-                        Sophus::SE3f poseAfterLBA = mpCurrentKeyFrame->GetPose();
-                        Sophus::SE3f delta = poseBeforeLBA.inverse() * poseAfterLBA;
-                        const float trans_delta = delta.translation().norm();
-                        const float rot_delta = delta.so3().log().norm();
-                        std::cerr << "[VGGT LM] After LBA KF " << mpCurrentKeyFrame->mnId
-                                  << " |Δt|=" << trans_delta
-                                  << " |Δrot|=" << rot_delta
-                                  << std::endl;
+                        // 优化写回后立即注册稠密 MapPoints，避免批量堆积
+                        IntegrateVGGTDenseKeyframe(mpCurrentKeyFrame);
                     }
 
                 }
@@ -335,7 +318,7 @@ void LocalMapping::ProcessNewKeyFrame()
         mlNewKeyFrames.pop_front();
     }
     mbCurrentKeyFrameIsVGGT = mpCurrentKeyFrame && mpCurrentKeyFrame->IsVGGTKeyframe();
-    std::cerr << "[VGGT LM] KF " << mpCurrentKeyFrame->mnId << " fromVGGT=" << mpCurrentKeyFrame->IsVGGTKeyframe() << std::endl;
+
     // Compute Bags of Words structures
     mpCurrentKeyFrame->ComputeBoW();
 
@@ -425,7 +408,6 @@ void LocalMapping::MapPointCulling()
             borrar--;
         }
     }
-    std::cerr << "[VGGT LM] Bad points culled: " << bad_points_num << std::endl;
 }
 
 
@@ -1075,6 +1057,53 @@ MapPoint* LocalMapping::SelectRepresentative(const std::vector<MapPoint*>& group
         best = group.front();
 
     return best;
+}
+
+void LocalMapping::IntegrateVGGTDenseKeyframe(KeyFrame* pKF)
+{
+    if(!pKF || !pKF->IsVGGTKeyframe())
+        return;
+
+    const std::vector<VGGTDensePointRGBXYZ> dense_points = pKF->GetVGGTDenseMapPoints();
+    if(dense_points.empty())
+        return;
+
+    Map* pMap = pKF->GetMap();
+    if(!pMap || pMap->IsBad())
+        return;
+
+    if(!pKF->GetVGGTDensePointRefs().empty())
+        return;
+
+    std::vector<MapPoint*> vpDenseRefs;
+    vpDenseRefs.reserve(dense_points.size());
+
+    int inserted = 0;
+    for(const auto& sample : dense_points)
+    {
+        const Eigen::Vector3f& Pw = sample.xyz;
+        if(!std::isfinite(Pw.x()) || !std::isfinite(Pw.y()) || !std::isfinite(Pw.z()))
+            continue;
+
+        MapPoint* pMP = new MapPoint(Pw, pKF, pMap);
+        pMP->SetVGGTPoint(true);
+        pMP->SetColor(sample.rgb);
+        Eigen::Vector3f normal = Pw - pKF->GetCameraCenter();
+        const float norm = normal.norm();
+        if(norm > 1e-6f)
+            pMP->SetNormalVector(normal / norm);
+        mpAtlas->AddMapPoint(pMP);
+        vpDenseRefs.push_back(pMP);
+        ++inserted;
+    }
+
+    if(!vpDenseRefs.empty())
+    {
+        pKF->SetVGGTDensePointRefs(vpDenseRefs);
+        std::cerr << "[VGGT LM] KF " << pKF->mnId
+                  << " registered " << inserted
+                  << " dense MapPoints (input=" << dense_points.size() << ")" << std::endl;
+    }
 }
 
 void LocalMapping::RequestStop()

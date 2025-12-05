@@ -92,6 +92,9 @@ KeyFrame::KeyFrame(Frame &F, Map *pMap, KeyFrameDatabase *pKFDB):
     mImuBias = F.mImuBias;
     SetPose(F.GetPose());
 
+    mVGGTDenseMapPoints = F.mvpMapPointsDense;
+    mvVGGTKeyframeDensePointCloudRGBXYZ = F.mvVGGTKeyframeDensePointCloudRGBXYZ;
+
     mnOriginMapId = pMap->GetId();
 }
 
@@ -224,6 +227,54 @@ std::vector<Eigen::Vector3f> KeyFrame::GetVGGTPointsInCamera() const
 {
     unique_lock<mutex> lock(mMutexFeatures);
     return mvVGGTPointsInCamera;
+}
+
+void KeyFrame::SetVGGTDenseMapPoints(const std::vector<VGGTDensePointRGBXYZ> &dense_points)
+{
+    unique_lock<mutex> lock(mMutexFeatures);
+    mVGGTDenseMapPoints = dense_points;
+}
+
+std::vector<VGGTDensePointRGBXYZ> KeyFrame::GetVGGTDenseMapPoints() const
+{
+    unique_lock<mutex> lock(mMutexFeatures);
+    return mVGGTDenseMapPoints;
+}
+
+void KeyFrame::SetVGGTKeyframeDensePointCloud(const std::vector<float> &rgbxyz)
+{
+    unique_lock<mutex> lock(mMutexFeatures);
+    mvVGGTKeyframeDensePointCloudRGBXYZ = rgbxyz;
+}
+
+std::vector<float> KeyFrame::GetVGGTKeyframeDensePointCloud() const
+{
+    unique_lock<mutex> lock(mMutexFeatures);
+    return mvVGGTKeyframeDensePointCloudRGBXYZ;
+}
+
+bool KeyFrame::HasVGGTKeyframeDensePointCloud() const
+{
+    unique_lock<mutex> lock(mMutexFeatures);
+    return !mvVGGTKeyframeDensePointCloudRGBXYZ.empty();
+}
+
+void KeyFrame::SetVGGTDensePointRefs(const std::vector<MapPoint*> &dense_refs)
+{
+    unique_lock<mutex> lock(mMutexFeatures);
+    mvpVGGTDensePointRefs = dense_refs;
+}
+
+std::vector<MapPoint*> KeyFrame::GetVGGTDensePointRefs() const
+{
+    unique_lock<mutex> lock(mMutexFeatures);
+    return mvpVGGTDensePointRefs;
+}
+
+void KeyFrame::ClearVGGTDensePointRefs()
+{
+    unique_lock<mutex> lock(mMutexFeatures);
+    mvpVGGTDensePointRefs.clear();
 }
 
 void KeyFrame::AddConnection(KeyFrame *pKF, const int &weight)
@@ -641,6 +692,13 @@ void KeyFrame::SetBadFlag()
             mvpMapPoints[i]->EraseObservation(this);
         }
     }
+
+    for(MapPoint* pDenseMP : mvpVGGTDensePointRefs)
+    {
+        if(pDenseMP)
+            pDenseMP->SetBadFlag();
+    }
+    mvpVGGTDensePointRefs.clear();
 
     {
         unique_lock<mutex> lock(mMutexConnections);

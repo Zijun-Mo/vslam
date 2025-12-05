@@ -151,6 +151,7 @@ protected:
     void DownsampleMapPoints();
     float ComputeAdaptiveVoxelSize();
     MapPoint* SelectRepresentative(const std::vector<MapPoint*>& group) const;
+    void IntegrateVGGTDenseKeyframe(KeyFrame* pKF);
 
     System *mpSystem;
 

@@ -203,6 +203,17 @@ ros2 launch vslam_evals eval_7scenes_office.launch.py \
 ```
 链路：`seven_scenes_player` 播放 -> `vslam_bringup` (VGGT+ORB) -> `eval_node` 计算 ATE -> 写 `evals_7scenes.csv`。
 
+### 6.8 VGGT Dense 参数调优
+`vslam_bringup/config/vslam_params.yaml` 中集中声明了 VGGT 前端的稠密融合参数，可直接通过 `ros2 launch vslam_bringup vslam_system.launch.py` 时的同名参数覆盖，或在评估 launch 中由 `config` 传递：
+- `dense.voxel_size`：体素网格长度（米），控制关键帧稠密点下采样的空间分辨率，默认 `0.03`。
+- `dense.min_points_per_voxel`：触发保留的最少样本数，低纹理场景可调低以保留更多点。
+- `dense.max_range`：忽略超过该距离的 VGGT 稠密点（米），避免远距离噪声。
+- `dense.color_consistency` / `dense.depth_consistency`：分别对颜色差异与深度差异设置阈值（像素/米），仅允许符合一致性的点进入体素。
+- `dense.ba.reused_weight` / `dense.ba.new_weight`：在 `RunVGGTLBALocal` Phase2 中为复用点和新点设置不同的信息矩阵权重，影响对姿态的约束强度。
+- `dense.ba.huber_delta`：VGGT Dense BA 的 Huber 核 delta，默认 `sqrt(7.815)≈2.795`，可按噪声水平放大或缩小。
+
+修改 YAML 后重新 `colcon build` 并重启相应节点即可生效；也可在运行时使用 `ros2 param set /vggt_frontend_node dense.voxel_size 0.05` 等命令在线调参。
+
 ## 7. 性能与资源
 VGGT 前端在单卡（例如 A100/H100）可在百帧级输入下数秒内聚合；内存随帧数线性增长。若需更快注意编译 Flash Attention 3。
 

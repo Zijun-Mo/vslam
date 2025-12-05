@@ -27,12 +27,17 @@
 #include<cmath>
 #include<atomic>
 #include<limits>
+#include<algorithm>
+#include<chrono>
+#include<random>
+#include <Eigen/Eigenvalues>
+
+#include <open3d/Open3D.h>
 
 #include <opencv2/imgproc.hpp>
 #include <opencv2/highgui.hpp>
 
 #include "OptimizableTypes.h"
-
 
 namespace ORB_SLAM3
 {
@@ -44,72 +49,264 @@ bool sortByVal(const pair<MapPoint*, int> &a, const pair<MapPoint*, int> &b)
 namespace
 {
 std::atomic<bool> g_enable_vggt_phase2{true};
+std::mutex g_dense_cfg_mutex;
+VGGTDenseBAConfig g_dense_cfg;
+
+std::mutex g_fuse_cfg_mutex;
+VGGTDenseConfig g_fuse_cfg;
+
+VGGTDenseBAConfig GetDenseConfig()
+{
+    std::lock_guard<std::mutex> lock(g_dense_cfg_mutex);
+    return g_dense_cfg;
+}
+
+VGGTDenseConfig GetFusionConfig()
+{
+    std::lock_guard<std::mutex> lock(g_fuse_cfg_mutex);
+    return g_fuse_cfg;
+}
 
 struct VGGTPriorObservation
 {
     MapPoint* pMP{nullptr};
     Eigen::Vector3d camPoint{Eigen::Vector3d::Zero()};
+    Eigen::Vector3d color{Eigen::Vector3d::Constant(255.0)};
     bool isNew{true};
     long globalId{-1};
 };
 
-std::vector<VGGTPriorObservation> CollectVGGTPriors(KeyFrame* pKF, Map* pTargetMap)
+struct VGGTDenseFusionResult
+{
+    std::vector<VGGTDensePointRGBXYZ> fused_world;
+    std::vector<float> fused_cam_rgbxyz; // RGBXYZ per point
+};
+
+static VGGTDenseFusionResult FuseDenseObservations(const std::vector<VGGTPriorObservation>& observations,
+                                                   const Sophus::SE3f& optimizedPose,
+                                                   const KeyFrame* pKF)
+{
+    VGGTDenseFusionResult result;
+    if(observations.empty() || !pKF)
+        return result;
+
+    const Sophus::SE3f Twc = optimizedPose.inverse();
+    const Eigen::Matrix3f Rwc = Twc.rotationMatrix();
+    const Eigen::Vector3f twc = Twc.translation();
+
+    const VGGTDenseConfig cfg = GetFusionConfig(); // mirror frontend fusion parameters
+    const float voxel_size = std::max(1e-4f, cfg.voxel_size);
+    const int min_points = std::max(1, cfg.min_points_per_voxel);
+    const float max_range = (cfg.max_range > 0.0f) ? cfg.max_range : std::numeric_limits<float>::max();
+
+    struct VoxelKey
+    {
+        int x{0};
+        int y{0};
+        int z{0};
+        bool operator==(const VoxelKey &other) const
+        {
+            return x == other.x && y == other.y && z == other.z;
+        }
+    };
+
+    struct VoxelKeyHash
+    {
+        std::size_t operator()(const VoxelKey &key) const
+        {
+            std::size_t hx = std::hash<int>{}(key.x);
+            hx ^= std::hash<int>{}(key.y) + 0x9e3779b9u + (hx << 6) + (hx >> 2);
+            hx ^= std::hash<int>{}(key.z) + 0x9e3779b9u + (hx << 6) + (hx >> 2);
+            return hx;
+        }
+    };
+
+    struct DenseBucket
+    {
+        Eigen::Vector3f sum_world{Eigen::Vector3f::Zero()};
+        Eigen::Vector3f sum_cam{Eigen::Vector3f::Zero()};
+        Eigen::Vector3f sum_color{Eigen::Vector3f::Zero()};
+        int count{0};
+    };
+
+    std::unordered_map<VoxelKey, DenseBucket, VoxelKeyHash> buckets;
+    buckets.reserve(observations.size());
+
+    auto clamp_color = [](float value) -> uint8_t
+    {
+        if(!std::isfinite(value)) return 0;
+        if(value <= 0.0f) return 0;
+        if(value >= 255.0f) return static_cast<uint8_t>(255);
+        return static_cast<uint8_t>(value);
+    };
+
+    std::size_t invalid_pts = 0;
+    std::size_t range_drop = 0;
+    std::size_t kept_pts = 0;
+
+    for(const auto &obs : observations)
+    {
+        const Eigen::Vector3f cam_pt = obs.camPoint.cast<float>();
+        if(!std::isfinite(cam_pt.x()) || !std::isfinite(cam_pt.y()) || !std::isfinite(cam_pt.z()))
+        {
+            ++invalid_pts;
+            continue;
+        }
+        const float radial = cam_pt.norm();
+        if(radial > max_range)
+        {
+            ++range_drop;
+            continue;
+        }
+
+        Eigen::Vector3f world_pt = Rwc * cam_pt + twc;
+        const float inv = 1.0f / voxel_size;
+        VoxelKey key;
+        key.x = static_cast<int>(std::floor(world_pt.x() * inv));
+        key.y = static_cast<int>(std::floor(world_pt.y() * inv));
+        key.z = static_cast<int>(std::floor(world_pt.z() * inv));
+
+        const cv::Vec3b color = (obs.pMP && obs.pMP->HasColor()) ? obs.pMP->GetColor() : cv::Vec3b(255, 255, 255);
+
+        DenseBucket &bucket = buckets[key];
+        Eigen::Vector3f candidate_color(static_cast<float>(color[0]), static_cast<float>(color[1]), static_cast<float>(color[2]));
+
+        bucket.sum_world += world_pt;
+        bucket.sum_cam += cam_pt;
+        bucket.sum_color += candidate_color;
+        bucket.count++;
+        ++kept_pts;
+    }
+
+    result.fused_world.reserve(buckets.size());
+    result.fused_cam_rgbxyz.reserve(buckets.size() * 6);
+
+    std::size_t voxel_kept = 0;
+    std::size_t voxel_dropped = 0;
+    for(const auto &entry : buckets)
+    {
+        const DenseBucket &bucket = entry.second;
+        if(bucket.count < min_points)
+        {
+            ++voxel_dropped;
+            continue;
+        }
+
+        ++voxel_kept;
+
+        const Eigen::Vector3f mean_cam = bucket.sum_cam / static_cast<float>(bucket.count);
+        if(mean_cam.norm() > max_range)
+            continue;
+
+        const Eigen::Vector3f mean_world = bucket.sum_world / static_cast<float>(bucket.count);
+        const Eigen::Vector3f mean_color = bucket.sum_color / static_cast<float>(bucket.count);
+
+        VGGTDensePointRGBXYZ fused_point;
+        fused_point.xyz = mean_world;
+        fused_point.rgb = cv::Vec3b(
+            clamp_color(mean_color.x()),
+            clamp_color(mean_color.y()),
+            clamp_color(mean_color.z()));
+        result.fused_world.push_back(fused_point);
+
+        result.fused_cam_rgbxyz.push_back(static_cast<float>(fused_point.rgb[0]));
+        result.fused_cam_rgbxyz.push_back(static_cast<float>(fused_point.rgb[1]));
+        result.fused_cam_rgbxyz.push_back(static_cast<float>(fused_point.rgb[2]));
+        result.fused_cam_rgbxyz.push_back(mean_cam.x());
+        result.fused_cam_rgbxyz.push_back(mean_cam.y());
+        result.fused_cam_rgbxyz.push_back(mean_cam.z());
+    }
+
+    if(result.fused_world.empty())
+        result.fused_cam_rgbxyz.clear();
+
+    return result;
+}
+
+std::vector<VGGTPriorObservation> CollectVGGTPhase1Priors(KeyFrame* pKF, Map* pTargetMap)
 {
     std::vector<VGGTPriorObservation> result;
     if(!pKF || !pTargetMap)
         return result;
 
-    const std::vector<MapPoint*> vpMatches = pKF->GetMapPointMatches();
     const std::vector<long> vGlobalIds = pKF->GetVGGTGlobalTrackIds();
-    const std::vector<char> vIsNewFlags = pKF->GetVGGTIsNewFlags();
+    const std::vector<char> vIsNew = pKF->GetVGGTIsNewFlags();
     const std::vector<Eigen::Vector3f> vCamPoints = pKF->GetVGGTPointsInCamera();
+    const std::vector<MapPoint*> vMapPoints = pKF->GetMapPointMatches();
+    const size_t count = std::min(std::min(vGlobalIds.size(), vIsNew.size()), std::min(vCamPoints.size(), vMapPoints.size()));
 
-    if(vpMatches.empty() || vCamPoints.empty())
-        return result;
-
-    result.reserve(vpMatches.size());
-    std::unordered_set<MapPoint*> usedPoints;
-    usedPoints.reserve(vpMatches.size());
-    double total_cam_mp_dist = 0.0;
-    int dist_samples = 0;
-    const Sophus::SE3f Tcw = pKF->GetPose();
-
-    for(size_t i = 0; i < vpMatches.size(); ++i)
+    result.reserve(count);
+    for(size_t i = 0; i < count; ++i)
     {
-        MapPoint* pMP = vpMatches[i];
+        MapPoint* pMP = vMapPoints[i];
         if(!pMP || pMP->isBad())
             continue;
         if(pMP->GetMap() != pTargetMap)
             continue;
-        if(!pMP->IsVGGTPoint())
-            continue;
-        if(i >= vCamPoints.size())
-            continue;
-        const Eigen::Vector3f& cam = vCamPoints[i];
-        if(!std::isfinite(cam[0]) || !std::isfinite(cam[1]) || !std::isfinite(cam[2]))
-            continue;
-        if(!usedPoints.insert(pMP).second)
+
+        const long global_id = vGlobalIds[i];
+        if(global_id < 0)
             continue;
 
         VGGTPriorObservation obs;
         obs.pMP = pMP;
-        obs.camPoint = cam.cast<double>();
-        obs.isNew = (i < vIsNewFlags.size()) ? (vIsNewFlags[i] != 0) : true;
-        obs.globalId = (i < vGlobalIds.size()) ? vGlobalIds[i] : -1;
+        obs.camPoint = vCamPoints[i].cast<double>();
+        if(pMP->HasColor())
+        {
+            const cv::Vec3b c = pMP->GetColor();
+            obs.color = Eigen::Vector3d(static_cast<double>(c[0]),
+                                         static_cast<double>(c[1]),
+                                         static_cast<double>(c[2]));
+        }
+        obs.isNew = vIsNew[i] != 0;
+        obs.globalId = global_id;
         result.push_back(obs);
-
-        const Eigen::Vector3f Pw = pMP->GetWorldPos();
-        const Eigen::Vector3f Pc = Tcw * Pw;
-        total_cam_mp_dist += (Pc - cam).norm();
-        if((Pc - cam).norm() >= 1e-5) ++dist_samples;
     }
 
-    if(dist_samples > 0)
+    return result;
+}
+
+std::vector<VGGTPriorObservation> CollectVGGTPhase2Priors(KeyFrame* pKF, Map* pTargetMap)
+{
+    std::vector<VGGTPriorObservation> result;
+    if(!pKF || !pTargetMap)
+        return result;
+
+    const std::vector<VGGTDensePointRGBXYZ> vDenseWorld = pKF->GetVGGTDenseMapPoints();
+    const std::vector<MapPoint*> vDenseRefs = pKF->GetVGGTDensePointRefs();
+    const std::vector<float> vDenseCam = pKF->GetVGGTKeyframeDensePointCloud();
+    const size_t dense_cam_stride = 6;
+    const size_t dense_cam_samples = (vDenseCam.size() >= dense_cam_stride) ? (vDenseCam.size() / dense_cam_stride) : 0;
+    const size_t dense_count = std::min(std::min(vDenseWorld.size(), vDenseRefs.size()), dense_cam_samples);
+    if(dense_count == 0)
     {
-        const double avg_dist = total_cam_mp_dist / static_cast<double>(dist_samples);
-        std::cerr << "[VGGT Prior] KF " << pKF->mnId
-                  << " avg_cam_mp_dist=" << avg_dist
-                  << " samples=" << dist_samples << std::endl;
+        std::cerr << "[VGGT LBA] Phase2 priors empty: dense_world=" << vDenseWorld.size()
+                  << " dense_refs=" << vDenseRefs.size()
+                  << " dense_cam_samples=" << dense_cam_samples
+                  << " stride=" << dense_cam_stride << std::endl;
+    }
+    result.reserve(dense_count);
+    for(size_t i = 0; i < dense_count; ++i)
+    {
+        MapPoint* pMP = vDenseRefs[i];
+        if(!pMP || pMP->isBad())
+            continue;
+        if(pMP->GetMap() != pTargetMap)
+            continue;
+        const size_t offset = i * dense_cam_stride;
+        VGGTPriorObservation obs;
+        obs.pMP = pMP;
+        obs.camPoint = Eigen::Vector3d(
+            static_cast<double>(vDenseCam[offset + 3]),
+            static_cast<double>(vDenseCam[offset + 4]),
+            static_cast<double>(vDenseCam[offset + 5]));
+        obs.color = Eigen::Vector3d(
+            static_cast<double>(vDenseCam[offset + 0]),
+            static_cast<double>(vDenseCam[offset + 1]),
+            static_cast<double>(vDenseCam[offset + 2]));
+        obs.isNew = true;
+        obs.globalId = -1;
+        result.push_back(obs);
     }
 
     return result;
@@ -190,100 +387,140 @@ Sophus::SE3f RunVGGTPhase2(KeyFrame* pKF,
                            double& chi2_after,
                            int& edge_count)
 {
-    edge_count = static_cast<int>(observations.size());
-    if(observations.empty())
+    const long kf_id = pKF ? static_cast<long>(pKF->mnId) : -1;
+    (void)pKF;
+    (void)pbStopFlag;
+
+    std::vector<VGGTPriorObservation> dense_obs;
+    dense_obs.reserve(observations.size());
+    for(const auto& obs : observations)
+    {
+        if(!obs.pMP || obs.pMP->isBad())
+            continue;
+        dense_obs.push_back(obs);
+    }
+
+    constexpr size_t kMaxPhase2Edges = 40000;
+    if(dense_obs.size() > kMaxPhase2Edges)
+    {
+        std::mt19937 rng(static_cast<uint32_t>(kf_id >= 0 ? kf_id : 1));
+        std::shuffle(dense_obs.begin(), dense_obs.end(), rng);
+        dense_obs.resize(kMaxPhase2Edges);
+    }
+
+    if(dense_obs.empty())
     {
         chi2_before = 0.0;
         chi2_after = 0.0;
+        edge_count = 0;
         return initialPose;
     }
 
-    g2o::SparseOptimizer optimizer;
-    auto* linearSolver = new g2o::LinearSolverEigen<g2o::BlockSolver_6_3::PoseMatrixType>();
-    auto* solver_ptr = new g2o::BlockSolver_6_3(linearSolver);
-    auto* solver = new g2o::OptimizationAlgorithmLevenberg(solver_ptr);
-    optimizer.setAlgorithm(solver);
-    optimizer.setVerbose(false);
-    if(pbStopFlag)
-        optimizer.setForceStopFlag(pbStopFlag);
+    const VGGTDenseBAConfig dense_cfg = GetDenseConfig();
+    const float kVoxel = std::max(1e-4f, static_cast<float>(dense_cfg.phase2_voxel_size));
+    const float kMaxDist = std::max(kVoxel, static_cast<float>(dense_cfg.phase2_search_radius));
+    const double icp_max_corr = static_cast<double>(kMaxDist);
 
-    g2o::VertexSE3Expmap* vPose = new g2o::VertexSE3Expmap();
-    g2o::SE3Quat Tcw(initialPose.unit_quaternion().cast<double>(), initialPose.translation().cast<double>());
-    vPose->setEstimate(Tcw);
-    vPose->setId(0);
-    optimizer.addVertex(vPose);
+    // 构建目标点云（世界坐标），优先保留已有法向，否则用 Open3D 估计
+    std::vector<MapPoint*> vAllDenseMPs = pMap->GetAllMapPoints();
+    vAllDenseMPs.erase(std::remove_if(vAllDenseMPs.begin(), vAllDenseMPs.end(), [](MapPoint* p){
+        return (!p || p->isBad() || !p->IsVGGTPoint());
+    }), vAllDenseMPs.end());
 
-    const double thHuberVGGT = std::sqrt(7.815);
-    const Sophus::SE3d Tcw_d = initialPose.cast<double>();
-    const Sophus::SE3d Twc_d = Tcw_d.inverse();
-
-    std::vector<int> pointVertexIds;
-    pointVertexIds.reserve(observations.size());
-
-    int nextId = 1;
-    for(size_t i = 0; i < observations.size(); ++i)
+    auto target = std::make_shared<open3d::geometry::PointCloud>();
+    target->points_.reserve(vAllDenseMPs.size());
+    target->normals_.reserve(vAllDenseMPs.size());
+    target->colors_.reserve(vAllDenseMPs.size());
+    auto normalize_color = [](double v) -> double
     {
-        const auto& obs = observations[i];
-        g2o::VertexSBAPointXYZ* vPoint = new g2o::VertexSBAPointXYZ();
-        Eigen::Vector3d initWorld;
-        if(obs.isNew)
+        if(!std::isfinite(v)) return 1.0;
+        if(v < 0.0) return 0.0;
+        if(v > 255.0) return 1.0;
+        return v / 255.0;
+    };
+    for(MapPoint* pMP : vAllDenseMPs)
+    {
+        const Eigen::Vector3f Pw_nb = pMP->GetWorldPos();
+        if(!std::isfinite(Pw_nb.x()) || !std::isfinite(Pw_nb.y()) || !std::isfinite(Pw_nb.z()))
+            continue;
+        target->points_.emplace_back(static_cast<double>(Pw_nb.x()),
+                                     static_cast<double>(Pw_nb.y()),
+                                     static_cast<double>(Pw_nb.z()));
+
+        const Eigen::Vector3f n = pMP->GetNormal();
+        const float n_norm = n.norm();
+        if(std::isfinite(n_norm) && n_norm > 1e-6f)
         {
-            initWorld = Twc_d * obs.camPoint;
+            Eigen::Vector3d nd = n.cast<double>().normalized();
+            target->normals_.emplace_back(nd.x(), nd.y(), nd.z());
         }
         else
         {
-            initWorld = obs.pMP->GetWorldPos().cast<double>();
+            target->normals_.emplace_back(0.0, 0.0, 0.0); // placeholder，后续重估
         }
-        vPoint->setEstimate(initWorld);
-        vPoint->setId(nextId);
-        vPoint->setFixed(false);
-        vPoint->setMarginalized(true);
-        optimizer.addVertex(vPoint);
 
-        EdgeVGGTDistance* e = new EdgeVGGTDistance();
-        e->setVertex(0, vPoint);
-        e->setVertex(1, vPose);
-        e->setMeasurement(obs.camPoint);
-        const double weight = obs.isNew ? 0.5 : 1.0;
-        e->setInformation(Eigen::Matrix3d::Identity() * weight);
-        auto* rk = new g2o::RobustKernelHuber;
-        rk->setDelta(thHuberVGGT);
-        e->setRobustKernel(rk);
-        optimizer.addEdge(e);
-
-        pointVertexIds.push_back(nextId);
-        ++nextId;
+        const cv::Vec3b color = (pMP->HasColor()) ? pMP->GetColor() : cv::Vec3b(255, 255, 255);
+        target->colors_.emplace_back(normalize_color(color[0]),
+                                     normalize_color(color[1]),
+                                     normalize_color(color[2]));
     }
 
-    optimizer.initializeOptimization();
-    optimizer.computeActiveErrors();
-    chi2_before = optimizer.chi2();
-    optimizer.optimize(15);
-    optimizer.computeActiveErrors();
-    chi2_after = optimizer.chi2();
-
-    g2o::VertexSE3Expmap* vPoseOpt = static_cast<g2o::VertexSE3Expmap*>(optimizer.vertex(0));
-    g2o::SE3Quat Tcw_opt = vPoseOpt->estimate();
-    Sophus::SE3f Tcw_final(Tcw_opt.rotation().cast<float>(), Tcw_opt.translation().cast<float>());
-
+    if(target->points_.size() < 10)
     {
-        unique_lock<mutex> lock(pMap->mMutexMapUpdate);
-        pKF->SetPose(Tcw_final);
-        for(size_t i = 0; i < pointVertexIds.size(); ++i)
-        {
-            const auto& obs = observations[i];
-            MapPoint* pMP = obs.pMP;
-            if(!pMP || pMP->isBad())
-                continue;
-            auto* vPoint = static_cast<g2o::VertexSBAPointXYZ*>(optimizer.vertex(pointVertexIds[i]));
-            const Eigen::Vector3d Pw = vPoint->estimate();
-            pMP->SetWorldPos(Pw.cast<float>());
-            pMP->UpdateNormalAndDepth();
-        }
-        pMap->IncreaseChangeIndex();
+        chi2_before = 0.0;
+        chi2_after = 0.0;
+        edge_count = 0;
+        return initialPose;
     }
 
-    return Tcw_final;
+    // 强制使用 Open3D 估计法向，满足点到面 ICP 要求
+    target->EstimateNormals(open3d::geometry::KDTreeSearchParamHybrid(icp_max_corr, 30));
+
+    // 构建源点云（相机坐标系下的稠密观测）
+    auto source = std::make_shared<open3d::geometry::PointCloud>();
+    source->points_.reserve(dense_obs.size());
+    source->colors_.reserve(dense_obs.size());
+    for(const auto& obs : dense_obs)
+    {
+        const Eigen::Vector3d pc = obs.camPoint;
+        if(!std::isfinite(pc.x()) || !std::isfinite(pc.y()) || !std::isfinite(pc.z()))
+            continue;
+        source->points_.emplace_back(pc.x(), pc.y(), pc.z());
+
+        const Eigen::Vector3d c = obs.color;
+        source->colors_.emplace_back(normalize_color(c.x()),
+                                     normalize_color(c.y()),
+                                     normalize_color(c.z()));
+    }
+
+    if(source->points_.size() < 6)
+    {
+        chi2_before = 0.0;
+        chi2_after = 0.0;
+        edge_count = 0;
+        return initialPose;
+    }
+
+    const Eigen::Matrix4d init_Twc = initialPose.inverse().matrix().cast<double>();
+    source->EstimateNormals(open3d::geometry::KDTreeSearchParamHybrid(icp_max_corr, 30));
+    const auto estimation = open3d::pipelines::registration::TransformationEstimationForColoredICP();
+    auto result = open3d::pipelines::registration::RegistrationColoredICP(
+        *source,
+        *target,
+        icp_max_corr,
+        init_Twc,
+        estimation,
+        open3d::pipelines::registration::ICPConvergenceCriteria());
+
+    edge_count = static_cast<int>(dense_obs.size());
+    chi2_before = 0.0;
+    chi2_after = result.inlier_rmse_;
+
+    Eigen::Matrix4d Twc_icp = result.transformation_;
+    Eigen::Matrix3d R = Twc_icp.block<3,3>(0,0);
+    Eigen::Vector3d t = Twc_icp.block<3,1>(0,3);
+    Sophus::SE3f Twc_icp_f(R.cast<float>(), t.cast<float>());
+    return Twc_icp_f.inverse();
 }
 
 void ApplyVGGTPhase1Result(KeyFrame* pKF,
@@ -308,6 +545,68 @@ void ApplyVGGTPhase1Result(KeyFrame* pKF,
         pMP->SetWorldPos(Pw);
         pMP->UpdateNormalAndDepth();
     }
+    pMap->IncreaseChangeIndex();
+}
+
+void ApplyVGGTPhaseResult(KeyFrame* pKF,
+                          const std::vector<VGGTPriorObservation>& phase1Observations,
+                          const std::vector<VGGTPriorObservation>& phase2Observations,
+                          const Sophus::SE3f& phase1Pose,
+                          const Sophus::SE3f& phase2Pose,
+                          const bool hasPhase2, 
+                          Map* pMap)
+{
+    if(!pKF || !pMap)
+        return;
+
+    const Sophus::SE3f optimizedPose = hasPhase2 ? phase2Pose : phase1Pose;
+    const Sophus::SE3f Twc = optimizedPose.inverse();
+    std::unordered_set<MapPoint*> updated;
+
+    // Collect dense refs (unique) from phase2 observations for later write-back
+    std::vector<MapPoint*> dense_refs;
+    dense_refs.reserve(phase2Observations.size());
+    for(const auto& obs : phase2Observations)
+    {
+        MapPoint* pMP = obs.pMP;
+        if(!pMP || pMP->isBad())
+            continue;
+        if(std::find(dense_refs.begin(), dense_refs.end(), pMP) == dense_refs.end())
+            dense_refs.push_back(pMP);
+    }
+
+    // Fuse dense cloud with optimized pose (world + cam RGBXYZ cache)
+    VGGTDenseFusionResult dense_fused = FuseDenseObservations(phase2Observations, phase2Pose, pKF);
+
+    unique_lock<mutex> lock(pMap->mMutexMapUpdate);
+    pKF->SetPose(optimizedPose);
+
+    auto apply_observations = [&](const std::vector<VGGTPriorObservation>& observations)
+    {
+        for(const auto& obs : observations)
+        {
+            if(!obs.isNew)
+                continue;
+            MapPoint* pMP = obs.pMP;
+            if(!pMP || pMP->isBad())
+                continue;
+            if(!updated.insert(pMP).second)
+                continue;
+
+            const Eigen::Vector3f Pw = Twc * obs.camPoint.cast<float>();
+            pMP->SetWorldPos(Pw);
+            pMP->UpdateNormalAndDepth();
+        }
+    };
+
+    apply_observations(phase1Observations);
+    apply_observations(phase2Observations);
+
+    // Write back dense fused cloud and refs
+    pKF->SetVGGTDenseMapPoints(dense_fused.fused_world);
+    pKF->SetVGGTKeyframeDensePointCloud(dense_fused.fused_cam_rgbxyz);
+    pKF->SetVGGTDensePointRefs(dense_refs);
+
     pMap->IncreaseChangeIndex();
 }
 
@@ -477,13 +776,14 @@ bool RunVGGTLBALocal(KeyFrame* pKF,
                      int& num_MPs,
                      int& num_edges)
 {
-    auto observations = CollectVGGTPriors(pKF, pMap);
-    if(observations.empty())
+    auto phase1_observations = CollectVGGTPhase1Priors(pKF, pMap);
+    auto phase2_observations = CollectVGGTPhase2Priors(pKF, pMap);
+    if(phase1_observations.empty() && phase2_observations.empty())
         return false;
 
     std::vector<VGGTPriorObservation> reused;
-    reused.reserve(observations.size());
-    for(const auto& obs : observations)
+    reused.reserve(phase1_observations.size());
+    for(const auto& obs : phase1_observations)
     {
         if(!obs.isNew)
             reused.push_back(obs);
@@ -496,76 +796,35 @@ bool RunVGGTLBALocal(KeyFrame* pKF,
 
     const bool phase2_enabled = g_enable_vggt_phase2.load();
 
+    Sophus::SE3f phase1Pose = initialPose;
     if(!reused.empty())
     {
-        const Sophus::SE3f phase1Pose = RunVGGTPhase1(initialPose, reused, pbStopFlag, phase1_before, phase1_after, phase1_edges);
-        std::cerr << "[VGGT LBA][Phase1] KF " << pKF->mnId
-                  << " reused=" << reused.size()
-                  << " chi2_before=" << phase1_before
-                  << " chi2_after=" << phase1_after << std::endl;
-
-        // VisualizeVGGTPhase1(reused, observations, initialPose, phase1Pose);
+        phase1Pose = RunVGGTPhase1(initialPose, reused, pbStopFlag, phase1_before, phase1_after, phase1_edges);
+        // VisualizeVGGTPhase1(reused, phase1_observations, initialPose, phase1Pose);
 
         if(pbStopFlag && *pbStopFlag)
         {
             num_fixedKF = 0;
             num_OptKF = 1;
-            num_MPs = observations.size();
+            num_MPs = static_cast<int>(phase1_observations.size());
             num_edges = phase1_edges;
             return true;
         }
-
-        if(!phase2_enabled)
-        {
-            std::cerr << "[VGGT LBA] Phase2 disabled, applying phase1 pose only" << std::endl;
-            ApplyVGGTPhase1Result(pKF, observations, phase1Pose, pMap);
-            num_fixedKF = 0;
-            num_OptKF = 1;
-            num_MPs = reused.size();
-            num_edges = phase1_edges;
-            return true;
-        }
-
-        double phase2_before = 0.0;
-        double phase2_after = 0.0;
-        int phase2_edges = 0;
-        RunVGGTPhase2(pKF, observations, phase1Pose, pbStopFlag, pMap, phase2_before, phase2_after, phase2_edges);
-        std::cerr << "[VGGT LBA][Phase2] KF " << pKF->mnId
-                  << " points=" << observations.size()
-                  << " chi2_before=" << phase2_before
-                  << " chi2_after=" << phase2_after << std::endl;
-
-        num_fixedKF = 0;
-        num_OptKF = 1;
-        num_MPs = observations.size();
-        num_edges = phase2_edges;
-        return true;
     }
-    else
+    if(!phase2_observations.empty())
     {
-        std::cerr << "[VGGT LBA][Phase1] KF " << pKF->mnId << " skipped (no reused tracks)" << std::endl;
-
-        if(!phase2_enabled)
-        {
-            std::cerr << "[VGGT LBA] Phase2 disabled and no reused tracks -> fallback to classic BA" << std::endl;
-            return false;
-        }
-
         double phase2_before = 0.0;
         double phase2_after = 0.0;
         int phase2_edges = 0;
-        RunVGGTPhase2(pKF, observations, initialPose, pbStopFlag, pMap, phase2_before, phase2_after, phase2_edges);
-        std::cerr << "[VGGT LBA][Phase2] KF " << pKF->mnId
-                  << " points=" << observations.size()
-                  << " chi2_before=" << phase2_before
-                  << " chi2_after=" << phase2_after << std::endl;
-
+        const Sophus::SE3f phase2Pose = RunVGGTPhase2(pKF, phase2_observations, phase1Pose, pbStopFlag, pMap, phase2_before, phase2_after, phase2_edges);
+        ApplyVGGTPhaseResult(pKF, phase1_observations, phase2_observations, phase1Pose, phase2Pose, phase2_enabled, pMap);
         num_fixedKF = 0;
         num_OptKF = 1;
-        num_MPs = observations.size();
+        num_MPs = static_cast<int>(phase2_observations.size());
         num_edges = phase2_edges;
         return true;
     }
+    return false;
 }
 }
 
@@ -577,6 +836,18 @@ void Optimizer::SetVGGTPhase2Enabled(bool enabled)
 bool Optimizer::IsVGGTPhase2Enabled()
 {
     return g_enable_vggt_phase2.load();
+}
+
+void Optimizer::SetVGGTDenseBAConfig(const VGGTDenseBAConfig& config)
+{
+    std::lock_guard<std::mutex> lock(g_dense_cfg_mutex);
+    g_dense_cfg = config;
+}
+
+void Optimizer::SetVGGTDenseConfig(const VGGTDenseConfig& config)
+{
+    std::lock_guard<std::mutex> lock(g_fuse_cfg_mutex);
+    g_fuse_cfg = config;
 }
 
 void Optimizer::GlobalBundleAdjustemnt(Map* pMap, int nIterations, bool* pbStopFlag, const unsigned long nLoopKF, const bool bRobust)

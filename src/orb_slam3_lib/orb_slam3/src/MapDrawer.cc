@@ -20,6 +20,7 @@
 #include "MapPoint.h"
 #include "KeyFrame.h"
 #include <pangolin/pangolin.h>
+#include <algorithm>
 #include <mutex>
 
 namespace ORB_SLAM3
@@ -188,6 +189,76 @@ void MapDrawer::DrawMapPoints()
         Eigen::Matrix<float,3,1> pos = (*sit)->GetWorldPos();
         glVertex3f(pos(0),pos(1),pos(2));
 
+    }
+
+    glEnd();
+}
+
+void MapDrawer::DrawVGGTDenseCloud(bool onlyActiveMap, size_t maxPoints, float pointSizeOverride)
+{
+    Map* pActiveMap = mpAtlas->GetCurrentMap();
+    if(!pActiveMap || maxPoints == 0)
+        return;
+
+    std::vector<Map*> maps = mpAtlas->GetAllMaps();
+    if(onlyActiveMap)
+    {
+        maps.clear();
+        maps.push_back(pActiveMap);
+    }
+
+    // First pass to estimate density for decimation.
+    size_t total_points = 0;
+    for(Map* pMap : maps)
+    {
+        if(!pMap)
+            continue;
+        const std::vector<KeyFrame*> kfs = pMap->GetAllKeyFrames();
+        for(KeyFrame* kf : kfs)
+        {
+            if(!kf)
+                continue;
+            total_points += kf->GetVGGTDenseMapPoints().size();
+        }
+    }
+
+    if(total_points == 0)
+        return;
+
+    const size_t stride = std::max<size_t>(1, total_points / maxPoints);
+    const float point_size = pointSizeOverride > 0.0f ? pointSizeOverride : mPointSize;
+
+    glPointSize(point_size);
+    glBegin(GL_POINTS);
+
+    size_t emitted = 0;
+    size_t idx = 0;
+    for(Map* pMap : maps)
+    {
+        if(!pMap)
+            continue;
+        const std::vector<KeyFrame*> kfs = pMap->GetAllKeyFrames();
+        for(KeyFrame* kf : kfs)
+        {
+            if(!kf)
+                continue;
+            const std::vector<VGGTDensePointRGBXYZ> dense = kf->GetVGGTDenseMapPoints();
+            for(const auto& pt : dense)
+            {
+                if((idx++ % stride) != 0)
+                    continue;
+                if(emitted >= maxPoints)
+                    break;
+
+                glColor3f(pt.rgb[2] / 255.f, pt.rgb[1] / 255.f, pt.rgb[0] / 255.f);
+                glVertex3f(pt.xyz.x(), pt.xyz.y(), pt.xyz.z());
+                ++emitted;
+            }
+            if(emitted >= maxPoints)
+                break;
+        }
+        if(emitted >= maxPoints)
+            break;
     }
 
     glEnd();

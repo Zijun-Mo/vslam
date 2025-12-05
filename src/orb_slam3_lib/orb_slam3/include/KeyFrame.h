@@ -61,6 +61,8 @@ class KeyFrame
         ar & const_cast<double&>(mTimeStamp);
         // Grid
         ar & const_cast<int&>(mnGridCols);
+        ar & mVGGTDenseMapPoints;
+        ar & mvVGGTKeyframeDensePointCloudRGBXYZ;
         ar & const_cast<int&>(mnGridRows);
         ar & const_cast<float&>(mfGridElementWidthInv);
         ar & const_cast<float&>(mfGridElementHeightInv);
@@ -222,6 +224,14 @@ public:
     std::vector<long> GetVGGTGlobalTrackIds() const;
     std::vector<char> GetVGGTIsNewFlags() const;
     std::vector<Eigen::Vector3f> GetVGGTPointsInCamera() const;
+    void SetVGGTDenseMapPoints(const std::vector<VGGTDensePointRGBXYZ> &dense_points);
+    std::vector<VGGTDensePointRGBXYZ> GetVGGTDenseMapPoints() const;
+    void SetVGGTKeyframeDensePointCloud(const std::vector<float> &rgbxyz);
+    std::vector<float> GetVGGTKeyframeDensePointCloud() const;
+    bool HasVGGTKeyframeDensePointCloud() const;
+    void SetVGGTDensePointRefs(const std::vector<MapPoint*> &dense_refs);
+    std::vector<MapPoint*> GetVGGTDensePointRefs() const;
+    void ClearVGGTDensePointRefs();
 
     // Bag of Words Representation
     void ComputeBoW();
@@ -492,6 +502,9 @@ protected:
     std::vector<long> mvVGGTGlobalTrackIds;
     std::vector<char> mvVGGTIsNewTrack;
     std::vector<Eigen::Vector3f> mvVGGTPointsInCamera;
+    std::vector<VGGTDensePointRGBXYZ> mVGGTDenseMapPoints;
+    std::vector<float> mvVGGTKeyframeDensePointCloudRGBXYZ;
+    std::vector<MapPoint*> mvpVGGTDensePointRefs;
 
     float mHalfBaseline; // Only for visualization
 

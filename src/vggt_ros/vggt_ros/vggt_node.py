@@ -211,6 +211,10 @@ class VGGTNode(Node):
                 img_tensor, transform = self.preprocess_image(img)
                 processed_images.append(img_tensor)
                 transforms.append(transform)
+            preprocessed_images_np = [
+                self.tensor_to_uint8_image(img_tensor)
+                for img_tensor in processed_images
+            ]
             
             # Stack (keep original order) and create reversed copy for inference
             images_tensor = torch.stack(processed_images)
@@ -331,7 +335,8 @@ class VGGTNode(Node):
                 query_grid_height,
                 stride,
                 current_images,
-                current_keyframe_ids
+                current_keyframe_ids,
+                preprocessed_images_np
             )
             # After publishing results, attach intrinsic average to last published message via stored fields
             
@@ -340,7 +345,7 @@ class VGGTNode(Node):
 
     def publish_results(self, points, extrinsic, intrinsic, depth, tracks, tracks_3d, tracks_mask,
                         headers, transforms, query_grid_width, query_grid_height, query_stride,
-                        current_images, current_keyframe_ids):
+                        current_images, current_keyframe_ids, preprocessed_images):
         # Use the header of the last frame for the point cloud and poses?
         # Or use the map frame.
         # Usually SLAM systems publish in a fixed frame (e.g. "map" or "odom").
@@ -441,6 +446,18 @@ class VGGTNode(Node):
         
         mask_msg.data = tracks_mask.flatten().astype(float).tolist()
         output_msg.tracks_mask = mask_msg
+
+        # Dense RGBD-derived point cloud (N_total x 4 -> [x,y,z,depth])
+        # 将窗口内所有世界系点云统一转换到时间上最后一帧（窗口倒序的第一帧）的相机系
+        extrinsic_last = extrinsic[-1] if len(extrinsic) > 0 else None
+        dense_cloud = self.build_window_point_cloud(points, depth, preprocessed_images, extrinsic_last)
+        cloud_msg = Float32MultiArray()
+        total_points = dense_cloud.shape[0]
+        dim_cloud_n = MultiArrayDimension(label="N", size=total_points, stride=total_points * 6 if total_points else 0)
+        dim_cloud_c = MultiArrayDimension(label="C", size=6, stride=6)
+        cloud_msg.layout.dim = [dim_cloud_n, dim_cloud_c]
+        cloud_msg.data = dense_cloud.reshape(-1).tolist()
+        output_msg.window_point_cloud = cloud_msg
 
         color_tensor = self.sample_track_colors(current_images, transforms, query_grid_width, query_grid_height, query_stride)
         color_msg = UInt8MultiArray()
@@ -570,6 +587,83 @@ class VGGTNode(Node):
                 colors[s, idx] = img[v, u]
 
         return colors
+
+    def tensor_to_uint8_image(self, tensor):
+        arr = tensor.detach().cpu().numpy()
+        arr = np.clip(arr, 0.0, 1.0)
+        arr = np.transpose(arr, (1, 2, 0))
+        return (arr * 255.0).astype(np.uint8)
+
+    def build_window_point_cloud(self, world_points, depth_tensor, preprocessed_images, extrinsic_last):
+        """Flatten (S,H,W,3) world coordinates into (N,6) [rgbxyz], then express positions in the latest frame's camera.
+
+        extrinsic_last: 4x4 or 3x4 world->cam of the temporally latest frame (the first in the reversed window).
+        """
+        if world_points is None:
+            return np.zeros((0, 6), dtype=np.float32)
+
+        world_points = np.asarray(world_points, dtype=np.float32)
+        if world_points.size == 0:
+            return np.zeros((0, 6), dtype=np.float32)
+
+        depth_tensor = np.zeros(world_points.shape[:3], dtype=np.float32) if depth_tensor is None else np.asarray(depth_tensor)
+        if depth_tensor.ndim == 4 and depth_tensor.shape[-1] == 1:
+            depth_tensor = depth_tensor[..., 0]
+        depth_tensor = depth_tensor.astype(np.float32, copy=False)
+
+        S, H, W, _ = world_points.shape
+        try:
+            depth_tensor = depth_tensor.reshape(S, H, W)
+        except ValueError:
+            raise ValueError("Depth tensor shape does not match world point grid")
+
+        color_volume = np.zeros((S, H, W, 3), dtype=np.float32)
+        if preprocessed_images:
+            for s in range(min(S, len(preprocessed_images))):
+                img = preprocessed_images[s]
+                if img is None or img.size == 0:
+                    continue
+                if img.shape[0] != H or img.shape[1] != W:
+                    img_resized = cv2.resize(img, (W, H), interpolation=cv2.INTER_LINEAR)
+                else:
+                    img_resized = img
+                color_volume[s] = img_resized.astype(np.float32)
+
+        total_points = S * H * W
+        cloud = np.zeros((total_points, 6), dtype=np.float32)
+        world_flat = world_points.reshape(total_points, 3)
+        depth_flat = depth_tensor.reshape(total_points)
+        color_flat = color_volume.reshape(total_points, 3)
+
+        cloud[:, :3] = color_flat
+
+        # 默认保持世界系，如果未提供外参则直接返回
+        if extrinsic_last is None:
+            cloud[:, 3:] = world_flat
+            invalid_mask = depth_flat <= 1e-6
+            if np.any(invalid_mask):
+                cloud[invalid_mask] = 0.0
+            return cloud
+
+        # 将所有点统一转换到最后一帧的相机系：p_cam = R_cw * p_world + t_cw
+        extrinsic_last = np.asarray(extrinsic_last, dtype=np.float32)
+        if extrinsic_last.shape == (3, 4):
+            R_cw = extrinsic_last[:, :3]
+            t_cw = extrinsic_last[:, 3]
+        elif extrinsic_last.shape == (4, 4):
+            R_cw = extrinsic_last[:3, :3]
+            t_cw = extrinsic_last[:3, 3]
+        else:
+            raise ValueError(f"Unexpected extrinsic shape: {extrinsic_last.shape}")
+
+        cam_flat = world_flat @ R_cw.T + t_cw
+        cloud[:, 3:] = cam_flat
+
+        invalid_mask = depth_flat <= 1e-6
+        if np.any(invalid_mask):
+            cloud[invalid_mask] = 0.0
+
+        return cloud
 
 def main(args=None):
     rclpy.init(args=args)

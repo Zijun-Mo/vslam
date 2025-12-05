@@ -36,6 +36,9 @@
 #include <mutex>
 #include <opencv2/opencv.hpp>
 
+#include <boost/serialization/access.hpp>
+#include <boost/serialization/array.hpp>
+
 #include "Eigen/Core"
 #include "sophus/se3.hpp"
 
@@ -50,6 +53,29 @@ class ConstraintPoseImu;
 class GeometricCamera;
 class ORBextractor;
 
+struct VGGTDensePointRGBXYZ
+{
+    Eigen::Vector3f xyz{Eigen::Vector3f::Zero()};
+    cv::Vec3b rgb{0, 0, 0};
+
+    template<class Archive>
+    void serialize(Archive &ar, const unsigned int /*version*/)
+    {
+        ar & boost::serialization::make_array(xyz.data(), xyz.size());
+        ar & rgb[0];
+        ar & rgb[1];
+        ar & rgb[2];
+    }
+};
+
+struct VGGTDenseConfig
+{
+    float voxel_size{0.03f};
+    int min_points_per_voxel{4};
+    float max_range{8.0f};
+    float color_consistency{30.0f};
+    float depth_consistency{0.5f};
+};
 class Frame
 {
 public:
@@ -373,6 +399,11 @@ public:
     // External 3D points and per-track colors (VGGT)
     std::vector<cv::Point3f> mvVGGT3Dpoints;
     std::vector<cv::Vec3b> mvVGGTTrackColors;
+    // Dense window cloud flattened as [r,g,b,x,y,z]
+    std::vector<float> mvVGGTWindowPointCloudRGBXYZ;
+    // Keyframe-only fused dense cache (camera RGBXYZ) and world-aligned map points
+    std::vector<float> mvVGGTKeyframeDensePointCloudRGBXYZ;
+    std::vector<VGGTDensePointRGBXYZ> mvpMapPointsDense;
 
     // Constructor for VGGT (External Tracks)
     Frame(const cv::Mat &imGray, const double &timeStamp, 
@@ -380,11 +411,18 @@ public:
           const std::vector<long> &vTrackIds,
           const std::vector<cv::Point3f> &v3DPoints,
           const std::vector<cv::Vec3b> &vTrackColors,
+            const std::vector<float> &window_point_cloud,
           ORBextractor* extractor, ORBVocabulary* voc, 
           GeometricCamera* pCamera, cv::Mat &distCoef, 
           const float &bf, const float &thDepth, 
           Frame* pPrevF = static_cast<Frame*>(NULL), 
           const IMU::Calib &ImuCalib = IMU::Calib());
+
+    inline const std::vector<VGGTDensePointRGBXYZ>& GetVGGTDenseMapPoints() const { return mvpMapPointsDense; }
+    inline std::vector<VGGTDensePointRGBXYZ>& MutableVGGTDenseMapPoints() { return mvpMapPointsDense; }
+    inline const std::vector<float>& GetVGGTKeyframeDensePointCloudRGBXYZ() const { return mvVGGTKeyframeDensePointCloudRGBXYZ; }
+    inline std::vector<float>& MutableVGGTKeyframeDensePointCloudRGBXYZ() { return mvVGGTKeyframeDensePointCloudRGBXYZ; }
+    inline bool HasVGGTDenseCache() const { return !mvpMapPointsDense.empty(); }
 };
 
 }// namespace ORB_SLAM

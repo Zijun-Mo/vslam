@@ -1645,6 +1645,7 @@ Sophus::SE3f System::TrackVGGT(const cv::Mat &im, const double &timestamp,
                                int query_stride,
                                int original_image_width,
                                int original_image_height,
+                               const std::vector<float> &window_point_cloud,
                                string filename)
 {
     // std::cout << "[DEBUG] System::TrackVGGT called. Timestamp: " << timestamp << ", Keys: " << vKeys.size() << std::endl;
@@ -1711,6 +1712,7 @@ Sophus::SE3f System::TrackVGGT(const cv::Mat &im, const double &timestamp,
                                                 query_stride,
                                                 original_image_width,
                                                 original_image_height,
+                                                window_point_cloud,
                                                 filename);
 
     unique_lock<mutex> lock2(mMutexState);

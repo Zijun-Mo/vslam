@@ -35,6 +35,7 @@ find_package(ament_cmake REQUIRED)
 find_package(OpenCV 4.2 REQUIRED)
 find_package(Eigen3 3.3.0 REQUIRED)
 find_package(Pangolin REQUIRED)
+find_package(Open3D REQUIRED CONFIG)
 
 include_directories(
   ${PROJECT_SOURCE_DIR}/orb_slam3
@@ -90,6 +91,7 @@ target_link_libraries(orb_slam3_lib
   ${OpenCV_LIBS}
   ${EIGEN3_LIBS}
   ${Pangolin_LIBRARIES}
+  Open3D::Open3D
   ${DBoW2_PATH}
   ${g2o_PATH}
   -lboost_system
@@ -145,6 +147,7 @@ set(THIS_PACKAGE_INCLUDE_DEPENDS
   OpenCV
   Eigen3
   Pangolin
+  Open3D
 )
 
 ament_export_include_directories(include include/Thirdparty/Sophus include/CameraModels)

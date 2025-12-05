@@ -4446,6 +4446,7 @@ Sophus::SE3f Tracking::GrabImageVGGT(const cv::Mat &im, const double &timestamp,
                                      int query_stride,
                                      int original_image_width,
                                      int original_image_height,
+                                     const std::vector<float> &window_point_cloud,
                                      string filename)
 {
     // std::cout << "[DEBUG] Tracking::GrabImageVGGT start." << std::endl;
@@ -4496,9 +4497,10 @@ Sophus::SE3f Tracking::GrabImageVGGT(const cv::Mat &im, const double &timestamp,
 
     // Create Frame with VGGT data
     if(mState==NOT_INITIALIZED || mState==NO_IMAGES_YET ||(lastID - initID) < mMaxFrames)
-        mCurrentFrame = Frame(mImGray, timestamp, vKeys, vTrackIds, v3DPoints, vTrackColors, mpIniORBextractor, mpORBVocabulary, mpCamera, mDistCoef, mbf, mThDepth, nullptr, IMU::Calib());
+        mCurrentFrame = Frame(mImGray, timestamp, vKeys, vTrackIds, v3DPoints, vTrackColors, window_point_cloud, mpIniORBextractor, mpORBVocabulary, mpCamera, mDistCoef, mbf, mThDepth, nullptr, IMU::Calib());
     else
-        mCurrentFrame = Frame(mImGray, timestamp, vKeys, vTrackIds, v3DPoints, vTrackColors, mpORBextractorLeft, mpORBVocabulary, mpCamera, mDistCoef, mbf, mThDepth, nullptr, IMU::Calib());
+        mCurrentFrame = Frame(mImGray, timestamp, vKeys, vTrackIds, v3DPoints, vTrackColors, window_point_cloud, mpORBextractorLeft, mpORBVocabulary, mpCamera, mDistCoef, mbf, mThDepth, nullptr, IMU::Calib());
+    PopulateFrameDenseStorage(mCurrentFrame);
     mbCurrentVGGTPointsConverted = false;
 
     if (mState==NO_IMAGES_YET)
@@ -4821,6 +4823,192 @@ void Tracking::InsertVGGTGridMapping(uint32_t cell_code, long global_id)
     mVGGTGridCellConsumed[cell_code].insert(global_id);
 }
 
+void Tracking::SetVGGTDenseConfig(const VGGTDenseConfig& config)
+{
+    mVGGTDenseConfig = config;
+    std::cerr << "[VGGT Dense] Updated voxel=" << mVGGTDenseConfig.voxel_size
+              << " min_pts=" << mVGGTDenseConfig.min_points_per_voxel
+              << " max_range=" << mVGGTDenseConfig.max_range
+              << " color_gate=" << mVGGTDenseConfig.color_consistency
+              << " depth_gate=" << mVGGTDenseConfig.depth_consistency << std::endl;
+}
+
+void Tracking::PopulateFrameDenseStorage(Frame &frame)
+{
+    auto &dense_points = frame.MutableVGGTDenseMapPoints();
+    dense_points.clear();
+
+    constexpr size_t kValuesPerPoint = 6;
+    const std::vector<float> &raw_cloud = frame.mvVGGTWindowPointCloudRGBXYZ;
+    if(raw_cloud.size() < kValuesPerPoint)
+        return;
+
+    dense_points.reserve(raw_cloud.size() / kValuesPerPoint);
+    auto saturate = [](float value) -> uint8_t
+    {
+        if(!std::isfinite(value))
+            return 0;
+        if(value <= 0.0f)
+            return 0;
+        if(value >= 255.0f)
+            return static_cast<uint8_t>(255);
+        return static_cast<uint8_t>(value);
+    };
+
+    for(size_t offset = 0; offset + kValuesPerPoint <= raw_cloud.size(); offset += kValuesPerPoint)
+    {
+        const float x = raw_cloud[offset + 3];
+        const float y = raw_cloud[offset + 4];
+        const float z = raw_cloud[offset + 5];
+        if(!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z))
+            continue;
+
+        VGGTDensePointRGBXYZ sample;
+        sample.xyz = Eigen::Vector3f(x, y, z);
+        sample.rgb = cv::Vec3b(
+            saturate(raw_cloud[offset + 0]),
+            saturate(raw_cloud[offset + 1]),
+            saturate(raw_cloud[offset + 2]));
+        dense_points.push_back(sample);
+    }
+}
+
+void Tracking::FuseVGGTKeyframeDenseCache(Frame &frame)
+{
+    auto &kf_cache = frame.MutableVGGTKeyframeDensePointCloudRGBXYZ();
+    kf_cache.clear();
+
+    const auto &raw_samples = frame.GetVGGTDenseMapPoints();
+    const size_t raw_count = raw_samples.size();
+    if(raw_count == 0)
+    {
+        frame.MutableVGGTDenseMapPoints().clear();
+        return;
+    }
+
+    const Sophus::SE3f Tcw = frame.GetPose();
+    const Sophus::SE3f Twc = Tcw.inverse();
+    const Eigen::Matrix3f Rwc = Twc.rotationMatrix();
+    const Eigen::Vector3f twc = Twc.translation();
+
+    const float voxel_size = std::max(1e-4f, mVGGTDenseConfig.voxel_size);
+    const int min_points = std::max(1, mVGGTDenseConfig.min_points_per_voxel);
+    const float max_range = (mVGGTDenseConfig.max_range > 0.0f) ? mVGGTDenseConfig.max_range : std::numeric_limits<float>::max();
+
+    struct VoxelKey
+    {
+        int x{0};
+        int y{0};
+        int z{0};
+        bool operator==(const VoxelKey &other) const
+        {
+            return x == other.x && y == other.y && z == other.z;
+        }
+    };
+
+    struct VoxelKeyHash
+    {
+        std::size_t operator()(const VoxelKey &key) const
+        {
+            std::size_t hx = std::hash<int>{}(key.x);
+            hx ^= std::hash<int>{}(key.y) + 0x9e3779b9u + (hx << 6) + (hx >> 2);
+            hx ^= std::hash<int>{}(key.z) + 0x9e3779b9u + (hx << 6) + (hx >> 2);
+            return hx;
+        }
+    };
+
+    struct DenseBucket
+    {
+        Eigen::Vector3f sum_world{Eigen::Vector3f::Zero()};
+        Eigen::Vector3f sum_cam{Eigen::Vector3f::Zero()};
+        Eigen::Vector3f sum_color{Eigen::Vector3f::Zero()};
+        int count{0};
+    };
+
+    std::unordered_map<VoxelKey, DenseBucket, VoxelKeyHash> buckets;
+    buckets.reserve(raw_samples.size());
+
+    auto clamp_color = [](float value) -> uint8_t
+    {
+        if(!std::isfinite(value))
+            return 0;
+        if(value <= 0.0f)
+            return 0;
+        if(value >= 255.0f)
+            return static_cast<uint8_t>(255);
+        return static_cast<uint8_t>(value);
+    };
+
+    for(const auto &sample : raw_samples)
+    {
+        const Eigen::Vector3f cam_pt = sample.xyz;
+        if(!std::isfinite(cam_pt.x()) || !std::isfinite(cam_pt.y()) || !std::isfinite(cam_pt.z()))
+            continue;
+        const float radial = cam_pt.norm();
+        if(radial > max_range)
+            continue;
+
+        Eigen::Vector3f world_pt = Rwc * cam_pt + twc;
+        const float inv = 1.0f / voxel_size;
+        VoxelKey key;
+        key.x = static_cast<int>(std::floor(world_pt.x() * inv));
+        key.y = static_cast<int>(std::floor(world_pt.y() * inv));
+        key.z = static_cast<int>(std::floor(world_pt.z() * inv));
+
+        DenseBucket &bucket = buckets[key];
+        const Eigen::Vector3f candidate_color(
+            static_cast<float>(sample.rgb[0]),
+            static_cast<float>(sample.rgb[1]),
+            static_cast<float>(sample.rgb[2]));
+
+        bucket.sum_world += world_pt;
+        bucket.sum_cam += cam_pt;
+        bucket.sum_color += candidate_color;
+        bucket.count++;
+    }
+
+    std::vector<VGGTDensePointRGBXYZ> fused_points;
+    fused_points.reserve(buckets.size());
+    kf_cache.reserve(buckets.size() * 6);
+
+    for(const auto &entry : buckets)
+    {
+        const DenseBucket &bucket = entry.second;
+        if(bucket.count < min_points)
+            continue;
+
+        const Eigen::Vector3f mean_cam = bucket.sum_cam / static_cast<float>(bucket.count);
+        const float radial = mean_cam.norm();
+        if(radial > max_range)
+            continue;
+
+        const Eigen::Vector3f mean_world = bucket.sum_world / static_cast<float>(bucket.count);
+        const Eigen::Vector3f mean_color = bucket.sum_color / static_cast<float>(bucket.count);
+
+        VGGTDensePointRGBXYZ fused_point;
+        fused_point.xyz = mean_world;
+        fused_point.rgb = cv::Vec3b(
+            clamp_color(mean_color.x()),
+            clamp_color(mean_color.y()),
+            clamp_color(mean_color.z()));
+        fused_points.push_back(fused_point);
+
+        kf_cache.push_back(static_cast<float>(fused_point.rgb[0]));
+        kf_cache.push_back(static_cast<float>(fused_point.rgb[1]));
+        kf_cache.push_back(static_cast<float>(fused_point.rgb[2]));
+        kf_cache.push_back(mean_cam.x());
+        kf_cache.push_back(mean_cam.y());
+        kf_cache.push_back(mean_cam.z());
+    }
+
+    auto &dense_output = frame.MutableVGGTDenseMapPoints();
+    dense_output = std::move(fused_points);
+
+    if(dense_output.empty())
+        kf_cache.clear();
+
+}
+
 void Tracking::TrackVGGT()
 {
     // std::cout << "[DEBUG] Tracking::TrackVGGT start. State: " << mState << std::endl;
@@ -4962,6 +5150,7 @@ void Tracking::MonocularInitializationVGGT()
     if(mCurrentFrame.N > 100) // Threshold
     {
         // Create KeyFrame
+        FuseVGGTKeyframeDenseCache(mCurrentFrame);
         KeyFrame* pKFini = new KeyFrame(mCurrentFrame, mpAtlas->GetCurrentMap(), mpKeyFrameDB);
         
         // Insert KeyFrame in Map
@@ -5220,21 +5409,16 @@ bool Tracking::NeedNewKeyFrameVGGT()
     {
         if(last_visibility < 0.3f)
         {
-            std::cerr << "[VGGT] Force keyframe (visibility=" << last_visibility
-                      << ") for VGGT frame " << last_kf_vggt_id << std::endl;
             return true;
         }
         if(last_visibility < 0.7f)
         {
-            std::cerr << "[VGGT] Create keyframe (visibility=" << last_visibility
-                      << ") for VGGT frame " << last_kf_vggt_id << std::endl;
             return true;
         }
     }
 
     if(frames_since_kf >= 7)
     {
-        std::cerr << "[VGGT] Create keyframe: exceeded 7-frame gap (" << frames_since_kf << ")" << std::endl;
         return true;
     }
 
@@ -5248,6 +5432,8 @@ void Tracking::CreateNewKeyFrameVGGT()
 
     if(!mpLocalMapper->SetNotStop(true))
         return;
+
+    FuseVGGTKeyframeDenseCache(mCurrentFrame);
 
     KeyFrame* pKF = new KeyFrame(mCurrentFrame, mpAtlas->GetCurrentMap(), mpKeyFrameDB);
     pKF->SetVGGTKeyframe(true);
@@ -5263,18 +5449,46 @@ void Tracking::CreateNewKeyFrameVGGT()
     {
         pKF->mPrevKF = mpLastKeyFrame;
         mpLastKeyFrame->mNextKF = pKF;
-
-        Sophus::SE3f lastPose = mpLastKeyFrame->GetPose();
-        Eigen::Vector3f t_last = lastPose.translation();
-        std::cerr << "[VGGT Track] Using last KF " << mpLastKeyFrame->mnId
-                  << " pose t=" << t_last.transpose()
-                  << " rot_mag=" << lastPose.so3().log().norm()
-                  << " when spawning KF " << pKF->mnId << std::endl;
     }
 
     if (mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD)
     {
         mpImuPreintegratedFromLastKF = new IMU::Preintegrated(pKF->GetImuBias(),pKF->mImuCalib);
+    }
+
+    // 预先为 VGGT 稠密点生成 MapPoint 引用，供 Phase2 LBA 使用
+    if(pKF->IsVGGTKeyframe())
+    {
+        const std::vector<VGGTDensePointRGBXYZ>& dense_points = pKF->GetVGGTDenseMapPoints();
+        if(!dense_points.empty())
+        {
+            std::vector<MapPoint*> dense_refs;
+            dense_refs.reserve(dense_points.size());
+
+            Map* pMap = mpAtlas->GetCurrentMap();
+            for(const auto& sample : dense_points)
+            {
+                const Eigen::Vector3f& Pw = sample.xyz;
+                if(!std::isfinite(Pw.x()) || !std::isfinite(Pw.y()) || !std::isfinite(Pw.z()))
+                    continue;
+
+                MapPoint* pMP = new MapPoint(Pw, pKF, pMap);
+                pMP->SetVGGTPoint(true);
+                pMP->SetColor(sample.rgb);
+                Eigen::Vector3f normal = Pw - pKF->GetCameraCenter();
+                const float norm = normal.norm();
+                if(norm > 1e-6f)
+                    pMP->SetNormalVector(normal / norm);
+
+                mpAtlas->AddMapPoint(pMP);
+                dense_refs.push_back(pMP);
+            }
+
+            if(!dense_refs.empty())
+            {
+                pKF->SetVGGTDensePointRefs(dense_refs);
+            }
+        }
     }
 
     const int vg_points = static_cast<int>(mCurrentFrame.mvVGGT3Dpoints.size());
@@ -5497,10 +5711,6 @@ void Tracking::CreateNewKeyFrameVGGT()
         window_frame_ids = mLatestVGGTFrameIds;
         window_visibility_masks = mCurrentVGGTWindowVisibilityMasks;
     }
-    std::cerr << "[VGGT] KF global track IDs -> reused=" << reused_global_ids
-              << ", new=" << new_global_ids
-              << ", prev_frame_id=" << mnLastKeyFrameVGGTFrameId
-              << ", window_invisible=" << FormatFrameInvisibleCounts(window_frame_ids, window_visibility_masks) << std::endl;
 
     if (mpLocalMapper->insertKeyFrameCallback)
     {
@@ -5518,10 +5728,6 @@ void Tracking::CreateNewKeyFrameVGGT()
     mpLastKeyFrame = pKF;
     mnLastKeyFrameVGGTFrameId = mCurrentVGGTFrameId;
     mAccumulatedVGGTMotion = Sophus::SE3f();
-    
-    std::cerr << "[VGGT KF] New KeyFrame created: " << pKF->mnId 
-              << ", Frame: " << mCurrentFrame.mnId 
-              << ", mpLastKeyFrame updated" << std::endl;
 }
 
 } //namespace ORB_SLAM

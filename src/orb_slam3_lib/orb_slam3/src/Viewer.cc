@@ -20,6 +20,7 @@
 #include "Viewer.h"
 #include <pangolin/pangolin.h>
 
+#include <algorithm>
 #include <mutex>
 
 namespace ORB_SLAM3
@@ -182,6 +183,10 @@ void Viewer::Run()
     pangolin::Var<bool> menuShowKeyFrames("menu.Show KeyFrames",true,true);
     pangolin::Var<bool> menuShowGraph("menu.Show Graph",false,true);
     pangolin::Var<bool> menuShowInertialGraph("menu.Show Inertial Graph",true,true);
+    pangolin::Var<bool> menuShowDense("menu.Show Dense",false,true);
+    pangolin::Var<bool> menuDenseActiveOnly("menu.Dense Active Map",true,true);
+    pangolin::Var<int> menuDenseMaxPoints("menu.Dense Max Points",200000,1000,2000000);
+    pangolin::Var<float> menuDensePointSize("menu.Dense Point Size",mpMapDrawer->GetPointSize(),0.1f,10.0f);
     pangolin::Var<bool> menuLocalizationMode("menu.Localization Mode",false,true);
     pangolin::Var<bool> menuReset("menu.Reset",false,false);
     pangolin::Var<bool> menuStop("menu.Stop",false,false);
@@ -314,6 +319,12 @@ void Viewer::Run()
             mpMapDrawer->DrawKeyFrames(menuShowKeyFrames,menuShowGraph, menuShowInertialGraph, menuShowOptLba);
         if(menuShowPoints)
             mpMapDrawer->DrawMapPoints();
+        if(menuShowDense)
+        {
+            const size_t max_dense = static_cast<size_t>(std::max(0, static_cast<int>(menuDenseMaxPoints.Get())));
+            const float dense_size = static_cast<float>(menuDensePointSize.Get());
+            mpMapDrawer->DrawVGGTDenseCloud(menuDenseActiveOnly, max_dense, dense_size);
+        }
         // Draw stored non-keyframe trajectory points (does not affect map points)
         mpMapDrawer->DrawFrameTrajectory();
 

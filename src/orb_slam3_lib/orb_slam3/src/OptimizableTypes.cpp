@@ -212,6 +212,61 @@ namespace ORB_SLAM3 {
         _jacobianOplusXj = SE3deriv;
     }
 
+    EdgeSE3PointToPlaneOnlyPose::EdgeSE3PointToPlaneOnlyPose()
+        : BaseUnaryEdge<1, PointPlaneMeasurement, g2o::VertexSE3Expmap>()
+    {
+    }
+
+    bool EdgeSE3PointToPlaneOnlyPose::read(std::istream& is)
+    {
+        for(int i = 0; i < 3; ++i) is >> _measurement.camPoint[i];
+        for(int i = 0; i < 3; ++i) is >> _measurement.planeCenter[i];
+        for(int i = 0; i < 3; ++i) is >> _measurement.planeNormal[i];
+        return true;
+    }
+
+    bool EdgeSE3PointToPlaneOnlyPose::write(std::ostream& os) const
+    {
+        for(int i = 0; i < 3; ++i) os << _measurement.camPoint[i] << " ";
+        for(int i = 0; i < 3; ++i) os << _measurement.planeCenter[i] << " ";
+        for(int i = 0; i < 3; ++i) os << _measurement.planeNormal[i] << (i + 1 < 3 ? " " : "");
+        return os.good();
+    }
+
+    void EdgeSE3PointToPlaneOnlyPose::computeError()
+    {
+        const auto* pose = static_cast<const g2o::VertexSE3Expmap*>(_vertices[0]);
+        const g2o::SE3Quat& Tcw = pose->estimate();
+        const Eigen::Matrix3d Rcw = Tcw.rotation().toRotationMatrix();
+        const Eigen::Vector3d tcw = Tcw.translation();
+
+        const Eigen::Matrix3d Rwc = Rcw.transpose();
+        const Eigen::Vector3d twc = -Rwc * tcw;
+
+        const Eigen::Vector3d Pw = Rwc * _measurement.camPoint + twc;
+        _error[0] = _measurement.planeNormal.dot(Pw - _measurement.planeCenter);
+    }
+
+    void EdgeSE3PointToPlaneOnlyPose::linearizeOplus()
+    {
+        const auto* pose = static_cast<const g2o::VertexSE3Expmap*>(_vertices[0]);
+        const g2o::SE3Quat& Tcw = pose->estimate();
+        const Eigen::Matrix3d Rcw = Tcw.rotation().toRotationMatrix();
+        const Eigen::Vector3d tcw = Tcw.translation();
+
+        const Eigen::Matrix3d Rwc = Rcw.transpose();
+        const Eigen::Vector3d twc = -Rwc * tcw;
+        const Eigen::Vector3d Pw = Rwc * _measurement.camPoint + twc;
+
+        const Eigen::Vector3d& n = _measurement.planeNormal;
+        const Eigen::Vector3d jac_rot = -n.cross(Pw);
+        const Eigen::Vector3d jac_trans = -(Rcw * n);
+
+        _jacobianOplusXi.setZero();
+        _jacobianOplusXi.block<1,3>(0,0) = jac_rot.transpose();
+        _jacobianOplusXi.block<1,3>(0,3) = jac_trans.transpose();
+    }
+
     EdgeSE3ProjectXYZToBody::EdgeSE3ProjectXYZToBody() : BaseBinaryEdge<2, Eigen::Vector2d, g2o::VertexSBAPointXYZ, g2o::VertexSE3Expmap>() {
     }
 

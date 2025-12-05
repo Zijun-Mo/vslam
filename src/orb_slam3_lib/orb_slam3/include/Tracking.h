@@ -412,6 +412,7 @@ public:
                                int query_stride,
                                int original_image_width,
                                int original_image_height,
+                               const std::vector<float> &window_point_cloud,
                                string filename);
 
     void UpdateVGGTVisibilityWindow(const std::vector<uint64_t> &frame_ids,
@@ -442,12 +443,17 @@ public:
                               const std::vector<long>& globalIds);
     void ResetVGGTGridConsumption();
     void InsertVGGTGridMapping(uint32_t cell_code, long global_id);
+    void SetVGGTDenseConfig(const VGGTDenseConfig& config);
 
 protected:
     void TrackVGGT();
     void MonocularInitializationVGGT();
     bool NeedNewKeyFrameVGGT();
     void CreateNewKeyFrameVGGT();
+    void PopulateFrameDenseStorage(Frame &frame);
+    void FuseVGGTKeyframeDenseCache(Frame &frame);
+
+    VGGTDenseConfig mVGGTDenseConfig;
 };
 
 } //namespace ORB_SLAM

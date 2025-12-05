@@ -141,6 +141,7 @@ public:
                            int query_stride,
                            int original_image_width,
                            int original_image_height,
+                           const std::vector<float> &window_point_cloud,
                            string filename="");
 
     // This stops local mapping thread (map building) and performs only camera tracking.

@@ -16,6 +16,10 @@ std_msgs/Float32MultiArray tracks_2d
 std_msgs/Float32MultiArray tracks_mask
 # Per-track RGB colors stored as uint8 with layout (S, N, 3)
 std_msgs/UInt8MultiArray tracks_colors
+# Dense RGB+XYZ point cloud flattened to (N, 6) with N = S * H * W.
+# Each row stores [r, g, b, x, y, z] (colors in 0-255) in the same
+# world frame as tracks_3d; invalid samples are zeros.
+std_msgs/Float32MultiArray window_point_cloud
 # Query grid dimensions (downsampled from original image)
 uint32 query_grid_width
 uint32 query_grid_height
