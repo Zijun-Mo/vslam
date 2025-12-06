@@ -1118,6 +1118,7 @@ bool RunVGGTLBALocal(KeyFrame* pKF,
             num_edges = phase1_edges;
             return true;
         }
+        ApplyVGGTPhase1Result(pKF, phase1_observations, phase1Pose, pMap);
     }
     if(!phase2_observations.observations.empty() || !phase2_observations.priors.empty())
     {

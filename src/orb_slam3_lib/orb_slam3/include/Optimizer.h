@@ -45,9 +45,6 @@ class LoopClosing;
 
 struct VGGTDenseBAConfig
 {
-    double reused_point_weight{1.0};
-    double new_point_weight{0.25};
-    double huber_delta{std::sqrt(7.815)};
     double phase2_voxel_size{0.1};      // spatial hash resolution for Phase2 plane search (meters)
     double phase2_search_radius{0.5};   // neighbor search radius for Phase2 (meters)
 };
