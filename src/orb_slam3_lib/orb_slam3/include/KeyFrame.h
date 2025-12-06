@@ -502,9 +502,9 @@ protected:
     std::vector<long> mvVGGTGlobalTrackIds;
     std::vector<char> mvVGGTIsNewTrack;
     std::vector<Eigen::Vector3f> mvVGGTPointsInCamera;
-    std::vector<VGGTDensePointRGBXYZ> mVGGTDenseMapPoints;
-    std::vector<float> mvVGGTKeyframeDensePointCloudRGBXYZ;
-    std::vector<MapPoint*> mvpVGGTDensePointRefs;
+    std::vector<VGGTDensePointRGBXYZ> mVGGTDenseMapPoints; // 局部地图稠密点云
+    std::vector<float> mvVGGTKeyframeDensePointCloudRGBXYZ; // 当前关键帧稠密点云
+    std::vector<MapPoint*> mvpVGGTDensePointRefs; // 局部地图稠密点云对应的MapPoint指针
 
     float mHalfBaseline; // Only for visualization
 

@@ -4866,9 +4866,10 @@ void Tracking::PopulateFrameDenseStorage(Frame &frame)
         VGGTDensePointRGBXYZ sample;
         sample.xyz = Eigen::Vector3f(x, y, z);
         sample.rgb = cv::Vec3b(
-            saturate(raw_cloud[offset + 0]),
+            // raw_cloud stores RGB from Python; convert to OpenCV BGR for downstream viewers
+            saturate(raw_cloud[offset + 2]),
             saturate(raw_cloud[offset + 1]),
-            saturate(raw_cloud[offset + 2]));
+            saturate(raw_cloud[offset + 0]));
         dense_points.push_back(sample);
     }
 }
@@ -5433,10 +5434,39 @@ void Tracking::CreateNewKeyFrameVGGT()
     if(!mpLocalMapper->SetNotStop(true))
         return;
 
-    FuseVGGTKeyframeDenseCache(mCurrentFrame);
+    // 对关键帧：先体素融合当前帧稠密点
+    FuseVGGTKeyframeDenseCache(mCurrentFrame); // 产出 mvVGGTKeyframeDensePointCloudRGBXYZ 并更新 mVGGTDenseMapPoints
+
+    // 继承上一关键帧的稠密点，并附加本帧融合结果，保证新 KF 含有历史累积
+    if(mpLastKeyFrame)
+    {
+        std::vector<VGGTDensePointRGBXYZ> inherited = mpLastKeyFrame->GetVGGTDenseMapPoints();
+        const auto fused_now = mCurrentFrame.GetVGGTDenseMapPoints();
+        inherited.insert(inherited.end(), fused_now.begin(), fused_now.end());
+        mCurrentFrame.MutableVGGTDenseMapPoints() = std::move(inherited);
+    }
 
     KeyFrame* pKF = new KeyFrame(mCurrentFrame, mpAtlas->GetCurrentMap(), mpKeyFrameDB);
     pKF->SetVGGTKeyframe(true);
+
+    // 继承上一关键帧的稠密 MapPoint 引用（仅非初始化），用于 Phase2 先验
+    if(mpLastKeyFrame)
+    {
+        std::vector<MapPoint*> inherited_refs;
+        const auto &prev_refs = mpLastKeyFrame->GetVGGTDensePointRefs();
+        inherited_refs.reserve(prev_refs.size());
+        Map* pMap = mpAtlas->GetCurrentMap();
+        for(MapPoint* pMP : prev_refs)
+        {
+            if(!pMP || pMP->isBad())
+                continue;
+            if(pMP->GetMap() != pMap)
+                continue;
+            inherited_refs.push_back(pMP);
+        }
+        if(!inherited_refs.empty())
+            pKF->SetVGGTDensePointRefs(inherited_refs);
+    }
 
     if(mpAtlas->isImuInitialized())
         pKF->bImu = true;
@@ -5454,41 +5484,6 @@ void Tracking::CreateNewKeyFrameVGGT()
     if (mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD)
     {
         mpImuPreintegratedFromLastKF = new IMU::Preintegrated(pKF->GetImuBias(),pKF->mImuCalib);
-    }
-
-    // 预先为 VGGT 稠密点生成 MapPoint 引用，供 Phase2 LBA 使用
-    if(pKF->IsVGGTKeyframe())
-    {
-        const std::vector<VGGTDensePointRGBXYZ>& dense_points = pKF->GetVGGTDenseMapPoints();
-        if(!dense_points.empty())
-        {
-            std::vector<MapPoint*> dense_refs;
-            dense_refs.reserve(dense_points.size());
-
-            Map* pMap = mpAtlas->GetCurrentMap();
-            for(const auto& sample : dense_points)
-            {
-                const Eigen::Vector3f& Pw = sample.xyz;
-                if(!std::isfinite(Pw.x()) || !std::isfinite(Pw.y()) || !std::isfinite(Pw.z()))
-                    continue;
-
-                MapPoint* pMP = new MapPoint(Pw, pKF, pMap);
-                pMP->SetVGGTPoint(true);
-                pMP->SetColor(sample.rgb);
-                Eigen::Vector3f normal = Pw - pKF->GetCameraCenter();
-                const float norm = normal.norm();
-                if(norm > 1e-6f)
-                    pMP->SetNormalVector(normal / norm);
-
-                mpAtlas->AddMapPoint(pMP);
-                dense_refs.push_back(pMP);
-            }
-
-            if(!dense_refs.empty())
-            {
-                pKF->SetVGGTDensePointRefs(dense_refs);
-            }
-        }
     }
 
     const int vg_points = static_cast<int>(mCurrentFrame.mvVGGT3Dpoints.size());

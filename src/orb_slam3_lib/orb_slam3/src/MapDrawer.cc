@@ -207,18 +207,27 @@ void MapDrawer::DrawVGGTDenseCloud(bool onlyActiveMap, size_t maxPoints, float p
         maps.push_back(pActiveMap);
     }
 
-    // First pass to estimate density for decimation.
+    // First pass to estimate density for decimation on the newest KF of each map.
     size_t total_points = 0;
+    std::vector<KeyFrame*> latest_kfs;
+    latest_kfs.reserve(maps.size());
     for(Map* pMap : maps)
     {
         if(!pMap)
             continue;
         const std::vector<KeyFrame*> kfs = pMap->GetAllKeyFrames();
+        KeyFrame* latest = nullptr;
         for(KeyFrame* kf : kfs)
         {
             if(!kf)
                 continue;
-            total_points += kf->GetVGGTDenseMapPoints().size();
+            if(!latest || kf->mnId > latest->mnId)
+                latest = kf;
+        }
+        if(latest)
+        {
+            latest_kfs.push_back(latest);
+            total_points += latest->GetVGGTDenseMapPoints().size();
         }
     }
 
@@ -233,29 +242,21 @@ void MapDrawer::DrawVGGTDenseCloud(bool onlyActiveMap, size_t maxPoints, float p
 
     size_t emitted = 0;
     size_t idx = 0;
-    for(Map* pMap : maps)
+    for(KeyFrame* kf : latest_kfs)
     {
-        if(!pMap)
+        if(!kf)
             continue;
-        const std::vector<KeyFrame*> kfs = pMap->GetAllKeyFrames();
-        for(KeyFrame* kf : kfs)
+        const std::vector<VGGTDensePointRGBXYZ> dense = kf->GetVGGTDenseMapPoints();
+        for(const auto& pt : dense)
         {
-            if(!kf)
+            if((idx++ % stride) != 0)
                 continue;
-            const std::vector<VGGTDensePointRGBXYZ> dense = kf->GetVGGTDenseMapPoints();
-            for(const auto& pt : dense)
-            {
-                if((idx++ % stride) != 0)
-                    continue;
-                if(emitted >= maxPoints)
-                    break;
-
-                glColor3f(pt.rgb[2] / 255.f, pt.rgb[1] / 255.f, pt.rgb[0] / 255.f);
-                glVertex3f(pt.xyz.x(), pt.xyz.y(), pt.xyz.z());
-                ++emitted;
-            }
             if(emitted >= maxPoints)
                 break;
+
+            glColor3f(pt.rgb[2] / 255.f, pt.rgb[1] / 255.f, pt.rgb[0] / 255.f);
+            glVertex3f(pt.xyz.x(), pt.xyz.y(), pt.xyz.z());
+            ++emitted;
         }
         if(emitted >= maxPoints)
             break;
