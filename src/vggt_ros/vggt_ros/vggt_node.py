@@ -16,6 +16,7 @@ from collections import deque
 from PIL import Image as PILImage
 from torchvision import transforms as TF
 import cv2
+import math
 
 from vggt_ros.keyframe_selector import KeyframeSelector
 from vggt_ros.geometry_utils import compute_3d_tracks
@@ -40,6 +41,10 @@ class VGGTNode(Node):
         self.declare_parameter('image_topic', '/camera/image_raw')
         self.declare_parameter('min_parallax', 0.1) # 0-1 => fraction of image diagonal
         self.declare_parameter('track_visibility_threshold', 0.5)
+        self.declare_parameter('scale_enable', True)
+        self.declare_parameter('scale_min_overlap_ratio', 0.8)
+        self.declare_parameter('scale_jump_lower', 0.5)
+        self.declare_parameter('scale_jump_upper', 2.0)
         
         self.model_name = self.get_parameter('model_name').get_parameter_value().string_value
         self.device = self.get_parameter('device').get_parameter_value().string_value
@@ -47,6 +52,10 @@ class VGGTNode(Node):
         self.image_topic = self.get_parameter('image_topic').get_parameter_value().string_value
         self.min_parallax = self.get_parameter('min_parallax').get_parameter_value().double_value
         self.track_visibility_threshold = self.get_parameter('track_visibility_threshold').get_parameter_value().double_value
+        self.scale_enable = self.get_parameter('scale_enable').get_parameter_value().bool_value
+        self.scale_min_overlap_ratio = self.get_parameter('scale_min_overlap_ratio').get_parameter_value().double_value
+        self.scale_jump_lower = self.get_parameter('scale_jump_lower').get_parameter_value().double_value
+        self.scale_jump_upper = self.get_parameter('scale_jump_upper').get_parameter_value().double_value
         
         if self.device == 'cuda' and not torch.cuda.is_available():
             self.get_logger().warn('CUDA not available, using CPU')
@@ -61,6 +70,14 @@ class VGGTNode(Node):
         self.keyframe_id_counter = 0
         self.inferred_keyframe_ids = set()
         self.keyframe_id_map = {}  # Maps keyframe tuple to ID
+        self.prev_keyframe_ids = None
+        self.prev_cam_positions = None
+        self.prev_depth_medians = None
+        self.prev_window_scale = 1.0
+        self.global_scale = 1.0
+        self.last_scale_traj_ratio = 1.0
+        self.last_scale_depth_ratio = 1.0
+        self.last_scale_overlap = 0
         
         # Publishers
         # Use absolute topic to avoid namespace confusion when launched in containers
@@ -293,11 +310,13 @@ class VGGTNode(Node):
                 self.intrinsic_count += 1
 
             # Publish results
-            # Convert BFloat16 to Float32 before numpy conversion
+            # Convert tensor or ndarray to numpy, handling bfloat16 and detaching torch tensors
             def to_numpy(tensor):
-                if tensor.dtype == torch.bfloat16:
-                    return tensor.float().cpu().numpy()
-                return tensor.cpu().numpy()
+                if torch.is_tensor(tensor):
+                    if tensor.dtype == torch.bfloat16:
+                        return tensor.float().detach().cpu().numpy()
+                    return tensor.detach().cpu().numpy()
+                return np.asarray(tensor)
             
             raw_vis = predictions.get("vis")
             if raw_vis is not None:
@@ -321,12 +340,55 @@ class VGGTNode(Node):
                         f"tracks_vis shape {vis_mask.shape} does not match depth mask {combined_mask.shape}; falling back to depth-only mask"
                     )
 
+            # Convert tensors to numpy for scaling/publish
+            extrinsic_np = to_numpy(extrinsic.squeeze(0))
+            intrinsic_np = to_numpy(intrinsic.squeeze(0))
+            depth_np = to_numpy(depth_map.squeeze(0))
+            tracks_2d_np = to_numpy(track_tensor.squeeze(0))
+            points_np = to_numpy(point_map_by_unprojection)
+
+            # Scale estimation and application happen right after model output
+            scale_result = self.estimate_and_apply_scale(
+                current_keyframe_ids,
+                extrinsic_np,
+                depth_np,
+                tracks_3d_world_np
+            )
+
+            if not scale_result["publish"]:
+                self.get_logger().warn(
+                    f"Scale jump detected (traj_ratio={scale_result['traj_ratio']:.3f}, depth_ratio={scale_result['depth_ratio']:.3f}); skipping publish for this window"
+                )
+                return
+
+            scale_applied = scale_result["scale_applied"]
+            # Apply scale to all 3D-related outputs
+            extrinsic_np[:, :3, 3] *= scale_applied
+            depth_np *= scale_applied
+            tracks_3d_world_np = tracks_3d_world_np * scale_applied
+            points_np = points_np * scale_applied
+
+            # Cache scaled data for next window
+            try:
+                cam_to_world_scaled = closed_form_inverse_se3(extrinsic_np)
+                cam_positions = cam_to_world_scaled[:, :3, 3]
+            except Exception:
+                cam_positions = None
+            depth_medians_scaled = self.compute_depth_medians(depth_np)
+            self.prev_keyframe_ids = list(current_keyframe_ids)
+            self.prev_cam_positions = cam_positions
+            self.prev_depth_medians = depth_medians_scaled
+            self.prev_window_scale = scale_applied
+            self.last_scale_traj_ratio = scale_result["traj_ratio"]
+            self.last_scale_depth_ratio = scale_result["depth_ratio"]
+            self.last_scale_overlap = scale_result["overlap_count"]
+
             self.publish_results(
-                point_map_by_unprojection,
-                to_numpy(extrinsic.squeeze(0)),
-                to_numpy(intrinsic.squeeze(0)),
-                to_numpy(depth_map.squeeze(0)),
-                to_numpy(track_tensor.squeeze(0)),
+                points_np,
+                extrinsic_np,
+                intrinsic_np,
+                depth_np,
+                tracks_2d_np,
                 tracks_3d_world_np,
                 combined_mask.astype(np.float32),
                 current_headers,
@@ -342,6 +404,122 @@ class VGGTNode(Node):
             
         except Exception as e:
             self.get_logger().error(f'Inference failed: {e}')
+
+    def compute_depth_medians(self, depth_np, eps=1e-6):
+        if depth_np is None:
+            return None
+        depth_flat = depth_np.reshape(depth_np.shape[0], -1)
+        medians = []
+        for i in range(depth_flat.shape[0]):
+            valid = depth_flat[i][depth_flat[i] > eps]
+            if valid.size == 0:
+                medians.append(0.0)
+            else:
+                medians.append(float(np.median(valid)))
+        return medians
+
+    def estimate_and_apply_scale(self, current_keyframe_ids, extrinsic_np, depth_np, tracks_3d_np):
+        # Defaults: no scale change
+        result = {
+            "scale_applied": self.global_scale,
+            "traj_ratio": 1.0,
+            "depth_ratio": 1.0,
+            "overlap_count": 0,
+            "publish": True,
+        }
+
+        if not self.scale_enable:
+            return result
+
+        if self.prev_keyframe_ids is None or self.prev_cam_positions is None:
+            self.global_scale = self.global_scale
+            result["scale_applied"] = self.global_scale
+            return result
+
+        # Previous window was already scaled by prev_window_scale; convert it back to raw scale
+        prev_scale = max(self.prev_window_scale, 1e-6)
+        prev_cam_positions_raw = None
+        if self.prev_cam_positions is not None:
+            try:
+                prev_cam_positions_raw = np.asarray(self.prev_cam_positions, dtype=np.float32) / prev_scale
+            except Exception:
+                prev_cam_positions_raw = None
+        depth_medians_prev_raw = None
+        if self.prev_depth_medians is not None:
+            try:
+                depth_medians_prev_raw = [float(d) / prev_scale for d in self.prev_depth_medians]
+            except Exception:
+                depth_medians_prev_raw = None
+
+        # Overlap check
+        prev_id_to_idx = {int(k): idx for idx, k in enumerate(self.prev_keyframe_ids)}
+        curr_id_to_idx = {int(k): idx for idx, k in enumerate(current_keyframe_ids)}
+        overlap_ids = [k for k in current_keyframe_ids if k in prev_id_to_idx]
+        result["overlap_count"] = len(overlap_ids)
+        min_required = math.ceil(self.scale_min_overlap_ratio * float(self.window_size))
+        if len(overlap_ids) < min_required:
+            result["scale_applied"] = self.global_scale
+            return result
+
+        # Trajectory-based ratio using consecutive baselines on overlap frames
+        try:
+            cam_to_world_raw = closed_form_inverse_se3(extrinsic_np)
+            cam_positions_curr = cam_to_world_raw[:, :3, 3]
+        except Exception:
+            cam_positions_curr = None
+
+        traj_ratios = []
+        if cam_positions_curr is not None and prev_cam_positions_raw is not None:
+            # Sort overlap ids to respect temporal order
+            overlap_sorted = sorted(overlap_ids)
+            prev_pts = [prev_cam_positions_raw[prev_id_to_idx[k]] for k in overlap_sorted]
+            curr_pts = [cam_positions_curr[curr_id_to_idx[k]] for k in overlap_sorted]
+            prev_pts = np.asarray(prev_pts, dtype=np.float32)
+            curr_pts = np.asarray(curr_pts, dtype=np.float32)
+            if prev_pts.shape[0] >= 2:
+                prev_baseline = np.linalg.norm(np.diff(prev_pts, axis=0), axis=1)
+                curr_baseline = np.linalg.norm(np.diff(curr_pts, axis=0), axis=1)
+                for pb, cb in zip(prev_baseline, curr_baseline):
+                    if cb > 1e-6:
+                        traj_ratios.append(pb / cb)
+        traj_ratio = float(np.median(traj_ratios)) if traj_ratios else 1.0
+        result["traj_ratio"] = traj_ratio
+
+        # Depth-based ratio using per-frame medians
+        depth_medians_prev = depth_medians_prev_raw
+        depth_medians_curr = self.compute_depth_medians(depth_np)
+        depth_ratios = []
+        if depth_medians_prev and depth_medians_curr:
+            for k in overlap_ids:
+                p_idx = prev_id_to_idx[k]
+                c_idx = curr_id_to_idx[k]
+                prev_d = depth_medians_prev[p_idx] if p_idx < len(depth_medians_prev) else 0.0
+                curr_d = depth_medians_curr[c_idx] if c_idx < len(depth_medians_curr) else 0.0
+                if curr_d > 1e-6 and prev_d > 1e-6:
+                    depth_ratios.append(prev_d / curr_d)
+        depth_ratio = float(np.median(depth_ratios)) if depth_ratios else 1.0
+        result["depth_ratio"] = depth_ratio
+
+        # Fuse ratios (median of available sources)
+        candidates = []
+        if traj_ratios:
+            candidates.append(traj_ratio)
+        if depth_ratios:
+            candidates.append(depth_ratio)
+        if not candidates:
+            result["scale_applied"] = self.global_scale
+            return result
+
+        fused_scale = float(np.median(candidates))
+        # Apply jump guard
+        if fused_scale < self.scale_jump_lower or fused_scale > self.scale_jump_upper:
+            result["publish"] = False
+            return result
+
+        # Update global scale
+        self.global_scale *= fused_scale
+        result["scale_applied"] = self.global_scale
+        return result
 
     def publish_results(self, points, extrinsic, intrinsic, depth, tracks, tracks_3d, tracks_mask,
                         headers, transforms, query_grid_width, query_grid_height, query_stride,
@@ -503,7 +681,7 @@ class VGGTNode(Node):
         else:
             output_msg.intrinsic_avg = [0.0]*9
             output_msg.intrinsic_samples = 0
-        
+
         self.vggt_pub.publish(output_msg)
         
 

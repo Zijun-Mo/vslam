@@ -7,6 +7,10 @@
     image_topic: "/camera/image_raw"
     min_parallax: 0.05
     track_visibility_threshold: 0.3
+    scale_enable: true
+    scale_min_overlap_ratio: 0.5
+    scale_jump_lower: 0.5
+    scale_jump_upper: 2.0
 
     # ORB-SLAM3 Frontend Parameters
     voc_file: "/home/jun/vslam/src/orb_slam3_lib/orb_slam3/Vocabulary/ORBvoc.txt.bin"
