@@ -1,5 +1,5 @@
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, TimerAction
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch.launch_description_sources import PythonLaunchDescriptionSource
@@ -56,6 +56,12 @@ def generate_launch_description():
         output="screen",
     )
 
+    # 延迟 10 秒启动数据播放，确保系统节点先行就绪
+    seven_scenes_player_delay = TimerAction(
+        period=10.0,
+        actions=[seven_scenes_player],
+    )
+
     vslam_system = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             [FindPackageShare("vslam_bringup"), "/launch/vslam_system.launch.py"]
@@ -89,7 +95,7 @@ def generate_launch_description():
             data_root_arg,
             dataset_dir_arg,
             play_rate_arg,
-            seven_scenes_player,
+            seven_scenes_player_delay,
             vslam_system,
             eval_node,
         ]
