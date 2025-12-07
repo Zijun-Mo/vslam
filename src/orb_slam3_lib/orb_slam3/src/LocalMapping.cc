@@ -170,6 +170,12 @@ void LocalMapping::Run()
                         IntegrateVGGTDenseKeyframe(mpCurrentKeyFrame);
                     }
 
+                    // 通知外部：关键帧已完成局部优化，可用于发布优化位姿
+                    if(b_doneLBA && keyFrameOptimizedCallback)
+                    {
+                        keyFrameOptimizedCallback(mpCurrentKeyFrame);
+                    }
+
                 }
 #ifdef REGISTER_TIMES
                 std::chrono::steady_clock::time_point time_EndLBA = std::chrono::steady_clock::now();

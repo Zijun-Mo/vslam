@@ -63,6 +63,12 @@ public:
         insertKeyFrameCallback = callback;
     }
 
+    // Callback after keyframe optimization (e.g., for publishing optimized poses)
+    std::function<void(KeyFrame*)> keyFrameOptimizedCallback;
+    void SetKeyFrameOptimizedCallback(std::function<void(KeyFrame*)> callback) {
+        keyFrameOptimizedCallback = std::move(callback);
+    }
+
     // Thread Synch
     void RequestStop();
     void RequestReset();

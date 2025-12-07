@@ -140,7 +140,7 @@ class EvalNode(Node):
 
         self.est_poses: List[Tuple[float, float, float, float, float, float, float, float]] = []
 
-        self.pose_sub = self.create_subscription(PoseStamped, "/vslam/pose", self.pose_callback, 50)
+        self.pose_sub = self.create_subscription(PoseStamped, "/vslam/pose_optimized", self.pose_callback, 50)
         self.done_sub = self.create_subscription(Empty, "/dataset_done", self.done_callback, 10)
 
         self.get_logger().info("EvalNode initialized, waiting for poses...")
