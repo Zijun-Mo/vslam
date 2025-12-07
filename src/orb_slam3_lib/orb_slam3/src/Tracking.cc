@@ -4892,7 +4892,7 @@ void Tracking::FuseVGGTKeyframeDenseCache(Frame &frame)
     const Eigen::Matrix3f Rwc = Twc.rotationMatrix();
     const Eigen::Vector3f twc = Twc.translation();
 
-    const float voxel_size = std::max(1e-4f, mVGGTDenseConfig.voxel_size);
+    const float voxel_base = std::max(1e-4f, mVGGTDenseConfig.voxel_size);
     const int min_points = std::max(1, mVGGTDenseConfig.min_points_per_voxel);
     const float max_range = (mVGGTDenseConfig.max_range > 0.0f) ? mVGGTDenseConfig.max_range : std::numeric_limits<float>::max();
 
@@ -4949,8 +4949,11 @@ void Tracking::FuseVGGTKeyframeDenseCache(Frame &frame)
         if(radial > max_range)
             continue;
 
+        const float depth = std::max(radial, 1e-4f); // 至少 0.1mm，避免体素无限细
+        const float voxel_eff = std::max(1e-4f, voxel_base * depth);
+        const float inv = 1.0f / voxel_eff;
+
         Eigen::Vector3f world_pt = Rwc * cam_pt + twc;
-        const float inv = 1.0f / voxel_size;
         VoxelKey key;
         key.x = static_cast<int>(std::floor(world_pt.x() * inv));
         key.y = static_cast<int>(std::floor(world_pt.y() * inv));
@@ -5405,20 +5408,27 @@ bool Tracking::NeedNewKeyFrameVGGT()
     const int frames_since_kf = mCurrentFrame.mnId - mnLastKeyFrameId;
     const uint64_t last_kf_vggt_id = mnLastKeyFrameVGGTFrameId;
     const float last_visibility = LookupVisibilityRatio(last_kf_vggt_id);
+    const bool local_idle = mpLocalMapper->AcceptKeyFrames();
 
-    if(last_visibility >= 0.0f)
+    // Hard triggers: low visibility or too many frames since last KF
+    if(last_visibility >= 0.0f && last_visibility < 0.3f)
     {
-        if(last_visibility < 0.3f)
-        {
-            return true;
+        if (! local_idle) {
+            std::cerr << "[VGGT] Forcing keyframe: visibility=" << last_visibility << " < 0.3" << std::endl;
         }
-        if(last_visibility < 0.7f)
-        {
-            return true;
-        }
+        return true;
     }
 
     if(frames_since_kf >= 7)
+    {
+        if (! local_idle) {
+            std::cerr << "[VGGT] Forcing keyframe: frames_since_kf=" << frames_since_kf << " >= 7" << std::endl;
+        }
+        return true;
+    }
+
+    // Soft trigger: moderate visibility drop, only when local mapping is idle
+    if(last_visibility >= 0.0f && last_visibility < 0.7f && local_idle)
     {
         return true;
     }

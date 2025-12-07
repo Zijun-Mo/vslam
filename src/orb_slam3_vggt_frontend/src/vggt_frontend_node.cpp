@@ -45,6 +45,7 @@ public:
         declare_parameter("dense.min_points_per_voxel", 4);
         declare_parameter("dense.max_range", 8.0);
         declare_parameter("dense.phase2_radius", 0.5);
+        declare_parameter("dense.phase2_max_edges", 40000);
         // Camera intrinsic override parameters (optional). If provided (fx>0) we will generate a temp YAML and call ChangeCalibration.
         declare_parameter("camera.fx", 0.0);
         declare_parameter("camera.fy", 0.0);
@@ -101,12 +102,14 @@ public:
         ORB_SLAM3::VGGTDenseBAConfig dense_ba_cfg;
         dense_ba_cfg.phase2_voxel_size = dense_cfg.voxel_size; // align Phase2 voxel with fusion
         dense_ba_cfg.phase2_search_radius = get_parameter("dense.phase2_radius").as_double();
+        dense_ba_cfg.phase2_max_edges = get_parameter("dense.phase2_max_edges").as_int();
         dense_ba_cfg_ = dense_ba_cfg;
         ORB_SLAM3::Optimizer::SetVGGTDenseBAConfig(dense_ba_cfg_);
         RCLCPP_INFO(get_logger(),
-            "VGGT dense BA: voxel=%.3f, radius=%.3f",
+            "VGGT dense BA: voxel=%.3f, radius=%.3f, max_edges=%d",
             dense_ba_cfg_.phase2_voxel_size,
-            dense_ba_cfg_.phase2_search_radius);
+            dense_ba_cfg_.phase2_search_radius,
+            dense_ba_cfg_.phase2_max_edges);
 
         param_callback_ = this->add_on_set_parameters_callback(
             std::bind(&VggtFrontendNode::OnParametersUpdated, this, std::placeholders::_1));
@@ -865,6 +868,14 @@ private:
                         ba_changed = true;
                     }
                 }
+                else if(name == "dense.phase2_max_edges")
+                {
+                    if(auto value = extract_int(param))
+                    {
+                        dense_ba_cfg_.phase2_max_edges = std::max(1, *value);
+                        ba_changed = true;
+                    }
+                }
             }
 
             if(dense_changed)
@@ -895,9 +906,10 @@ private:
         {
             ORB_SLAM3::Optimizer::SetVGGTDenseBAConfig(ba_snapshot);
             RCLCPP_INFO(get_logger(),
-                        "[Dynamic] VGGT dense BA updated: voxel=%.3f, radius=%.3f",
+                        "[Dynamic] VGGT dense BA updated: voxel=%.3f, radius=%.3f, max_edges=%d",
                         ba_snapshot.phase2_voxel_size,
-                        ba_snapshot.phase2_search_radius);
+                        ba_snapshot.phase2_search_radius,
+                        ba_snapshot.phase2_max_edges);
         }
 
         result.successful = true;

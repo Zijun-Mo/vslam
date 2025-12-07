@@ -30,6 +30,7 @@
 #include<algorithm>
 #include<chrono>
 #include<random>
+#include<future>
 #include <Eigen/Eigenvalues>
 
 #include <open3d/Open3D.h>
@@ -115,9 +116,9 @@ static VGGTDenseFusionResult FuseDenseObservations(const VGGTPhase2Samples& samp
     const Sophus::SE3f Tcw = optimizedPose;
 
     const VGGTDenseConfig cfg = GetFusionConfig(); // mirror frontend fusion parameters
-    const float voxel_size = std::max(1e-4f, cfg.voxel_size);
+    const float voxel_base = std::max(1e-4f, cfg.voxel_size);
     const int min_points = std::max(1, cfg.min_points_per_voxel);
-    std::cerr << "[VGGT LBA] FuseDenseObservations: voxel_size=" << voxel_size
+    std::cerr << "[VGGT LBA] FuseDenseObservations: voxel_size=" << voxel_base
               << " min_points_per_voxel=" << min_points << std::endl;
     const float max_range = (cfg.max_range > 0.0f) ? cfg.max_range : std::numeric_limits<float>::max();
 
@@ -233,7 +234,11 @@ static VGGTDenseFusionResult FuseDenseObservations(const VGGTPhase2Samples& samp
         if(!cam_pt.allFinite() || !world_pt.allFinite())
             continue;
 
-        const float inv = 1.0f / voxel_size;
+        const float radial = cam_pt.norm();
+        const float depth = std::max(radial, 1e-4f); // 至少 0.1mm，避免体素无限细
+        const float depth_for_voxel = std::min(depth, 1.0f); // 1m 以外不再放大量纲
+        const float voxel_eff = std::max(1e-4f, voxel_base * depth_for_voxel);
+        const float inv = 1.0f / voxel_eff;
         VoxelKey key;
         key.x = static_cast<int>(std::floor(world_pt.x() * inv));
         key.y = static_cast<int>(std::floor(world_pt.y() * inv));
@@ -513,7 +518,8 @@ Sophus::SE3f RunVGGTPhase2(KeyFrame* pKF,
 
     std::vector<VGGTPhase2Samples::Observation> dense_obs = samples.observations;
 
-    constexpr size_t kMaxPhase2Edges = 40000;
+    const VGGTDenseBAConfig dense_cfg = GetDenseConfig();
+    const size_t kMaxPhase2Edges = static_cast<size_t>(std::max(1, dense_cfg.phase2_max_edges));
     if(dense_obs.size() > kMaxPhase2Edges)
     {
         std::mt19937 rng(static_cast<uint32_t>(kf_id >= 0 ? kf_id : 1));
@@ -529,16 +535,77 @@ Sophus::SE3f RunVGGTPhase2(KeyFrame* pKF,
         return initialPose;
     }
 
-    const VGGTDenseBAConfig dense_cfg = GetDenseConfig();
-    const float kVoxel = std::max(1e-4f, static_cast<float>(dense_cfg.phase2_voxel_size));
-    const float kMaxDist = std::max(kVoxel, static_cast<float>(dense_cfg.phase2_search_radius));
-    const double icp_max_corr = static_cast<double>(kMaxDist);
+    const float kVoxelBase = std::max(1e-4f, static_cast<float>(dense_cfg.phase2_voxel_size));
+    const float search_radius_base = std::max(1e-4f, static_cast<float>(dense_cfg.phase2_search_radius));
+    const size_t kMaxPhase2Refs = kMaxPhase2Edges * 4;
+
+    const auto t_stage_start = std::chrono::steady_clock::now();
 
     // 构建目标点云（世界坐标），优先保留已有法向，否则用 Open3D 估计
     std::vector<MapPoint*> vAllDenseMPs = pMap->GetAllMapPoints();
     vAllDenseMPs.erase(std::remove_if(vAllDenseMPs.begin(), vAllDenseMPs.end(), [](MapPoint* p){
         return (!p || p->isBad() || !p->IsVGGTPoint());
     }), vAllDenseMPs.end());
+    if(vAllDenseMPs.size() > kMaxPhase2Refs)
+    {
+        // Weighted downsample refs: uniform within 1m, probability ~ 1/r^3 beyond 1m
+        std::mt19937 rng(static_cast<uint32_t>(kf_id >= 0 ? kf_id + 17 : 17));
+        std::vector<MapPoint*> weighted_refs;
+        weighted_refs.reserve(kMaxPhase2Refs);
+        std::vector<MapPoint*> refs_sorted; refs_sorted.reserve(vAllDenseMPs.size());
+        std::vector<double> weights; weights.reserve(vAllDenseMPs.size());
+
+        const Sophus::SE3f& Tcw_init = initialPose; // camera pose
+        for(MapPoint* pMP : vAllDenseMPs)
+        {
+            if(!pMP)
+                continue;
+            const Eigen::Vector3f Pw = pMP->GetWorldPos();
+            const Eigen::Vector3f cam = Tcw_init * Pw;
+            if(!cam.allFinite())
+                continue;
+            const float r = std::max(cam.norm(), 1e-6f);
+            const double w = (r <= 1.0f) ? 1.0 : 1.0 / std::max(1e-6, std::pow(static_cast<double>(r), 3.0));
+            refs_sorted.push_back(pMP);
+            weights.push_back(w);
+        }
+
+        if(refs_sorted.size() <= kMaxPhase2Refs)
+        {
+            vAllDenseMPs.swap(refs_sorted);
+        }
+        else
+        {
+            const size_t pool_size = refs_sorted.size();
+            std::vector<double> prefix;
+            prefix.reserve(pool_size);
+            double running = 0.0;
+            for(double w : weights)
+            {
+                running += w;
+                prefix.push_back(running);
+            }
+            const double total_w = running;
+            if(total_w <= 0.0)
+            {
+                std::shuffle(vAllDenseMPs.begin(), vAllDenseMPs.end(), rng);
+                vAllDenseMPs.resize(kMaxPhase2Refs);
+            }
+            else
+            {
+                weighted_refs.reserve(kMaxPhase2Refs);
+                for(size_t i = 0; i < kMaxPhase2Refs; ++i)
+                {
+                    const double pick = std::uniform_real_distribution<double>(0.0, total_w)(rng);
+                    const auto it = std::lower_bound(prefix.begin(), prefix.end(), pick);
+                    const size_t idx = static_cast<size_t>(std::distance(prefix.begin(), it));
+                    weighted_refs.push_back(refs_sorted[idx]);
+                }
+                vAllDenseMPs.swap(weighted_refs);
+            }
+        }
+    }
+    const auto t_after_refs = std::chrono::steady_clock::now();
 
     auto target = std::make_shared<open3d::geometry::PointCloud>();
     target->points_.reserve(vAllDenseMPs.size());
@@ -586,9 +653,6 @@ Sophus::SE3f RunVGGTPhase2(KeyFrame* pKF,
         return initialPose;
     }
 
-    // 强制使用 Open3D 估计法向，满足点到面 ICP 要求
-    target->EstimateNormals(open3d::geometry::KDTreeSearchParamHybrid(icp_max_corr, 30));
-
     // 构建源点云（相机坐标系下的稠密观测）
     auto source = std::make_shared<open3d::geometry::PointCloud>();
     source->points_.reserve(dense_obs.size());
@@ -606,6 +670,7 @@ Sophus::SE3f RunVGGTPhase2(KeyFrame* pKF,
                                      normalize_color(c.z()));
     }
 
+    const auto t_after_source = std::chrono::steady_clock::now();
     if(source->points_.size() < 6)
     {
         chi2_before = 0.0;
@@ -614,8 +679,24 @@ Sophus::SE3f RunVGGTPhase2(KeyFrame* pKF,
         return initialPose;
     }
 
+    // 对 ICP 使用固定对应阈值，所有点均等权（远处点本就更稀疏，无需额外按距离衰减）
+    const float kMaxDist = std::max(kVoxelBase, search_radius_base);
+    const double icp_max_corr = static_cast<double>(kMaxDist);
+
+    // 强制使用 Open3D 估计法向，满足点到面 ICP 要求（使用缩放后的搜索半径）
+    target->EstimateNormals(open3d::geometry::KDTreeSearchParamHybrid(icp_max_corr, 30));
     const Eigen::Matrix4d init_Twc = initialPose.inverse().matrix().cast<double>();
     source->EstimateNormals(open3d::geometry::KDTreeSearchParamHybrid(icp_max_corr, 30));
+    const auto t_after_normals = std::chrono::steady_clock::now();
+
+    auto to_ms = [](const auto& t0, const auto& t1) -> double
+    {
+        return std::chrono::duration<double, std::milli>(t1 - t0).count();
+    };
+    const double ms_refs = to_ms(t_stage_start, t_after_refs);
+    const double ms_source = to_ms(t_after_refs, t_after_source);
+    const double ms_normals = to_ms(t_after_source, t_after_normals);
+    const auto t_start_icp = std::chrono::steady_clock::now();
     const auto estimation = open3d::pipelines::registration::TransformationEstimationForColoredICP();
     auto result = open3d::pipelines::registration::RegistrationColoredICP(
         *source,
@@ -624,6 +705,8 @@ Sophus::SE3f RunVGGTPhase2(KeyFrame* pKF,
         init_Twc,
         estimation,
         open3d::pipelines::registration::ICPConvergenceCriteria());
+    const auto t_end_icp = std::chrono::steady_clock::now();
+    const double ms_icp = to_ms(t_start_icp, t_end_icp);
 
     edge_count = static_cast<int>(dense_obs.size());
     chi2_before = 0.0;
@@ -645,7 +728,12 @@ Sophus::SE3f RunVGGTPhase2(KeyFrame* pKF,
               << " inlier_rmse=" << result.inlier_rmse_
               << " trans_delta=" << trans_delta
               << " rot_delta_deg=" << rot_delta_deg
-              << " edges=" << edge_count
+              << " ref_count=" << vAllDenseMPs.size()
+              << " obs_count=" << dense_obs.size()
+              << " refs_ms=" << ms_refs
+              << " source_ms=" << ms_source
+              << " normals_ms=" << ms_normals
+              << " icp_ms=" << ms_icp
               << std::endl;
 
     return Tcw_opt;

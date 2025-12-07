@@ -18,6 +18,7 @@ import cv2
 import rclpy
 from cv_bridge import CvBridge
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, QoSDurabilityPolicy
 from sensor_msgs.msg import Image
 from std_msgs.msg import Empty
 
@@ -29,12 +30,16 @@ class SevenScenesPlayerNode(Node):
         self.declare_parameter("seq_root", "")
         self.declare_parameter("fps", 30.0)
         self.declare_parameter("play_rate", 1.0)
+        self.declare_parameter("wait_for_start", True)
 
         self.seq_root = Path(
             self.get_parameter("seq_root").get_parameter_value().string_value
         )
         self.fps = float(self.get_parameter("fps").value)
         self.play_rate = float(self.get_parameter("play_rate").value)
+        self.wait_for_start = (
+            self.get_parameter("wait_for_start").get_parameter_value().bool_value
+        )
 
         self.bridge = CvBridge()
         self.frames: List[Path] = self._collect_frames(self.seq_root)
@@ -43,6 +48,10 @@ class SevenScenesPlayerNode(Node):
 
         self.image_pub = self.create_publisher(Image, "/camera/image_raw", 10)
         self.done_pub = self.create_publisher(Empty, "/dataset_done", 10)
+        start_qos = QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+        self.start_sub = self.create_subscription(
+            Empty, "/dataset_start", self._start_callback, start_qos
+        )
 
         if not self.frames:
             self.get_logger().error(f"No frames found under {self.seq_root}")
@@ -54,11 +63,15 @@ class SevenScenesPlayerNode(Node):
                 f"Invalid playback rate (fps * play_rate <= 0). Using 30.0."
             )
             effective_rate = 30.0
-        period = 1.0 / effective_rate
-        self.timer = self.create_timer(period, self._timer_cb)
-        self.get_logger().info(
-            f"SevenScenesPlayer started: {len(self.frames)} frames, period={period:.4f}s, seq_root={self.seq_root}"
-        )
+        self.timer = None
+        self.period = 1.0 / effective_rate
+
+        if self.wait_for_start:
+            self.get_logger().info(
+                f"SevenScenesPlayer ready ({len(self.frames)} frames, period={self.period:.4f}s). Waiting for /dataset_start..."
+            )
+        else:
+            self._start_timer()
 
     def _collect_frames(self, root: Path) -> List[Path]:
         if not root.is_dir():
@@ -104,6 +117,22 @@ class SevenScenesPlayerNode(Node):
             self.timer.cancel()
         except Exception:
             pass
+
+    def _start_callback(self, _msg: Empty) -> None:
+        if not self.wait_for_start:
+            return
+        self._start_timer()
+
+    def _start_timer(self) -> None:
+        if self.timer is not None:
+            return
+        if not hasattr(self, "period") or not self.frames:
+            self.get_logger().warn("Cannot start playback; frames not loaded or period unset.")
+            return
+        self.timer = self.create_timer(self.period, self._timer_cb)
+        self.get_logger().info(
+            f"SevenScenesPlayer started playback: {len(self.frames)} frames, period={self.period:.4f}s"
+        )
 
 
 def main(args=None) -> None:

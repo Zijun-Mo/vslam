@@ -6,6 +6,7 @@ import rclpy
 from builtin_interfaces.msg import Time
 from cv_bridge import CvBridge
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, QoSDurabilityPolicy
 from sensor_msgs.msg import Image
 from std_msgs.msg import Empty
 
@@ -16,17 +17,22 @@ class TUMPlayerNode(Node):
 
         self.declare_parameter('seq_root', '/data/rgbd_dataset_freiburg1_room')
         self.declare_parameter('play_rate', 1.0)
+        self.declare_parameter('wait_for_start', True)
 
         self.seq_root = self.get_parameter('seq_root').get_parameter_value().string_value
         self.play_rate = float(self.get_parameter('play_rate').get_parameter_value().double_value)
+        self.wait_for_start = self.get_parameter('wait_for_start').get_parameter_value().bool_value
 
         self.bridge = CvBridge()
         self.rgb_sequence = self._load_rgb_list(os.path.join(self.seq_root, 'rgb.txt'))
         self.frame_idx = 0
         self.done_published = False
+        self.timer_period = None
 
         self.image_pub = self.create_publisher(Image, '/camera/image_raw', 10)
         self.done_pub = self.create_publisher(Empty, '/dataset_done', 10)
+        start_qos = QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+        self.start_sub = self.create_subscription(Empty, '/dataset_start', self._start_callback, start_qos)
 
         if not self.rgb_sequence:
             self.get_logger().error('No rgb entries found; nothing to play.')
@@ -37,10 +43,12 @@ class TUMPlayerNode(Node):
         if safe_rate != self.play_rate:
             self.get_logger().warn('play_rate must be > 0. Using 1.0.')
 
-        timer_period = 1.0 / (fps * safe_rate)
-        self.get_logger().info(f'Loaded {len(self.rgb_sequence)} RGB frames. Using fps={fps:.2f}, play_rate={safe_rate}, period={timer_period:.4f}s')
-        # rclpy Node uses create_timer (wall-clock based)
-        self.timer = self.create_timer(timer_period, self._timer_callback)
+        self.timer_period = 1.0 / (fps * safe_rate)
+        self.timer = None
+        if self.wait_for_start:
+            self.get_logger().info(f'Loaded {len(self.rgb_sequence)} RGB frames. Using fps={fps:.2f}, play_rate={safe_rate}, period={self.timer_period:.4f}s. Waiting for /dataset_start...')
+        else:
+            self._start_timer()
 
     def _load_rgb_list(self, rgb_file: str) -> List[Tuple[float, str]]:
         entries: List[Tuple[float, str]] = []
@@ -110,6 +118,20 @@ class TUMPlayerNode(Node):
         msg.header.frame_id = 'camera'
 
         self.image_pub.publish(msg)
+
+    def _start_callback(self, _msg: Empty) -> None:
+        if not self.wait_for_start:
+            return
+        self._start_timer()
+
+    def _start_timer(self) -> None:
+        if self.timer is not None:
+            return
+        if self.timer_period is None:
+            self.get_logger().warn('Cannot start playback; timer period not set (likely no frames).')
+            return
+        self.timer = self.create_timer(self.timer_period, self._timer_callback)
+        self.get_logger().info(f'Starting playback with period={self.timer_period:.4f}s')
 
 
 def main(args=None) -> None:

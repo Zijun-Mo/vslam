@@ -89,7 +89,7 @@ def generate_launch_description():
     )
     
     delayed_vggt_node = TimerAction(
-        period=5.0,
+        period=0.0,
         actions=[vggt_node]
     )
     

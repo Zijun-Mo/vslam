@@ -5,10 +5,12 @@ from typing import List, Tuple
 
 import numpy as np
 import rclpy
+import time
 from builtin_interfaces.msg import Time
 from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
-from std_msgs.msg import Empty
+from rclpy.qos import QoSProfile, QoSDurabilityPolicy
+from std_msgs.msg import Empty, Bool
 from ament_index_python.packages import PackageNotFoundError, get_package_share_directory
 
 
@@ -140,8 +142,15 @@ class EvalNode(Node):
 
         self.est_poses: List[Tuple[float, float, float, float, float, float, float, float]] = []
 
+        start_qos = QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+        ready_qos = QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+
+        self.start_pub = self.create_publisher(Empty, "/dataset_start", start_qos)
+        self.started = False
+
         self.pose_sub = self.create_subscription(PoseStamped, "/vslam/pose_optimized", self.pose_callback, 50)
         self.done_sub = self.create_subscription(Empty, "/dataset_done", self.done_callback, 10)
+        self.ready_sub = self.create_subscription(Bool, "/vggt/model_ready", self.model_ready_callback, ready_qos)
 
         self.get_logger().info("EvalNode initialized, waiting for poses...")
 
@@ -155,7 +164,19 @@ class EvalNode(Node):
         q = msg.pose.orientation
         self.est_poses.append((ts, p.x, p.y, p.z, q.x, q.y, q.z, q.w))
 
+    def model_ready_callback(self, msg: Bool) -> None:
+        if not msg.data:
+            return
+        if self.started:
+            return
+        self.start_pub.publish(Empty())
+        self.started = True
+        self.get_logger().info("Received /vggt/model_ready; published /dataset_start")
+
     def done_callback(self, _msg: Empty) -> None:
+        # 等待 2 秒，确保最后一帧/日志写入完成再结束
+        time.sleep(10.0)
+
         if not self.groundtruth_path or not os.path.exists(self.groundtruth_path):
             self.get_logger().error("Groundtruth file missing; cannot compute ATE.")
             return

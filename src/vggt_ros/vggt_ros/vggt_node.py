@@ -1,9 +1,9 @@
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSPresetProfiles
+from rclpy.qos import QoSPresetProfiles, QoSProfile, QoSDurabilityPolicy
 from sensor_msgs.msg import Image, PointCloud, ChannelFloat32
 from geometry_msgs.msg import PoseArray, Pose, Point32
-from std_msgs.msg import Header, Float32MultiArray, MultiArrayDimension, UInt8MultiArray
+from std_msgs.msg import Header, Float32MultiArray, MultiArrayDimension, UInt8MultiArray, Bool
 from vslam_msgs.msg import VggtOutput
 from cv_bridge import CvBridge
 import numpy as np
@@ -82,6 +82,9 @@ class VGGTNode(Node):
         # Publishers
         # Use absolute topic to avoid namespace confusion when launched in containers
         self.vggt_pub = self.create_publisher(VggtOutput, '/vggt/output', 1)
+        ready_qos = QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+        self.model_ready_pub = self.create_publisher(Bool, '/vggt/model_ready', ready_qos)
+        self.model_ready = False
         self.frame_count = 0
         
         # Inference time tracking
@@ -108,8 +111,16 @@ class VGGTNode(Node):
             self.model = VGGT.from_pretrained(self.model_name).to(self.device)
             self.model.eval()
             self.get_logger().info('Model loaded successfully.')
+            self._publish_model_ready()
         except Exception as e:
             self.get_logger().error(f'Failed to load model: {e}')
+
+    def _publish_model_ready(self):
+        if self.model_ready:
+            return
+        self.model_ready_pub.publish(Bool(data=True))
+        self.model_ready = True
+        self.get_logger().info('Published /vggt/model_ready')
 
     def image_callback(self, msg):
         try:

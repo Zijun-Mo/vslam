@@ -47,6 +47,7 @@ struct VGGTDenseBAConfig
 {
     double phase2_voxel_size{0.1};      // spatial hash resolution for Phase2 plane search (meters)
     double phase2_search_radius{0.5};   // neighbor search radius for Phase2 (meters)
+    int phase2_max_edges{40000};        // max source samples for Phase2 ICP; refs capped at 4x
 };
 
 class Optimizer
