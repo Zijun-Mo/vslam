@@ -5414,6 +5414,8 @@ bool Tracking::NeedNewKeyFrameVGGT()
     const uint64_t last_kf_vggt_id = mnLastKeyFrameVGGTFrameId;
     const float last_visibility = LookupVisibilityRatio(last_kf_vggt_id);
     const bool local_idle = mpLocalMapper->AcceptKeyFrames();
+    const int window_size = static_cast<int>(mCurrentVGGTWindowTwc.size());
+    const int frame_budget = (window_size > 0) ? (window_size - 1) : 7;
 
     // Hard triggers: low visibility or too many frames since last KF
     if(last_visibility >= 0.0f && last_visibility < 0.3f)
@@ -5424,10 +5426,11 @@ bool Tracking::NeedNewKeyFrameVGGT()
         return true;
     }
 
-    if(frames_since_kf >= 7)
+    if(frames_since_kf >= frame_budget)
     {
         if (! local_idle) {
-            std::cerr << "[VGGT] Forcing keyframe: frames_since_kf=" << frames_since_kf << " >= 7" << std::endl;
+            std::cerr << "[VGGT] Forcing keyframe: frames_since_kf=" << frames_since_kf
+                      << " >= " << frame_budget << std::endl;
         }
         return true;
     }
