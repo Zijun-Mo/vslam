@@ -222,6 +222,8 @@ class EvalNode(Node):
         )
 
         self.write_csv(n, rmse, mean, median, std, max_err, min_err)
+        seq_tag = self.seq_name if self.seq_name else self._infer_seq_name()
+        self.get_logger().info(f"[EvalNode] DONE scene={seq_tag} seq={seq_tag} ATE_RMSE={rmse:.3f}")
         self._shutdown_once()
 
     def write_csv(self, n: int, rmse: float, mean: float, median: float, std: float, max_err: float, min_err: float) -> None:
