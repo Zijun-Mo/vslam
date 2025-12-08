@@ -23,6 +23,9 @@
 #include <algorithm>
 #include <mutex>
 
+#include <open3d/Open3D.h>
+#include "Optimizer.h"
+
 namespace ORB_SLAM3
 {
 
@@ -265,6 +268,102 @@ void MapDrawer::DrawVGGTDenseCloud(bool onlyActiveMap, size_t maxPoints, float p
     glEnd();
 }
 
+void MapDrawer::DrawTSDFMesh(bool wireframe, size_t maxFaces, float lineWidth, float faceAlpha)
+{
+    if(maxFaces == 0)
+    {
+        return;
+    }
+
+    auto mesh_ptr = ExtractTSDFMeshCopy();
+    if(!mesh_ptr)
+    {
+        return;
+    }
+
+    auto& mesh = *mesh_ptr;
+    if(mesh.triangles_.empty() || mesh.vertices_.empty())
+    {
+        return;
+    }
+
+    const size_t tri_count = mesh.triangles_.size();
+    const size_t stride = std::max<size_t>(1, tri_count / maxFaces);
+
+    if(wireframe)
+    {
+        glLineWidth(lineWidth > 0.0f ? lineWidth : mCameraLineWidth);
+        glBegin(GL_LINES);
+    }
+    else
+    {
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glBegin(GL_TRIANGLES);
+    }
+
+    const bool has_color = mesh.HasVertexColors();
+    size_t emitted = 0;
+    for(size_t i = 0; i < tri_count; ++i)
+    {
+        if((i % stride) != 0)
+            continue;
+        if(emitted >= maxFaces)
+            break;
+
+        const Eigen::Vector3i &tri = mesh.triangles_[i];
+        const Eigen::Vector3d &v0 = mesh.vertices_[tri(0)];
+        const Eigen::Vector3d &v1 = mesh.vertices_[tri(1)];
+        const Eigen::Vector3d &v2 = mesh.vertices_[tri(2)];
+
+        auto set_color = [&](int idx)
+        {
+            if(has_color && idx < static_cast<int>(mesh.vertex_colors_.size()))
+            {
+                const Eigen::Vector3d &c = mesh.vertex_colors_[idx];
+                glColor4f(static_cast<float>(c(0)), static_cast<float>(c(1)), static_cast<float>(c(2)), faceAlpha);
+            }
+            else
+            {
+                glColor4f(0.2f, 0.6f, 1.0f, faceAlpha);
+            }
+        };
+
+        if(wireframe)
+        {
+            set_color(tri(0));
+            glVertex3d(v0(0), v0(1), v0(2));
+            glVertex3d(v1(0), v1(1), v1(2));
+
+            set_color(tri(1));
+            glVertex3d(v1(0), v1(1), v1(2));
+            glVertex3d(v2(0), v2(1), v2(2));
+
+            set_color(tri(2));
+            glVertex3d(v2(0), v2(1), v2(2));
+            glVertex3d(v0(0), v0(1), v0(2));
+        }
+        else
+        {
+            set_color(tri(0));
+            glVertex3d(v0(0), v0(1), v0(2));
+            set_color(tri(1));
+            glVertex3d(v1(0), v1(1), v1(2));
+            set_color(tri(2));
+            glVertex3d(v2(0), v2(1), v2(2));
+        }
+
+        ++emitted;
+    }
+
+    glEnd();
+
+    if(!wireframe)
+    {
+        glDisable(GL_BLEND);
+    }
+}
+
 void MapDrawer::AddFramePose(const Sophus::SE3f &Tcw, bool isKeyFrame)
 {
     // Store Twc (world pose) for drawing; limit size to avoid unbounded growth
@@ -343,6 +442,7 @@ void MapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const b
             KeyFrame* pKF = vpKFs[i];
             Eigen::Matrix4f Twc = pKF->GetPoseInverse().matrix();
             unsigned int index_color = pKF->mnOriginMapId;
+            (void)index_color;
 
             glPushMatrix();
 

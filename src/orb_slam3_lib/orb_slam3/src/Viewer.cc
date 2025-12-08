@@ -187,6 +187,11 @@ void Viewer::Run()
     pangolin::Var<bool> menuDenseActiveOnly("menu.Dense Active Map",true,true);
     pangolin::Var<int> menuDenseMaxPoints("menu.Dense Max Points",200000,1000,2000000);
     pangolin::Var<float> menuDensePointSize("menu.Dense Point Size",mpMapDrawer->GetPointSize(),0.1f,10.0f);
+    pangolin::Var<bool> menuShowTSDF("menu.Show TSDF Mesh", false, true);
+    pangolin::Var<bool> menuTSDFWireframe("menu.TSDF Wireframe", false, true);
+    pangolin::Var<int> menuTSDFMaxFaces("menu.TSDF Max Faces", 200000, 1000, 2000000);
+    pangolin::Var<float> menuTSDFLineWidth("menu.TSDF Line Width", 1.5f, 0.1f, 10.0f);
+    pangolin::Var<float> menuTSDFAlpha("menu.TSDF Alpha", 0.35f, 0.05f, 1.0f);
     pangolin::Var<bool> menuLocalizationMode("menu.Localization Mode",false,true);
     pangolin::Var<bool> menuReset("menu.Reset",false,false);
     pangolin::Var<bool> menuStop("menu.Stop",false,false);
@@ -324,6 +329,13 @@ void Viewer::Run()
             const size_t max_dense = static_cast<size_t>(std::max(0, static_cast<int>(menuDenseMaxPoints.Get())));
             const float dense_size = static_cast<float>(menuDensePointSize.Get());
             mpMapDrawer->DrawVGGTDenseCloud(menuDenseActiveOnly, max_dense, dense_size);
+        }
+        if(menuShowTSDF)
+        {
+            const size_t max_faces = static_cast<size_t>(std::max(0, static_cast<int>(menuTSDFMaxFaces.Get())));
+            const float line_w = static_cast<float>(menuTSDFLineWidth.Get());
+            const float alpha = static_cast<float>(menuTSDFAlpha.Get());
+            mpMapDrawer->DrawTSDFMesh(menuTSDFWireframe.Get(), max_faces, line_w, alpha);
         }
         // Draw stored non-keyframe trajectory points (does not affect map points)
         mpMapDrawer->DrawFrameTrajectory();

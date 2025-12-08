@@ -94,6 +94,14 @@ KeyFrame::KeyFrame(Frame &F, Map *pMap, KeyFrameDatabase *pKFDB):
 
     mVGGTDenseMapPoints = F.mvpMapPointsDense;
     mvVGGTKeyframeDensePointCloudRGBXYZ = F.mvVGGTKeyframeDensePointCloudRGBXYZ;
+    mvVGGTWindowRGB = F.mvVGGTWindowRGB;
+    mvVGGTWindowDepth = F.mvVGGTWindowDepth;
+    mVGGTWindowImgWidth = F.mVGGTWindowImgWidth;
+    mVGGTWindowImgHeight = F.mVGGTWindowImgHeight;
+    mVGGTWindowFrameCount = F.mVGGTWindowFrameCount;
+    mVGGTWindowFrameIds = F.mvVGGTWindowFrameIds;
+    mVGGTWindowPosesTwc = F.mvVGGTWindowPosesTwc;
+    mVGGTFrameId = F.mVGGTFrameId;
 
     mnOriginMapId = pMap->GetId();
 }
@@ -189,6 +197,12 @@ bool KeyFrame::isVelocitySet()
     return mbHasVelocity;
 }
 
+Eigen::Matrix3f KeyFrame::GetCalibrationMatrix()
+{
+    unique_lock<mutex> lock(mMutexPose);
+    return mK_;
+}
+
 void KeyFrame::SetVGGTKeyframe(bool flag)
 {
     unique_lock<mutex> lock(mMutexFeatures);
@@ -275,6 +289,54 @@ void KeyFrame::ClearVGGTDensePointRefs()
 {
     unique_lock<mutex> lock(mMutexFeatures);
     mvpVGGTDensePointRefs.clear();
+}
+
+std::vector<uint8_t> KeyFrame::GetVGGTWindowRGB() const
+{
+    unique_lock<mutex> lock(mMutexFeatures);
+    return mvVGGTWindowRGB;
+}
+
+std::vector<float> KeyFrame::GetVGGTWindowDepth() const
+{
+    unique_lock<mutex> lock(mMutexFeatures);
+    return mvVGGTWindowDepth;
+}
+
+int KeyFrame::GetVGGTWindowImgWidth() const
+{
+    unique_lock<mutex> lock(mMutexFeatures);
+    return mVGGTWindowImgWidth;
+}
+
+int KeyFrame::GetVGGTWindowImgHeight() const
+{
+    unique_lock<mutex> lock(mMutexFeatures);
+    return mVGGTWindowImgHeight;
+}
+
+int KeyFrame::GetVGGTWindowFrameCount() const
+{
+    unique_lock<mutex> lock(mMutexFeatures);
+    return mVGGTWindowFrameCount;
+}
+
+std::vector<uint64_t> KeyFrame::GetVGGTWindowFrameIds() const
+{
+    unique_lock<mutex> lock(mMutexFeatures);
+    return mVGGTWindowFrameIds;
+}
+
+std::vector<Sophus::SE3f> KeyFrame::GetVGGTWindowPosesTwc() const
+{
+    unique_lock<mutex> lock(mMutexFeatures);
+    return mVGGTWindowPosesTwc;
+}
+
+uint64_t KeyFrame::GetVGGTFrameId() const
+{
+    unique_lock<mutex> lock(mMutexFeatures);
+    return mVGGTFrameId;
 }
 
 void KeyFrame::AddConnection(KeyFrame *pKF, const int &weight)

@@ -1646,6 +1646,11 @@ Sophus::SE3f System::TrackVGGT(const cv::Mat &im, const double &timestamp,
                                int original_image_width,
                                int original_image_height,
                                const std::vector<float> &window_point_cloud,
+                               const std::vector<uint8_t> &window_images,
+                               const std::vector<float> &window_depths,
+                               int window_image_width,
+                               int window_image_height,
+                               int window_image_count,
                                string filename)
 {
     // std::cout << "[DEBUG] System::TrackVGGT called. Timestamp: " << timestamp << ", Keys: " << vKeys.size() << std::endl;
@@ -1694,7 +1699,6 @@ Sophus::SE3f System::TrackVGGT(const cv::Mat &im, const double &timestamp,
             mbResetActiveMap = false;
         }
     }
-
     Sophus::SE3f Tcw = mpTracker->GrabImageVGGT(im,
                                                 timestamp,
                                                 vKeys,
@@ -1713,6 +1717,11 @@ Sophus::SE3f System::TrackVGGT(const cv::Mat &im, const double &timestamp,
                                                 original_image_width,
                                                 original_image_height,
                                                 window_point_cloud,
+                                                window_images,
+                                                window_depths,
+                                                window_image_width,
+                                                window_image_height,
+                                                window_image_count,
                                                 filename);
 
     unique_lock<mutex> lock2(mMutexState);

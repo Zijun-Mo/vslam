@@ -1312,13 +1312,21 @@ Frame::Frame(const cv::Mat &imGray, const double &timeStamp,
              const std::vector<cv::Point3f> &v3DPoints,
              const std::vector<cv::Vec3b> &vTrackColors,
              const std::vector<float> &window_point_cloud,
+             const std::vector<uint8_t> &window_images,
+             const std::vector<float> &window_depths,
+             int window_image_width,
+             int window_image_height,
+             int window_image_count,
+             const std::vector<uint64_t> &window_frame_ids,
+             const std::vector<Sophus::SE3f> &window_pose_twcs,
+             uint64_t window_frame_id_current,
              ORBextractor* extractor, ORBVocabulary* voc, 
              GeometricCamera* pCamera, cv::Mat &distCoef, 
              const float &bf, const float &thDepth, 
              Frame* pPrevF, const IMU::Calib &ImuCalib)
         : mpcpi(NULL), mbHasPose(false), mbHasVelocity(false),
             mpORBvocabulary(voc), mpORBextractorLeft(extractor), mpORBextractorRight(static_cast<ORBextractor*>(NULL)),
-            mTimeStamp(timeStamp), mK(pCamera->toK()), mDistCoef(distCoef), mbf(bf), mb(0), mThDepth(thDepth), N(0),
+            mTimeStamp(timeStamp), mK(pCamera->toK()), mK_(Converter::toMatrix3f(mK)), mDistCoef(distCoef), mbf(bf), mb(0), mThDepth(thDepth), N(0),
             mImuCalib(ImuCalib),
             mpImuPreintegrated(NULL), mpPrevFrame(pPrevF), mpImuPreintegratedFrame(NULL), mpReferenceKF(static_cast<KeyFrame*>(NULL)),
             mnDataset(0),
@@ -1408,6 +1416,28 @@ Frame::Frame(const cv::Mat &imGray, const double &timeStamp,
     mvVGGT3Dpoints = valid3DPoints;
     mvVGGTTrackColors = validTrackColors;
     mvVGGTWindowPointCloudRGBXYZ = window_point_cloud;
+    mvVGGTWindowRGB = window_images;
+    mvVGGTWindowDepth = window_depths;
+    mVGGTWindowImgWidth = window_image_width;
+    mVGGTWindowImgHeight = window_image_height;
+    mVGGTWindowFrameCount = window_image_count;
+    mvVGGTWindowFrameIds = window_frame_ids;
+    mvVGGTWindowPosesTwc = window_pose_twcs;
+    mVGGTFrameId = window_frame_id_current;
+    // Fallback: infer frame count if not provided or inconsistent
+    if(mVGGTWindowFrameCount <= 0 && mVGGTWindowImgWidth > 0 && mVGGTWindowImgHeight > 0)
+    {
+        const size_t rgb_stride = static_cast<size_t>(mVGGTWindowImgWidth) * static_cast<size_t>(mVGGTWindowImgHeight) * 3;
+        if(rgb_stride > 0 && !mvVGGTWindowRGB.empty())
+        {
+            mVGGTWindowFrameCount = static_cast<int>(mvVGGTWindowRGB.size() / rgb_stride);
+        }
+        const size_t depth_stride = static_cast<size_t>(mVGGTWindowImgWidth) * static_cast<size_t>(mVGGTWindowImgHeight);
+        if(mVGGTWindowFrameCount <= 0 && depth_stride > 0 && !mvVGGTWindowDepth.empty())
+        {
+            mVGGTWindowFrameCount = static_cast<int>(mvVGGTWindowDepth.size() / depth_stride);
+        }
+    }
     N = mvKeys.size();
 
     // MapPoints

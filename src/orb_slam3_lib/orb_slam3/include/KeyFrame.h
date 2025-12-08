@@ -33,6 +33,7 @@
 #include "SerializationUtils.h"
 
 #include <mutex>
+#include <cstdint>
 
 #include <boost/serialization/base_object.hpp>
 #include <boost/serialization/vector.hpp>
@@ -63,6 +64,11 @@ class KeyFrame
         ar & const_cast<int&>(mnGridCols);
         ar & mVGGTDenseMapPoints;
         ar & mvVGGTKeyframeDensePointCloudRGBXYZ;
+        ar & mvVGGTWindowRGB;
+        ar & mvVGGTWindowDepth;
+        ar & mVGGTWindowImgWidth;
+        ar & mVGGTWindowImgHeight;
+        ar & mVGGTWindowFrameCount;
         ar & const_cast<int&>(mnGridRows);
         ar & const_cast<float&>(mfGridElementWidthInv);
         ar & const_cast<float&>(mfGridElementHeightInv);
@@ -216,6 +222,7 @@ public:
     Eigen::Vector3f GetTranslation();
     Eigen::Vector3f GetVelocity();
     bool isVelocitySet();
+    Eigen::Matrix3f GetCalibrationMatrix();
     void SetVGGTKeyframe(bool flag=true);
     bool IsVGGTKeyframe();
     void SetVGGTTrackMetadata(const std::vector<long>& global_track_ids,
@@ -232,6 +239,14 @@ public:
     void SetVGGTDensePointRefs(const std::vector<MapPoint*> &dense_refs);
     std::vector<MapPoint*> GetVGGTDensePointRefs() const;
     void ClearVGGTDensePointRefs();
+    std::vector<uint8_t> GetVGGTWindowRGB() const;
+    std::vector<float> GetVGGTWindowDepth() const;
+    int GetVGGTWindowImgWidth() const;
+    int GetVGGTWindowImgHeight() const;
+    int GetVGGTWindowFrameCount() const;
+    std::vector<uint64_t> GetVGGTWindowFrameIds() const;
+    std::vector<Sophus::SE3f> GetVGGTWindowPosesTwc() const;
+    uint64_t GetVGGTFrameId() const;
 
     // Bag of Words Representation
     void ComputeBoW();
@@ -504,6 +519,14 @@ protected:
     std::vector<Eigen::Vector3f> mvVGGTPointsInCamera;
     std::vector<VGGTDensePointRGBXYZ> mVGGTDenseMapPoints; // 局部地图稠密点云
     std::vector<float> mvVGGTKeyframeDensePointCloudRGBXYZ; // 当前关键帧稠密点云
+    std::vector<uint8_t> mvVGGTWindowRGB;
+    std::vector<float> mvVGGTWindowDepth;
+    int mVGGTWindowImgWidth{0};
+    int mVGGTWindowImgHeight{0};
+    int mVGGTWindowFrameCount{0};
+    std::vector<uint64_t> mVGGTWindowFrameIds; // VGGT window frame ids (aligned with RGBD window)
+    std::vector<Sophus::SE3f> mVGGTWindowPosesTwc; // VGGT window absolute poses Twc
+    uint64_t mVGGTFrameId{0}; // Current VGGT frame id corresponding to latest window element
     std::vector<MapPoint*> mvpVGGTDensePointRefs; // 局部地图稠密点云对应的MapPoint指针
 
     float mHalfBaseline; // Only for visualization

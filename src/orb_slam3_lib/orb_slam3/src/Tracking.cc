@@ -4447,6 +4447,11 @@ Sophus::SE3f Tracking::GrabImageVGGT(const cv::Mat &im, const double &timestamp,
                                      int original_image_width,
                                      int original_image_height,
                                      const std::vector<float> &window_point_cloud,
+                                     const std::vector<uint8_t> &window_images,
+                                     const std::vector<float> &window_depths,
+                                     int window_image_width,
+                                     int window_image_height,
+                                     int window_image_count,
                                      string filename)
 {
     // std::cout << "[DEBUG] Tracking::GrabImageVGGT start." << std::endl;
@@ -4462,7 +4467,7 @@ Sophus::SE3f Tracking::GrabImageVGGT(const cv::Mat &im, const double &timestamp,
     {
         std::lock_guard<std::mutex> lock(mMutexVGGTVisibility);
         mCurrentVGGTWindowVisibilityMasks = window_visibility_masks;
-        mCurrentVGGTWindowTwc = std::move(window_pose_se3);
+        mCurrentVGGTWindowTwc = window_pose_se3;
         mCurrentVGGTWindowTracks2d = window_tracks_2d;
     }
     UpdateVGGTTrackCache(frame_ids, window_tracks_2d);
@@ -4497,9 +4502,9 @@ Sophus::SE3f Tracking::GrabImageVGGT(const cv::Mat &im, const double &timestamp,
 
     // Create Frame with VGGT data
     if(mState==NOT_INITIALIZED || mState==NO_IMAGES_YET ||(lastID - initID) < mMaxFrames)
-        mCurrentFrame = Frame(mImGray, timestamp, vKeys, vTrackIds, v3DPoints, vTrackColors, window_point_cloud, mpIniORBextractor, mpORBVocabulary, mpCamera, mDistCoef, mbf, mThDepth, nullptr, IMU::Calib());
+        mCurrentFrame = Frame(mImGray, timestamp, vKeys, vTrackIds, v3DPoints, vTrackColors, window_point_cloud, window_images, window_depths, window_image_width, window_image_height, window_image_count, frame_ids, window_pose_se3, mCurrentVGGTFrameId, mpIniORBextractor, mpORBVocabulary, mpCamera, mDistCoef, mbf, mThDepth, nullptr, IMU::Calib());
     else
-        mCurrentFrame = Frame(mImGray, timestamp, vKeys, vTrackIds, v3DPoints, vTrackColors, window_point_cloud, mpORBextractorLeft, mpORBVocabulary, mpCamera, mDistCoef, mbf, mThDepth, nullptr, IMU::Calib());
+        mCurrentFrame = Frame(mImGray, timestamp, vKeys, vTrackIds, v3DPoints, vTrackColors, window_point_cloud, window_images, window_depths, window_image_width, window_image_height, window_image_count, frame_ids, window_pose_se3, mCurrentVGGTFrameId, mpORBextractorLeft, mpORBVocabulary, mpCamera, mDistCoef, mbf, mThDepth, nullptr, IMU::Calib());
     PopulateFrameDenseStorage(mCurrentFrame);
     mbCurrentVGGTPointsConverted = false;
 

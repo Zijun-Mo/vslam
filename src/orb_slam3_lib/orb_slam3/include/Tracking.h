@@ -413,6 +413,11 @@ public:
                                int original_image_width,
                                int original_image_height,
                                const std::vector<float> &window_point_cloud,
+                               const std::vector<uint8_t> &window_images,
+                               const std::vector<float> &window_depths,
+                               int window_image_width,
+                               int window_image_height,
+                               int window_image_count,
                                string filename);
 
     void UpdateVGGTVisibilityWindow(const std::vector<uint64_t> &frame_ids,

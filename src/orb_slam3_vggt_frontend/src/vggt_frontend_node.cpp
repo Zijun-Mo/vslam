@@ -306,6 +306,9 @@ private:
         // Get original image dimensions
         int orig_W = static_cast<int>(vggt_msg->original_image_width);
         int orig_H = static_cast<int>(vggt_msg->original_image_height);
+        // Window RGBD dimensions (aligned with depth/preprocessed grid)
+        int window_img_w = static_cast<int>(vggt_msg->window_image_width);
+        int window_img_h = static_cast<int>(vggt_msg->window_image_height);
         
         if (N != expected_N)
         {
@@ -414,6 +417,22 @@ private:
                        static_cast<int>(color_layout[2].size) >= 3 &&
                                color_data.size() >= static_cast<size_t>(S) * static_cast<size_t>(N) * 3;
         const size_t color_offset = has_color ? static_cast<size_t>(frame_idx) * static_cast<size_t>(N) * 3 : 0;
+
+        // Decode full window RGB and depth for later keyframe storage
+        std::vector<uint8_t> window_rgb_raw = vggt_msg->window_images.data;
+        std::vector<float> window_depth_raw = vggt_msg->window_depths.data;
+        int window_frames_rgb = 0;
+        int window_frames_depth = 0;
+        const auto &img_layout = vggt_msg->window_images.layout.dim;
+        if(img_layout.size() >= 4)
+        {
+            window_frames_rgb = static_cast<int>(img_layout[0].size);
+        }
+        const auto &depth_layout = vggt_msg->window_depths.layout.dim;
+        if(depth_layout.size() >= 3)
+        {
+            window_frames_depth = static_cast<int>(depth_layout[0].size);
+        }
 
         auto has_valid_track = [&](int frame_index, int track_idx) -> bool
         {
@@ -612,7 +631,12 @@ private:
             query_stride,
             orig_W,
             orig_H,
-            window_cloud_data);
+            window_cloud_data,
+            window_rgb_raw,
+            window_depth_raw,
+            window_img_w,
+            window_img_h,
+            window_frames_rgb > 0 ? window_frames_rgb : (window_frames_depth > 0 ? window_frames_depth : S));
         const int state = mpSystem->GetTrackingState();
         if(state == ORB_SLAM3::Tracking::OK || state == ORB_SLAM3::Tracking::OK_KLT)
         {

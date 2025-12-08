@@ -45,6 +45,7 @@ public:
 
     void DrawMapPoints();
     void DrawVGGTDenseCloud(bool onlyActiveMap, size_t maxPoints, float pointSizeOverride);
+    void DrawTSDFMesh(bool wireframe, size_t maxFaces, float lineWidth, float faceAlpha);
     void DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const bool bDrawInertialGraph, const bool bDrawOptLba);
     void DrawCurrentCamera(pangolin::OpenGlMatrix &Twc);
     void SetCurrentCameraPose(const Sophus::SE3f &Tcw);

@@ -28,6 +28,14 @@ uint32 query_stride
 uint32 original_image_width
 uint32 original_image_height
 
+# Full RGB window (preprocessed, aligned with depth) flattened to [S, H, W, 3]
+std_msgs/UInt8MultiArray window_images
+# Full depth window flattened to [S, H, W] (meters, same scale as window_point_cloud/depth_np)
+std_msgs/Float32MultiArray window_depths
+# Dimensions shared by all window frames
+uint32 window_image_width
+uint32 window_image_height
+
 # Average intrinsic matrix (row-major 3x3) accumulated over all model inferences so far
 float32[9] intrinsic_avg
 # Number of samples used in intrinsic_avg

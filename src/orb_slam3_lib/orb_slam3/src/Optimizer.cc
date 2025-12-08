@@ -31,7 +31,10 @@
 #include<chrono>
 #include<random>
 #include<future>
+#include <cstdint>
+#include <numeric>
 #include <Eigen/Eigenvalues>
+#include <iostream>
 
 #include <open3d/Open3D.h>
 
@@ -56,6 +59,9 @@ VGGTDenseBAConfig g_dense_cfg;
 std::mutex g_fuse_cfg_mutex;
 VGGTDenseConfig g_fuse_cfg;
 
+std::mutex g_tsdf_mutex;
+std::shared_ptr<open3d::pipelines::integration::ScalableTSDFVolume> g_tsdf_volume;
+
 VGGTDenseBAConfig GetDenseConfig()
 {
     std::lock_guard<std::mutex> lock(g_dense_cfg_mutex);
@@ -66,6 +72,47 @@ VGGTDenseConfig GetFusionConfig()
 {
     std::lock_guard<std::mutex> lock(g_fuse_cfg_mutex);
     return g_fuse_cfg;
+}
+
+std::shared_ptr<open3d::pipelines::integration::ScalableTSDFVolume> GetOrCreateTSDFVolumeImpl()
+{
+    std::lock_guard<std::mutex> lock(g_tsdf_mutex);
+    if(!g_tsdf_volume)
+    {
+        const VGGTDenseConfig cfg = GetFusionConfig();
+        const double voxel_len = static_cast<double>(std::max(1e-4f, cfg.voxel_size));
+        const double sdf_trunc = std::max(voxel_len * 4.0, 1e-3);
+        g_tsdf_volume = std::make_shared<open3d::pipelines::integration::ScalableTSDFVolume>(
+            voxel_len,
+            sdf_trunc,
+            open3d::pipelines::integration::TSDFVolumeColorType::RGB8);
+        std::cerr << "[VGGT TSDF] Initialized ScalableTSDFVolume voxel=" << voxel_len
+                  << " sdf_trunc=" << sdf_trunc << std::endl;
+    }
+    return g_tsdf_volume;
+}
+
+std::shared_ptr<open3d::geometry::TriangleMesh> ExtractTSDFMeshCopyImpl()
+{
+    std::lock_guard<std::mutex> lock(g_tsdf_mutex);
+    if(!g_tsdf_volume)
+    {
+        std::cerr << "[TSDF] ExtractTSDFMeshCopyImpl: volume is null" << std::endl;
+        return nullptr;
+    }
+    auto mesh = g_tsdf_volume->ExtractTriangleMesh();
+    if(!mesh)
+    {
+        std::cerr << "[TSDF] ExtractTSDFMeshCopyImpl: mesh extraction returned null" << std::endl;
+    }
+    else
+    {
+        const size_t v = mesh->vertices_.size();
+        const size_t f = mesh->triangles_.size();
+        static std::atomic<int64_t> log_counter{0};
+        const int64_t tick = ++log_counter;
+    }
+    return mesh;
 }
 
 struct VGGTPriorObservation
@@ -83,6 +130,16 @@ struct VGGTPhase2Samples
     using Observation = std::pair<Eigen::Vector3d, Eigen::Vector3d>; // camPoint with color
     std::vector<Prior> priors;
     std::vector<Observation> observations;
+    std::vector<uint8_t> window_rgb;   // Flattened [S, H, W, 3]
+    std::vector<float> window_depth;   // Flattened [S, H, W]
+    int window_img_width{0};
+    int window_img_height{0};
+    int window_frame_count{0};
+    std::vector<uint64_t> window_frame_ids;      // VGGT window frame ids (aligned with window_rgb/depth)
+    std::vector<Sophus::SE3f> window_poses_twcs; // Absolute Twc for each VGGT window frame
+    std::vector<Sophus::SE3f> window_relative_poses; // Relative pose to anchor frame (camera-to-camera)
+    uint64_t anchor_frame_id{0};
+    Eigen::Matrix3d K{Eigen::Matrix3d::Identity()};
 };
 
 struct VGGTDenseFusionResult
@@ -304,6 +361,129 @@ static VGGTDenseFusionResult FuseDenseObservations(const VGGTPhase2Samples& samp
     if(result.fused_world.empty())
         result.fused_cam_rgbxyz.clear();
 
+    {
+        auto tsdf_volume = GetOrCreateTSDFVolume();
+        // Integrate VGGT RGBD window into global TSDF using optimized keyframe pose as anchor
+        auto integrate_rgbd_window = [&](const VGGTPhase2Samples& samples, const Sophus::SE3f& optimizedPose)
+        {
+            if(!tsdf_volume)
+            {
+                std::cerr << "[TSDF] integrate_rgbd_window: TSDF volume not initialized" << std::endl;
+                return;
+            }
+
+            const int width = samples.window_img_width;
+            const int height = samples.window_img_height;
+            if(width <= 0 || height <= 0)
+            {
+                std::cerr << "[TSDF] integrate_rgbd_window: invalid image size " << width << "x" << height << std::endl;
+                return;
+            }
+
+            // Determine frame count from buffers if missing
+            int frame_count = samples.window_frame_count;
+            const size_t rgb_stride = static_cast<size_t>(width) * static_cast<size_t>(height) * 3;
+            const size_t depth_stride = static_cast<size_t>(width) * static_cast<size_t>(height);
+            if(frame_count <= 0 && rgb_stride > 0 && !samples.window_rgb.empty())
+            {
+                frame_count = static_cast<int>(samples.window_rgb.size() / rgb_stride);
+            }
+            if(frame_count <= 0 && depth_stride > 0 && !samples.window_depth.empty())
+            {
+                frame_count = static_cast<int>(samples.window_depth.size() / depth_stride);
+            }
+            if(frame_count <= 0)
+            {
+                std::cerr << "[TSDF] integrate_rgbd_window: frame_count could not be inferred" << std::endl;
+                return;
+            }
+
+            // Prepare intrinsics
+            double fx = samples.K(0,0);
+            double fy = samples.K(1,1);
+            double cx = samples.K(0,2);
+            double cy = samples.K(1,2);
+            open3d::camera::PinholeCameraIntrinsic intrinsic(width, height, fx, fy, cx, cy);
+
+            // Anchor pose (optimized keyframe world pose): Tcw -> Twc
+            const Sophus::SE3f Twc_anchor = optimizedPose.inverse();
+
+            // Helper to fetch relative Twc from samples (computed against anchor window pose)
+            auto get_relative_Twc = [&](int idx) -> Sophus::SE3f
+            {
+                if(idx >= 0 && idx < static_cast<int>(samples.window_relative_poses.size()))
+                {
+                    return samples.window_relative_poses[static_cast<size_t>(idx)];
+                }
+                // Fallback: recompute from absolute window poses if available
+                if(!samples.window_poses_twcs.empty())
+                {
+                    const size_t anchor_idx = samples.window_poses_twcs.size() - 1;
+                    const Sophus::SE3f anchor_Tcw = samples.window_poses_twcs[anchor_idx].inverse();
+                    if(idx >= 0 && idx < static_cast<int>(samples.window_poses_twcs.size()))
+                    {
+                        return samples.window_poses_twcs[static_cast<size_t>(idx)] * anchor_Tcw;
+                    }
+                }
+                return Sophus::SE3f();
+            };
+
+            for(int f = 0; f < frame_count; ++f)
+            {
+                const size_t rgb_offset = static_cast<size_t>(f) * rgb_stride;
+                const size_t depth_offset = static_cast<size_t>(f) * depth_stride;
+                if(rgb_offset + rgb_stride > samples.window_rgb.size())
+                {
+                    std::cerr << "[TSDF] integrate_rgbd_window: RGB buffer too small at frame " << f << std::endl;
+                    break;
+                }
+                if(depth_offset + depth_stride > samples.window_depth.size())
+                {
+                    std::cerr << "[TSDF] integrate_rgbd_window: depth buffer too small at frame " << f << std::endl;
+                    break;
+                }
+
+                open3d::geometry::Image o3d_color;
+                o3d_color.Prepare(width, height, 3, sizeof(uint8_t));
+                std::copy_n(samples.window_rgb.data() + rgb_offset, rgb_stride, o3d_color.data_.begin());
+
+                open3d::geometry::Image o3d_depth;
+                o3d_depth.Prepare(width, height, 1, sizeof(float));
+                const float* depth_src = samples.window_depth.data() + depth_offset;
+                float* depth_dst = reinterpret_cast<float*>(o3d_depth.data_.data());
+                std::copy_n(depth_src, depth_stride, depth_dst);
+
+                auto rgbd = open3d::geometry::RGBDImage::CreateFromColorAndDepth(
+                    o3d_color,
+                    o3d_depth,
+                    /*depth_scale*/1.0,
+                    /*depth_trunc*/std::numeric_limits<double>::max(),
+                    /*convert_rgb_to_intensity*/false);
+                if(!rgbd)
+                {
+                    std::cerr << "[TSDF] integrate_rgbd_window: failed to create RGBD image for frame " << f << std::endl;
+                    continue;
+                }
+
+                // Compute world pose for this frame: Twc_world = Twc_rel * Twc_anchor
+                const Sophus::SE3f Twc_rel = get_relative_Twc(f);
+                const Sophus::SE3f Twc_world = Twc_rel * Twc_anchor;
+                // Open3D expects extrinsic as Tcw (world -> camera)
+                const Sophus::SE3f Tcw_world = Twc_world.inverse();
+                Eigen::Matrix4d extrinsic = Tcw_world.matrix().cast<double>();
+
+                tsdf_volume->Integrate(*rgbd, intrinsic, extrinsic);
+            }
+        };
+
+        integrate_rgbd_window(samples, optimizedPose);
+        // 输出mesh顶点/面数日志
+        auto mesh = tsdf_volume->ExtractTriangleMesh();
+        const size_t v = mesh->vertices_.size(); 
+        const size_t f = mesh->triangles_.size();
+        std::cerr << "[TSDF] Extracted mesh vertices=" << v << " faces=" << f << std::endl;
+    }
+
     return result;
 }
 
@@ -355,6 +535,48 @@ VGGTPhase2Samples CollectVGGTPhase2Priors(KeyFrame* pKF, Map* pTargetMap)
     VGGTPhase2Samples result;
     if(!pKF || !pTargetMap)
         return result;
+
+    // Retrieve cached RGBD window for downstream dense usage
+    result.window_rgb = pKF->GetVGGTWindowRGB();
+    result.window_depth = pKF->GetVGGTWindowDepth();
+    result.window_img_width = pKF->GetVGGTWindowImgWidth();
+    result.window_img_height = pKF->GetVGGTWindowImgHeight();
+    result.window_frame_count = pKF->GetVGGTWindowFrameCount();
+    result.window_frame_ids = pKF->GetVGGTWindowFrameIds();
+    result.window_poses_twcs = pKF->GetVGGTWindowPosesTwc();
+    result.anchor_frame_id = pKF->GetVGGTFrameId();
+    if(result.window_frame_count <= 0 && result.window_img_width > 0 && result.window_img_height > 0)
+    {
+        const size_t rgb_stride = static_cast<size_t>(result.window_img_width) * static_cast<size_t>(result.window_img_height) * 3;
+        if(rgb_stride > 0 && !result.window_rgb.empty())
+        {
+            result.window_frame_count = static_cast<int>(result.window_rgb.size() / rgb_stride);
+        }
+        const size_t depth_stride = static_cast<size_t>(result.window_img_width) * static_cast<size_t>(result.window_img_height);
+        if(result.window_frame_count <= 0 && depth_stride > 0 && !result.window_depth.empty())
+        {
+            result.window_frame_count = static_cast<int>(result.window_depth.size() / depth_stride);
+        }
+    }
+
+    // Derive relative poses (camera-to-camera) using the last window pose as anchor
+    if(result.anchor_frame_id == 0 && !result.window_frame_ids.empty())
+    {
+        result.anchor_frame_id = result.window_frame_ids.back();
+    }
+    if(!result.window_poses_twcs.empty())
+    {
+        const Sophus::SE3f anchor_Twc = result.window_poses_twcs.back();
+        const Sophus::SE3f anchor_Tcw = anchor_Twc.inverse();
+        result.window_relative_poses.reserve(result.window_poses_twcs.size());
+        for(const auto &Twc : result.window_poses_twcs)
+        {
+            result.window_relative_poses.push_back(Twc * anchor_Tcw);
+        }
+    }
+
+    // Camera intrinsics (row-major) for downstream dense usage
+    result.K = pKF->GetCalibrationMatrix().cast<double>();
 
     const std::vector<VGGTDensePointRGBXYZ> vDenseWorld = pKF->GetVGGTDenseMapPoints();
     const std::vector<MapPoint*> vDenseRefs = pKF->GetVGGTDensePointRefs();
@@ -1164,6 +1386,28 @@ void VisualizeVGGTPhase2(const VGGTPhase2Samples& samples,
     cv::waitKey(1);
 }
 
+struct RunVGGTLBALocalTimer
+{
+    RunVGGTLBALocalTimer()
+        : start(std::chrono::steady_clock::now())
+    {
+    }
+
+    ~RunVGGTLBALocalTimer()
+    {
+        static std::atomic<int64_t> total_ns{0};
+        static std::atomic<int64_t> call_count{0};
+        const auto elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+        const auto count = call_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        const auto total = total_ns.fetch_add(elapsed_ns, std::memory_order_relaxed) + elapsed_ns;
+        const double avg_ms = static_cast<double>(total) / static_cast<double>(count) / 1e6;
+        std::cerr << "[RunVGGTLBALocal] average runtime: " << avg_ms << " ms over " << count << " calls" << std::endl;
+    }
+
+private:
+    std::chrono::steady_clock::time_point start;
+};
+
 bool RunVGGTLBALocal(KeyFrame* pKF,
                      bool* pbStopFlag,
                      Map* pMap,
@@ -1172,6 +1416,8 @@ bool RunVGGTLBALocal(KeyFrame* pKF,
                      int& num_MPs,
                      int& num_edges)
 {
+    RunVGGTLBALocalTimer timer;
+
     auto phase1_observations = CollectVGGTPhase1Priors(pKF, pMap);
     auto phase2_observations = CollectVGGTPhase2Priors(pKF, pMap);
     if(phase1_observations.empty() && phase2_observations.priors.empty() && phase2_observations.observations.empty())
@@ -6895,6 +7141,16 @@ void Optimizer::OptimizeEssentialGraph4DoF(Map* pMap, KeyFrame* pLoopKF, KeyFram
         pMP->UpdateNormalAndDepth();
     }
     pMap->IncreaseChangeIndex();
+}
+
+std::shared_ptr<open3d::pipelines::integration::ScalableTSDFVolume> GetOrCreateTSDFVolume()
+{
+    return GetOrCreateTSDFVolumeImpl();
+}
+
+std::shared_ptr<open3d::geometry::TriangleMesh> ExtractTSDFMeshCopy()
+{
+    return ExtractTSDFMeshCopyImpl();
 }
 
 } //namespace ORB_SLAM

@@ -26,6 +26,11 @@
 #include "LoopClosing.h"
 #include "Frame.h"
 
+#include <memory>
+
+namespace open3d { namespace geometry { class TriangleMesh; } }
+namespace open3d { namespace pipelines { namespace integration { class ScalableTSDFVolume; } } }
+
 #include <cmath>
 
 #include "Thirdparty/g2o/g2o/types/types_seven_dof_expmap.h"
@@ -111,6 +116,10 @@ public:
 
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW;
 };
+
+// TSDF accessors for visualization
+std::shared_ptr<open3d::pipelines::integration::ScalableTSDFVolume> GetOrCreateTSDFVolume();
+std::shared_ptr<open3d::geometry::TriangleMesh> ExtractTSDFMeshCopy();
 
 } //namespace ORB_SLAM3
 

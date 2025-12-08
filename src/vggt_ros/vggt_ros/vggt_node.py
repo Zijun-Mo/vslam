@@ -648,6 +648,63 @@ class VGGTNode(Node):
         cloud_msg.data = dense_cloud.reshape(-1).tolist()
         output_msg.window_point_cloud = cloud_msg
 
+        # Pack full RGB window (preprocessed, aligned with depth) and depth maps
+        window_h = 0
+        window_w = 0
+        # Depth comes as (S, H, W, 1) or (S, H, W)
+        depth_clean = depth
+        if depth_clean is None:
+            depth_clean = np.zeros((S, 0, 0), dtype=np.float32)
+        depth_clean = np.asarray(depth_clean)
+        if depth_clean.ndim == 4 and depth_clean.shape[-1] == 1:
+            depth_clean = depth_clean[..., 0]
+        if depth_clean.ndim >= 3:
+            window_h = int(depth_clean.shape[1]) if depth_clean.shape[1] is not None else 0
+            window_w = int(depth_clean.shape[2]) if depth_clean.shape[2] is not None else 0
+        if (window_h == 0 or window_w == 0) and preprocessed_images:
+            try:
+                window_h = int(preprocessed_images[0].shape[0])
+                window_w = int(preprocessed_images[0].shape[1])
+            except Exception:
+                window_h = 0
+                window_w = 0
+
+        # RGB: use preprocessed images (uint8) so they align with depth grid
+        window_images_msg = UInt8MultiArray()
+        if preprocessed_images and window_h > 0 and window_w > 0:
+            # Stack to (S, H, W, 3) in original temporal order (already latest-first?)
+            try:
+                img_stack = np.stack([
+                    cv2.resize(img, (window_w, window_h), interpolation=cv2.INTER_LINEAR)
+                    if img.shape[0] != window_h or img.shape[1] != window_w else img
+                    for img in preprocessed_images
+                ], axis=0).astype(np.uint8)
+                dim_img_s = MultiArrayDimension(label="S", size=img_stack.shape[0], stride=img_stack.size)
+                dim_img_h = MultiArrayDimension(label="H", size=window_h, stride=window_h * window_w * 3)
+                dim_img_w = MultiArrayDimension(label="W", size=window_w, stride=window_w * 3)
+                dim_img_c = MultiArrayDimension(label="C", size=3, stride=3)
+                window_images_msg.layout.dim = [dim_img_s, dim_img_h, dim_img_w, dim_img_c]
+                window_images_msg.data = img_stack.reshape(-1).tolist()
+            except Exception as e:
+                self.get_logger().warn(f"Failed to pack window_images: {e}")
+                window_images_msg.data = []
+        else:
+            window_images_msg.data = []
+        output_msg.window_images = window_images_msg
+
+        window_depths_msg = Float32MultiArray()
+        if window_h > 0 and window_w > 0:
+            dim_depth_s = MultiArrayDimension(label="S", size=depth_clean.shape[0], stride=depth_clean.size)
+            dim_depth_h = MultiArrayDimension(label="H", size=window_h, stride=window_h * window_w)
+            dim_depth_w = MultiArrayDimension(label="W", size=window_w, stride=window_w)
+            window_depths_msg.layout.dim = [dim_depth_s, dim_depth_h, dim_depth_w]
+            window_depths_msg.data = depth_clean.reshape(-1).astype(np.float32).tolist()
+        else:
+            window_depths_msg.data = []
+        output_msg.window_depths = window_depths_msg
+        output_msg.window_image_width = int(window_w)
+        output_msg.window_image_height = int(window_h)
+
         color_tensor = self.sample_track_colors(current_images, transforms, query_grid_width, query_grid_height, query_stride)
         color_msg = UInt8MultiArray()
         dim_s_color = MultiArrayDimension(label="S", size=color_tensor.shape[0], stride=color_tensor.shape[0] * color_tensor.shape[1] * 3)

@@ -34,6 +34,7 @@
 #include "Settings.h"
 
 #include <mutex>
+#include <cstdint>
 #include <opencv2/opencv.hpp>
 
 #include <boost/serialization/access.hpp>
@@ -401,6 +402,16 @@ public:
     std::vector<cv::Vec3b> mvVGGTTrackColors;
     // Dense window cloud flattened as [r,g,b,x,y,z]
     std::vector<float> mvVGGTWindowPointCloudRGBXYZ;
+    // Full window RGB (preprocessed) flattened [S, H, W, 3]
+    std::vector<uint8_t> mvVGGTWindowRGB;
+    // Full window depth flattened [S, H, W]
+    std::vector<float> mvVGGTWindowDepth;
+    int mVGGTWindowImgWidth{0};
+    int mVGGTWindowImgHeight{0};
+    int mVGGTWindowFrameCount{0};
+    std::vector<uint64_t> mvVGGTWindowFrameIds; // VGGT window frame ids (aligned with RGBD window)
+    std::vector<Sophus::SE3f> mvVGGTWindowPosesTwc; // VGGT window absolute poses Twc
+    uint64_t mVGGTFrameId{0}; // Current VGGT frame id corresponding to latest window element
     // Keyframe-only fused dense cache (camera RGBXYZ) and world-aligned map points
     std::vector<float> mvVGGTKeyframeDensePointCloudRGBXYZ;
     std::vector<VGGTDensePointRGBXYZ> mvpMapPointsDense;
@@ -411,7 +422,15 @@ public:
           const std::vector<long> &vTrackIds,
           const std::vector<cv::Point3f> &v3DPoints,
           const std::vector<cv::Vec3b> &vTrackColors,
-            const std::vector<float> &window_point_cloud,
+                    const std::vector<float> &window_point_cloud,
+                    const std::vector<uint8_t> &window_images,
+                    const std::vector<float> &window_depths,
+                    int window_image_width,
+                    int window_image_height,
+                    int window_image_count,
+                    const std::vector<uint64_t> &window_frame_ids,
+                    const std::vector<Sophus::SE3f> &window_pose_twcs,
+                    uint64_t window_frame_id_current,
           ORBextractor* extractor, ORBVocabulary* voc, 
           GeometricCamera* pCamera, cv::Mat &distCoef, 
           const float &bf, const float &thDepth, 
