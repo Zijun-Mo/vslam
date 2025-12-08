@@ -247,7 +247,7 @@ class EvalNode(Node):
                     ["seq_name", "run_id", "play_rate", "N", "rmse", "mean", "median", "std", "max", "min"]
                 )
             writer.writerow(row)
-        self.get_logger().info(f"[EvalNode] Wrote results to {csv_path}")
+        self.get_logger().info(f"[EvalNode] DONE Wrote results to {csv_path}")
 
     @staticmethod
     def _resolve_logs_dir() -> Path:
