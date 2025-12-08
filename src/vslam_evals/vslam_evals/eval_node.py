@@ -136,6 +136,7 @@ class EvalNode(Node):
         self.run_id = self.get_parameter("run_id").get_parameter_value().string_value
         self.play_rate = self._get_float_param("play_rate", 1.0)
         self.log_filename = self.get_parameter("log_filename").get_parameter_value().string_value or "evals_tum.csv"
+        self._shutdown_called = False
 
         if not self.groundtruth_path or not os.path.exists(self.groundtruth_path):
             self.get_logger().warn(f"groundtruth_path not set or not found: {self.groundtruth_path}")
@@ -174,19 +175,24 @@ class EvalNode(Node):
         self.get_logger().info("Received /vggt/model_ready; published /dataset_start")
 
     def done_callback(self, _msg: Empty) -> None:
+        if self._shutdown_called:
+            return
         # 等待 2 秒，确保最后一帧/日志写入完成再结束
         time.sleep(10.0)
 
         if not self.groundtruth_path or not os.path.exists(self.groundtruth_path):
             self.get_logger().error("Groundtruth file missing; cannot compute ATE.")
+            self._shutdown_once()
             return
         if not self.est_poses:
             self.get_logger().warn("No estimated poses received; skipping evaluation.")
+            self._shutdown_once()
             return
 
         gt = load_tum_trajectory(self.groundtruth_path)
         if not gt:
             self.get_logger().error(f"Failed to load GT from {self.groundtruth_path}")
+            self._shutdown_once()
             return
 
         gt_sorted = sorted(gt, key=lambda x: x[0])
@@ -194,6 +200,7 @@ class EvalNode(Node):
         pairs = associate_by_time(gt_sorted, est_sorted, self.max_time_diff)
         if not pairs:
             self.get_logger().warn("No timestamp associations found within max_time_diff.")
+            self._shutdown_once()
             return
 
         gt_sel = np.array([gt_sorted[i] for i, _ in pairs])
@@ -215,6 +222,7 @@ class EvalNode(Node):
         )
 
         self.write_csv(n, rmse, mean, median, std, max_err, min_err)
+        self._shutdown_once()
 
     def write_csv(self, n: int, rmse: float, mean: float, median: float, std: float, max_err: float, min_err: float) -> None:
         # Preferred location: <share>/vslam_evals/logs/evals_tum.csv
@@ -237,6 +245,7 @@ class EvalNode(Node):
                     ["seq_name", "run_id", "play_rate", "N", "rmse", "mean", "median", "std", "max", "min"]
                 )
             writer.writerow(row)
+        self.get_logger().info(f"[EvalNode] Wrote results to {csv_path}")
 
     @staticmethod
     def _resolve_logs_dir() -> Path:
@@ -286,6 +295,15 @@ class EvalNode(Node):
                 pass
         return ""
 
+    def _shutdown_once(self) -> None:
+        if self._shutdown_called:
+            return
+        self._shutdown_called = True
+        try:
+            rclpy.shutdown()
+        except Exception as exc:
+            self.get_logger().warn(f"rclpy.shutdown() failed: {exc}")
+
 
 def main(args=None) -> None:
     rclpy.init(args=args)
@@ -294,7 +312,10 @@ def main(args=None) -> None:
         rclpy.spin(node)
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
