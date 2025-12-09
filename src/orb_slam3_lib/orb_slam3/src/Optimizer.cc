@@ -33,6 +33,7 @@
 #include<future>
 #include <cstdint>
 #include <numeric>
+#include<iostream>
 #include <Eigen/Eigenvalues>
 #include <iostream>
 
@@ -1004,12 +1005,14 @@ void ApplyVGGTPhaseResult(KeyFrame* pKF,
     // Collect dense refs (unique) from phase2 observations for later write-back
     std::vector<MapPoint*> dense_refs;
     dense_refs.reserve(phase2Samples.priors.size());
+    std::unordered_set<MapPoint*> refs_seen;
+    refs_seen.reserve(phase2Samples.priors.size());
     for(const auto& prior : phase2Samples.priors)
     {
         MapPoint* pMP = prior.first;
         if(!pMP || pMP->isBad())
             continue;
-        if(std::find(dense_refs.begin(), dense_refs.end(), pMP) == dense_refs.end())
+        if(refs_seen.insert(pMP).second)
             dense_refs.push_back(pMP);
     }
 
@@ -1072,6 +1075,7 @@ void ApplyVGGTPhaseResult(KeyFrame* pKF,
 
     auto apply_observations = [&](const std::vector<VGGTPriorObservation>& observations)
     {
+        std::size_t applied = 0;
         for(const auto& obs : observations)
         {
             if(!obs.isNew)
@@ -1085,7 +1089,9 @@ void ApplyVGGTPhaseResult(KeyFrame* pKF,
             const Eigen::Vector3f Pw = Twc * obs.camPoint.cast<float>();
             pMP->SetWorldPos(Pw);
             pMP->UpdateNormalAndDepth();
+            ++applied;
         }
+        return applied;
     };
 
     apply_observations(phase1Observations);
@@ -1100,6 +1106,7 @@ void ApplyVGGTPhaseResult(KeyFrame* pKF,
     pKF->SetVGGTKeyframeDensePointCloud(dense_fused.fused_cam_rgbxyz);
     pKF->SetVGGTDensePointRefs(dense_refs);
     pMap->IncreaseChangeIndex();
+
 }
 
 void VisualizeVGGTPhase1(const std::vector<VGGTPriorObservation>& reused,
@@ -1408,6 +1415,48 @@ private:
     std::chrono::steady_clock::time_point start;
 };
 
+struct ScopedSectionTimerMs
+{
+    explicit ScopedSectionTimerMs(double& dst_ms)
+        : dst(dst_ms), start(std::chrono::steady_clock::now())
+    {
+    }
+
+    ~ScopedSectionTimerMs()
+    {
+        dst = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    }
+
+private:
+    double& dst;
+    std::chrono::steady_clock::time_point start;
+};
+
+struct RunVGGTLBALocalProfile
+{
+    double collect_phase1_ms{0.0};
+    double collect_phase2_ms{0.0};
+    double phase1_ms{0.0};
+    double apply_phase1_ms{0.0};
+    double phase2_ms{0.0};
+    double apply_phase2_ms{0.0};
+};
+
+static void LogRunVGGTLBALocalBreakdown(const RunVGGTLBALocalProfile& p,
+                                        const std::chrono::steady_clock::time_point& total_start)
+{
+    const double total_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - total_start).count();
+    std::cerr << "[RunVGGTLBALocal] breakdown (ms)"
+              << " collect_phase1=" << p.collect_phase1_ms
+              << " collect_phase2=" << p.collect_phase2_ms
+              << " phase1=" << p.phase1_ms
+              << " apply_phase1=" << p.apply_phase1_ms
+              << " phase2=" << p.phase2_ms
+              << " apply_phase2=" << p.apply_phase2_ms
+              << " total=" << total_ms
+              << std::endl;
+}
+
 bool RunVGGTLBALocal(KeyFrame* pKF,
                      bool* pbStopFlag,
                      Map* pMap,
@@ -1416,12 +1465,28 @@ bool RunVGGTLBALocal(KeyFrame* pKF,
                      int& num_MPs,
                      int& num_edges)
 {
+    const auto total_start = std::chrono::steady_clock::now();
     RunVGGTLBALocalTimer timer;
+    RunVGGTLBALocalProfile profile;
 
-    auto phase1_observations = CollectVGGTPhase1Priors(pKF, pMap);
-    auto phase2_observations = CollectVGGTPhase2Priors(pKF, pMap);
+    auto log_and_return = [&](bool result)
+    {
+        LogRunVGGTLBALocalBreakdown(profile, total_start);
+        return result;
+    };
+
+    std::vector<VGGTPriorObservation> phase1_observations;
+    {
+        ScopedSectionTimerMs t(profile.collect_phase1_ms);
+        phase1_observations = CollectVGGTPhase1Priors(pKF, pMap);
+    }
+    VGGTPhase2Samples phase2_observations;
+    {
+        ScopedSectionTimerMs t(profile.collect_phase2_ms);
+        phase2_observations = CollectVGGTPhase2Priors(pKF, pMap);
+    }
     if(phase1_observations.empty() && phase2_observations.priors.empty() && phase2_observations.observations.empty())
-        return false;
+        return log_and_return(false);
 
     std::vector<VGGTPriorObservation> reused;
     reused.reserve(phase1_observations.size());
@@ -1441,7 +1506,10 @@ bool RunVGGTLBALocal(KeyFrame* pKF,
     Sophus::SE3f phase1Pose = initialPose;
     if(!reused.empty())
     {
-        phase1Pose = RunVGGTPhase1(initialPose, reused, pbStopFlag, phase1_before, phase1_after, phase1_edges);
+        {
+            ScopedSectionTimerMs t(profile.phase1_ms);
+            phase1Pose = RunVGGTPhase1(initialPose, reused, pbStopFlag, phase1_before, phase1_after, phase1_edges);
+        }
         // VisualizeVGGTPhase1(reused, phase1_observations, initialPose, phase1Pose);
 
         if(pbStopFlag && *pbStopFlag)
@@ -1450,24 +1518,41 @@ bool RunVGGTLBALocal(KeyFrame* pKF,
             num_OptKF = 1;
             num_MPs = static_cast<int>(phase1_observations.size());
             num_edges = phase1_edges;
-            return true;
+            return log_and_return(true);
         }
-        ApplyVGGTPhase1Result(pKF, phase1_observations, phase1Pose, pMap);
+        {
+            ScopedSectionTimerMs t(profile.apply_phase1_ms);
+            ApplyVGGTPhase1Result(pKF, phase1_observations, phase1Pose, pMap);
+        }
+    }
+    if(!phase2_enabled){
+        num_fixedKF = 0;
+        num_OptKF = 1;
+        num_MPs = static_cast<int>(phase1_observations.size());
+        num_edges = phase1_edges;
+        return log_and_return(true);
     }
     if(!phase2_observations.observations.empty() || !phase2_observations.priors.empty())
     {
         double phase2_before = 0.0;
         double phase2_after = 0.0;
         int phase2_edges = 0;
-        const Sophus::SE3f phase2Pose = RunVGGTPhase2(pKF, phase2_observations, phase1Pose, pbStopFlag, pMap, phase2_before, phase2_after, phase2_edges);
-        ApplyVGGTPhaseResult(pKF, phase1_observations, phase2_observations, phase1Pose, phase2Pose, phase2_enabled, pMap);
+        Sophus::SE3f phase2Pose = phase1Pose;
+        {
+            ScopedSectionTimerMs t(profile.phase2_ms);
+            phase2Pose = RunVGGTPhase2(pKF, phase2_observations, phase1Pose, pbStopFlag, pMap, phase2_before, phase2_after, phase2_edges);
+        }
+        {
+            ScopedSectionTimerMs t(profile.apply_phase2_ms);
+            ApplyVGGTPhaseResult(pKF, phase1_observations, phase2_observations, phase1Pose, phase2Pose, phase2_enabled, pMap);
+        }
         num_fixedKF = 0;
         num_OptKF = 1;
         num_MPs = static_cast<int>(phase2_observations.observations.size());
         num_edges = phase2_edges;
-        return true;
+        return log_and_return(true);
     }
-    return false;
+    return log_and_return(false);
 }
 }
 
