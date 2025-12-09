@@ -1303,6 +1303,13 @@ bool RunVGGTLBALocal(KeyFrame* pKF,
             ApplyVGGTPhase1Result(pKF, phase1_observations, phase1Pose, pMap);
         }
     }
+    if(!phase2_enabled){
+        num_fixedKF = 0;
+        num_OptKF = 1;
+        num_MPs = static_cast<int>(phase1_observations.size());
+        num_edges = phase1_edges;
+        return log_and_return(true);
+    }
     if(!phase2_observations.observations.empty() || !phase2_observations.priors.empty())
     {
         double phase2_before = 0.0;
