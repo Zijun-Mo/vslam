@@ -442,19 +442,12 @@ class VGGTNode(Node):
         if not self.scale_enable:
             return result
 
-        if self.prev_keyframe_ids is None or self.prev_cam_positions is None:
-            self.global_scale = self.global_scale
+        if self.prev_keyframe_ids is None or self.prev_depth_medians is None:
             result["scale_applied"] = self.global_scale
             return result
 
-        # Previous window was already scaled by prev_window_scale; convert it back to raw scale
+        # Previous window was already scaled by prev_window_scale; convert depth stats back to raw scale
         prev_scale = max(self.prev_window_scale, 1e-6)
-        prev_cam_positions_raw = None
-        if self.prev_cam_positions is not None:
-            try:
-                prev_cam_positions_raw = np.asarray(self.prev_cam_positions, dtype=np.float32) / prev_scale
-            except Exception:
-                prev_cam_positions_raw = None
         depth_medians_prev_raw = None
         if self.prev_depth_medians is not None:
             try:
@@ -472,29 +465,8 @@ class VGGTNode(Node):
             result["scale_applied"] = self.global_scale
             return result
 
-        # Trajectory-based ratio using consecutive baselines on overlap frames
-        try:
-            cam_to_world_raw = closed_form_inverse_se3(extrinsic_np)
-            cam_positions_curr = cam_to_world_raw[:, :3, 3]
-        except Exception:
-            cam_positions_curr = None
-
-        traj_ratios = []
-        if cam_positions_curr is not None and prev_cam_positions_raw is not None:
-            # Sort overlap ids to respect temporal order
-            overlap_sorted = sorted(overlap_ids)
-            prev_pts = [prev_cam_positions_raw[prev_id_to_idx[k]] for k in overlap_sorted]
-            curr_pts = [cam_positions_curr[curr_id_to_idx[k]] for k in overlap_sorted]
-            prev_pts = np.asarray(prev_pts, dtype=np.float32)
-            curr_pts = np.asarray(curr_pts, dtype=np.float32)
-            if prev_pts.shape[0] >= 2:
-                prev_baseline = np.linalg.norm(np.diff(prev_pts, axis=0), axis=1)
-                curr_baseline = np.linalg.norm(np.diff(curr_pts, axis=0), axis=1)
-                for pb, cb in zip(prev_baseline, curr_baseline):
-                    if cb > 1e-6:
-                        traj_ratios.append(pb / cb)
-        traj_ratio = float(np.median(traj_ratios)) if traj_ratios else 1.0
-        result["traj_ratio"] = traj_ratio
+        # Trajectory-based ratio disabled; keep default
+        result["traj_ratio"] = 1.0
 
         # Depth-based ratio using per-frame medians
         depth_medians_prev = depth_medians_prev_raw
@@ -512,16 +484,11 @@ class VGGTNode(Node):
         result["depth_ratio"] = depth_ratio
 
         # Fuse ratios (median of available sources)
-        candidates = []
-        if traj_ratios:
-            candidates.append(traj_ratio)
-        if depth_ratios:
-            candidates.append(depth_ratio)
-        if not candidates:
+        if not depth_ratios:
             result["scale_applied"] = self.global_scale
             return result
 
-        fused_scale = float(np.median(candidates))
+        fused_scale = depth_ratio
         # Apply jump guard
         if fused_scale < self.scale_jump_lower or fused_scale > self.scale_jump_upper:
             result["publish"] = False

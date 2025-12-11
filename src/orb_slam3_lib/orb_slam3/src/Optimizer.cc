@@ -38,6 +38,8 @@
 #include <iostream>
 
 #include <open3d/Open3D.h>
+#include <open3d/core/Tensor.h>
+#include <open3d/t/pipelines/slam/Model.h>
 
 #include <opencv2/imgproc.hpp>
 #include <opencv2/highgui.hpp>
@@ -61,7 +63,8 @@ std::mutex g_fuse_cfg_mutex;
 VGGTDenseConfig g_fuse_cfg;
 
 std::mutex g_tsdf_mutex;
-std::shared_ptr<open3d::pipelines::integration::ScalableTSDFVolume> g_tsdf_volume;
+std::shared_ptr<open3d::t::pipelines::slam::Model> g_tsdf_volume;
+std::atomic<int> g_tsdf_frame_id{-1};
 
 VGGTDenseBAConfig GetDenseConfig()
 {
@@ -75,7 +78,7 @@ VGGTDenseConfig GetFusionConfig()
     return g_fuse_cfg;
 }
 
-std::shared_ptr<open3d::pipelines::integration::ScalableTSDFVolume> GetOrCreateTSDFVolumeImpl()
+std::shared_ptr<open3d::t::pipelines::slam::Model> GetOrCreateTSDFVolumeImpl()
 {
     std::lock_guard<std::mutex> lock(g_tsdf_mutex);
     if(!g_tsdf_volume)
@@ -83,12 +86,22 @@ std::shared_ptr<open3d::pipelines::integration::ScalableTSDFVolume> GetOrCreateT
         const VGGTDenseConfig cfg = GetFusionConfig();
         const double voxel_len = static_cast<double>(std::max(1e-4f, cfg.voxel_size));
         const double sdf_trunc = std::max(voxel_len * 4.0, 1e-3);
-        g_tsdf_volume = std::make_shared<open3d::pipelines::integration::ScalableTSDFVolume>(
-            voxel_len,
-            sdf_trunc,
-            open3d::pipelines::integration::TSDFVolumeColorType::RGB8);
-        std::cerr << "[VGGT TSDF] Initialized ScalableTSDFVolume voxel=" << voxel_len
-                  << " sdf_trunc=" << sdf_trunc << std::endl;
+        const int block_resolution = 16;
+        const int block_count = 20000; // 用户要求的预留 block 数量
+        const open3d::core::Device device("CPU:0");
+        const open3d::core::Tensor T_init = open3d::core::Tensor::Eye(4, open3d::core::Float64, device);
+        g_tsdf_volume = std::make_shared<open3d::t::pipelines::slam::Model>(
+            static_cast<float>(voxel_len),
+            block_resolution,
+            block_count,
+            T_init,
+            device);
+        g_tsdf_frame_id.store(-1); // 重置帧计数，保证后续 UpdateFramePose 单调递增
+        std::cerr << "[VGGT TSDF] Initialized tensor Model voxel=" << voxel_len
+                  << " sdf_trunc=" << sdf_trunc
+                  << " block_resolution=" << block_resolution
+                  << " block_count=" << block_count
+                  << " device=CPU:0" << std::endl;
     }
     return g_tsdf_volume;
 }
@@ -101,19 +114,37 @@ std::shared_ptr<open3d::geometry::TriangleMesh> ExtractTSDFMeshCopyImpl()
         std::cerr << "[TSDF] ExtractTSDFMeshCopyImpl: volume is null" << std::endl;
         return nullptr;
     }
-    auto mesh = g_tsdf_volume->ExtractTriangleMesh();
-    if(!mesh)
+
+    // Avoid crashing on empty TSDF (no fused frames yet)
+    if(g_tsdf_frame_id.load() < 0)
     {
-        std::cerr << "[TSDF] ExtractTSDFMeshCopyImpl: mesh extraction returned null" << std::endl;
+        std::cerr << "[TSDF] ExtractTSDFMeshCopyImpl: TSDF has no frames; skip mesh extraction" << std::endl;
+        return nullptr;
     }
-    else
+
+    try
     {
-        const size_t v = mesh->vertices_.size();
-        const size_t f = mesh->triangles_.size();
-        static std::atomic<int64_t> log_counter{0};
-        const int64_t tick = ++log_counter;
+        auto tmesh = g_tsdf_volume->ExtractTriangleMesh();
+        auto mesh = std::make_shared<open3d::geometry::TriangleMesh>(tmesh.ToLegacy());
+        if(mesh)
+        {
+            const size_t v = mesh->vertices_.size();
+            const size_t f = mesh->triangles_.size();
+            static std::atomic<int64_t> log_counter{0};
+            const int64_t tick = ++log_counter;
+            (void)v; (void)f; (void)tick;
+        }
+        else
+        {
+            std::cerr << "[TSDF] ExtractTSDFMeshCopyImpl: mesh extraction returned null" << std::endl;
+        }
+        return mesh;
     }
-    return mesh;
+    catch(const std::exception& e)
+    {
+        std::cerr << "[TSDF] ExtractTSDFMeshCopyImpl: ExtractTriangleMesh threw: " << e.what() << std::endl;
+        return nullptr;
+    }
 }
 
 struct VGGTPriorObservation
@@ -137,7 +168,7 @@ struct VGGTPhase2Samples
     int window_img_height{0};
     int window_frame_count{0};
     std::vector<uint64_t> window_frame_ids;      // VGGT window frame ids (aligned with window_rgb/depth)
-    std::vector<Sophus::SE3f> window_poses_twcs; // Absolute Twc for each VGGT window frame
+    std::vector<Sophus::SE3f> window_poses_twcs; // Window-local Twc for each VGGT window frame (not global)
     std::vector<Sophus::SE3f> window_relative_poses; // Relative pose to anchor frame (camera-to-camera)
     uint64_t anchor_frame_id{0};
     Eigen::Matrix3d K{Eigen::Matrix3d::Identity()};
@@ -364,7 +395,7 @@ static VGGTDenseFusionResult FuseDenseObservations(const VGGTPhase2Samples& samp
 
     {
         auto tsdf_volume = GetOrCreateTSDFVolume();
-        // Integrate VGGT RGBD window into global TSDF using optimized keyframe pose as anchor
+        // Integrate VGGT RGBD window into global TSDF (tensor API, CPU:0)
         auto integrate_rgbd_window = [&](const VGGTPhase2Samples& samples, const Sophus::SE3f& optimizedPose)
         {
             if(!tsdf_volume)
@@ -399,29 +430,43 @@ static VGGTDenseFusionResult FuseDenseObservations(const VGGTPhase2Samples& samp
                 return;
             }
 
-            // Prepare intrinsics
-            double fx = samples.K(0,0);
-            double fy = samples.K(1,1);
-            double cx = samples.K(0,2);
-            double cy = samples.K(1,2);
-            open3d::camera::PinholeCameraIntrinsic intrinsic(width, height, fx, fy, cx, cy);
+            const float depth_max = (GetFusionConfig().max_range > 0.0f && std::isfinite(GetFusionConfig().max_range)) ? GetFusionConfig().max_range : 10.0f;
 
-            // Anchor pose (optimized keyframe world pose): Tcw -> Twc
+            // Prepare intrinsics tensor (3x3) on CPU:0
+            const open3d::core::Device device("CPU:0");
+            const double fx = samples.K(0,0);
+            const double fy = samples.K(1,1);
+            const double cx = samples.K(0,2);
+            const double cy = samples.K(1,2);
+            if(!(std::isfinite(fx) && std::isfinite(fy)) || fx <= 0.0 || fy <= 0.0)
+            {
+                std::cerr << "[TSDF] integrate_rgbd_window: invalid intrinsics fx/fy (" << fx << ", " << fy << ")" << std::endl;
+                return;
+            }
+
+            std::vector<double> intrinsic_data{fx, 0.0, cx,
+                                               0.0, fy, cy,
+                                               0.0, 0.0, 1.0};
+            open3d::core::Tensor intrinsic_tensor(intrinsic_data, {3, 3}, open3d::core::Float64, device);
+
+            // Anchor pose: global keyframe Twc (from optimized Tcw)
             const Sophus::SE3f Twc_anchor = optimizedPose.inverse();
 
-            // Helper to fetch relative Twc from samples (computed against anchor window pose)
+            // Helper to fetch relative Twc from samples (camera-to-camera, relative to window anchor)
             auto get_relative_Twc = [&](int idx) -> Sophus::SE3f
             {
-                if(idx >= 0 && idx < static_cast<int>(samples.window_relative_poses.size()))
+                const int rel_count = static_cast<int>(samples.window_relative_poses.size());
+                if(idx >= 0 && idx < rel_count)
                 {
                     return samples.window_relative_poses[static_cast<size_t>(idx)];
                 }
-                // Fallback: recompute from absolute window poses if available
+                // Fallback: recompute relative pose from window-local Twc list
                 if(!samples.window_poses_twcs.empty())
                 {
                     const size_t anchor_idx = samples.window_poses_twcs.size() - 1;
                     const Sophus::SE3f anchor_Tcw = samples.window_poses_twcs[anchor_idx].inverse();
-                    if(idx >= 0 && idx < static_cast<int>(samples.window_poses_twcs.size()))
+                    const int window_count = static_cast<int>(samples.window_poses_twcs.size());
+                    if(idx >= 0 && idx < window_count)
                     {
                         return samples.window_poses_twcs[static_cast<size_t>(idx)] * anchor_Tcw;
                     }
@@ -444,45 +489,78 @@ static VGGTDenseFusionResult FuseDenseObservations(const VGGTPhase2Samples& samp
                     break;
                 }
 
-                open3d::geometry::Image o3d_color;
-                o3d_color.Prepare(width, height, 3, sizeof(uint8_t));
-                std::copy_n(samples.window_rgb.data() + rgb_offset, rgb_stride, o3d_color.data_.begin());
-
-                open3d::geometry::Image o3d_depth;
-                o3d_depth.Prepare(width, height, 1, sizeof(float));
-                const float* depth_src = samples.window_depth.data() + depth_offset;
-                float* depth_dst = reinterpret_cast<float*>(o3d_depth.data_.data());
-                std::copy_n(depth_src, depth_stride, depth_dst);
-
-                auto rgbd = open3d::geometry::RGBDImage::CreateFromColorAndDepth(
-                    o3d_color,
-                    o3d_depth,
-                    /*depth_scale*/1.0,
-                    /*depth_trunc*/std::numeric_limits<double>::max(),
-                    /*convert_rgb_to_intensity*/false);
-                if(!rgbd)
+                // Build frame with tensor-based images
+                open3d::t::pipelines::slam::Frame frame(height, width, intrinsic_tensor, device);
+                std::vector<uint8_t> color_vec(samples.window_rgb.begin() + static_cast<std::ptrdiff_t>(rgb_offset),
+                                                samples.window_rgb.begin() + static_cast<std::ptrdiff_t>(rgb_offset + rgb_stride));
+                std::vector<float> depth_vec(samples.window_depth.begin() + static_cast<std::ptrdiff_t>(depth_offset),
+                                              samples.window_depth.begin() + static_cast<std::ptrdiff_t>(depth_offset + depth_stride));
+                const std::size_t valid_depth_px = static_cast<std::size_t>(std::count_if(depth_vec.begin(), depth_vec.end(), [&](float d){
+                    return std::isfinite(d) && d > 0.0f && d <= depth_max;
+                }));
+                if(valid_depth_px == 0)
                 {
-                    std::cerr << "[TSDF] integrate_rgbd_window: failed to create RGBD image for frame " << f << std::endl;
+                    std::cerr << "[TSDF] integrate_rgbd_window: skip frame " << f << " (no depth within (0," << depth_max << "] )" << std::endl;
                     continue;
                 }
+                open3d::core::Tensor color_tensor_uint8(color_vec, {height, width, 3}, open3d::core::UInt8, device);
+                // Open3D tensor TSDF expects (float, float) or (uint16, uint8); we use float/float path
+                open3d::core::Tensor color_tensor = color_tensor_uint8.To(open3d::core::Float32) / 255.0f;
+                open3d::core::Tensor depth_tensor(depth_vec, {height, width, 1}, open3d::core::Float32, device);
+                frame.SetData("color", color_tensor);
+                frame.SetData("depth", depth_tensor);
 
-                // Compute world pose for this frame: Twc_world = Twc_rel * Twc_anchor
+                // Compute world pose for this frame using anchor world pose
                 const Sophus::SE3f Twc_rel = get_relative_Twc(f);
-                const Sophus::SE3f Twc_world = Twc_rel * Twc_anchor;
-                // Open3D expects extrinsic as Tcw (world -> camera)
+                // Twc_rel 是相对于窗口锚点的相机位姿（窗口系），Twc_anchor 是锚点在全局的位姿，
+                // 先把窗口系位姿左乘全局锚点，得到该帧的全局 Twc。
+                const Sophus::SE3f Twc_world = Twc_anchor * Twc_rel;
                 const Sophus::SE3f Tcw_world = Twc_world.inverse();
-                Eigen::Matrix4d extrinsic = Tcw_world.matrix().cast<double>();
+                const Eigen::Matrix4d Tcw_mat = Tcw_world.matrix().cast<double>();
+                std::vector<double> pose_data(Tcw_mat.data(), Tcw_mat.data() + 16);
+                open3d::core::Tensor pose_tensor(pose_data, {4, 4}, open3d::core::Float64, device);
+                const int frame_id = g_tsdf_frame_id.fetch_add(1) + 1; // enforce monotonic frame ids
+                tsdf_volume->UpdateFramePose(frame_id, pose_tensor);
 
-                tsdf_volume->Integrate(*rgbd, intrinsic, extrinsic);
+                try
+                {
+                    tsdf_volume->Integrate(frame,
+                                           /*depth_scale*/1.0f,
+                                           depth_max, 
+                                            /*trunc_voxel_multiplier*/8.0f);
+                }
+                catch(const std::exception& e)
+                {
+                    std::cerr << "[TSDF] Integrate failed on frame " << f << " (id=" << frame_id << "): "
+                              << e.what() << std::endl;
+                }
             }
         };
 
-        integrate_rgbd_window(samples, optimizedPose);
-        // 输出mesh顶点/面数日志
-        auto mesh = tsdf_volume->ExtractTriangleMesh();
-        const size_t v = mesh->vertices_.size(); 
-        const size_t f = mesh->triangles_.size();
-        std::cerr << "[TSDF] Extracted mesh vertices=" << v << " faces=" << f << std::endl;
+        try
+        {
+            integrate_rgbd_window(samples, optimizedPose);
+
+            // After fusion, extract mesh once for logging (no GetActiveIndices to avoid empty-key crash).
+            try
+            {
+                auto mesh = tsdf_volume->ExtractTriangleMesh();
+                auto mesh_legacy = mesh.ToLegacy();
+                const size_t v = mesh_legacy.vertices_.size();
+                const size_t f = mesh_legacy.triangles_.size();
+                std::cerr << "[TSDF] Mesh after fusion: "
+                          << v << " vertices, "
+                          << f << " triangles" << std::endl;
+            }
+            catch(const std::exception& e)
+            {
+                std::cerr << "[TSDF] Mesh extraction after fusion failed: " << e.what() << std::endl;
+            }
+        }
+        catch(const std::exception& e)
+        {
+            std::cerr << "[TSDF] Fusion failed: " << e.what() << std::endl;
+        }
     }
 
     return result;
@@ -910,6 +988,23 @@ Sophus::SE3f RunVGGTPhase2(KeyFrame* pKF,
     target->EstimateNormals(open3d::geometry::KDTreeSearchParamHybrid(icp_max_corr, 30));
     const Eigen::Matrix4d init_Twc = initialPose.inverse().matrix().cast<double>();
     source->EstimateNormals(open3d::geometry::KDTreeSearchParamHybrid(icp_max_corr, 30));
+    auto ensure_normals = [&](std::shared_ptr<open3d::geometry::PointCloud>& cloud) -> bool
+    {
+        if(cloud->points_.empty())
+            return false;
+        if(!cloud->HasNormals() || cloud->normals_.size() != cloud->points_.size())
+            cloud->EstimateNormals(open3d::geometry::KDTreeSearchParamHybrid(icp_max_corr, 30));
+        if(!cloud->HasNormals() || cloud->normals_.size() != cloud->points_.size())
+            cloud->normals_.assign(cloud->points_.size(), Eigen::Vector3d::Zero());
+        return cloud->HasNormals() && cloud->normals_.size() == cloud->points_.size();
+    };
+    if(!ensure_normals(target) || !ensure_normals(source))
+    {
+        chi2_before = 0.0;
+        chi2_after = 0.0;
+        edge_count = 0;
+        return initialPose;
+    }
     const auto t_after_normals = std::chrono::steady_clock::now();
 
     auto to_ms = [](const auto& t0, const auto& t1) -> double
@@ -7228,7 +7323,7 @@ void Optimizer::OptimizeEssentialGraph4DoF(Map* pMap, KeyFrame* pLoopKF, KeyFram
     pMap->IncreaseChangeIndex();
 }
 
-std::shared_ptr<open3d::pipelines::integration::ScalableTSDFVolume> GetOrCreateTSDFVolume()
+std::shared_ptr<open3d::t::pipelines::slam::Model> GetOrCreateTSDFVolume()
 {
     return GetOrCreateTSDFVolumeImpl();
 }

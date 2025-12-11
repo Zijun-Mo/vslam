@@ -5,6 +5,7 @@ set(ORB_SLAM3_SRC_DIR ${PROJECT_SOURCE_DIR}/src/orb_slam3/src)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -O3")
+add_compile_definitions(_GLIBCXX_USE_CXX11_ABI=1)
 
 ## Export compile commands for clangd
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)

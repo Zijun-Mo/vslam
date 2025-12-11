@@ -22,6 +22,7 @@
 #include <pangolin/pangolin.h>
 #include <algorithm>
 #include <mutex>
+#include <chrono>
 
 #include <open3d/Open3D.h>
 #include "Optimizer.h"
@@ -197,7 +198,7 @@ void MapDrawer::DrawMapPoints()
     glEnd();
 }
 
-void MapDrawer::DrawVGGTDenseCloud(bool onlyActiveMap, size_t maxPoints, float pointSizeOverride)
+void MapDrawer::DrawVGGTDenseCloud(bool onlyActiveMap, size_t maxPoints, float pointSizeOverride, int refreshMs)
 {
     Map* pActiveMap = mpAtlas->GetCurrentMap();
     if(!pActiveMap || maxPoints == 0)
@@ -210,72 +211,115 @@ void MapDrawer::DrawVGGTDenseCloud(bool onlyActiveMap, size_t maxPoints, float p
         maps.push_back(pActiveMap);
     }
 
-    // First pass to estimate density for decimation on the newest KF of each map.
-    size_t total_points = 0;
-    std::vector<KeyFrame*> latest_kfs;
-    latest_kfs.reserve(maps.size());
-    for(Map* pMap : maps)
+    const auto now = std::chrono::steady_clock::now();
+    const bool need_refresh = (refreshMs <= 0) ||
+        (mLastDenseFetch.time_since_epoch().count() == 0) ||
+        (std::chrono::duration_cast<std::chrono::milliseconds>(now - mLastDenseFetch).count() >= refreshMs);
+
+    if(need_refresh)
     {
-        if(!pMap)
-            continue;
-        const std::vector<KeyFrame*> kfs = pMap->GetAllKeyFrames();
-        KeyFrame* latest = nullptr;
-        for(KeyFrame* kf : kfs)
+        std::vector<VGGTDensePointRGBXYZ> refreshed;
+        // First pass to estimate density for decimation on the newest KF of each map.
+        size_t total_points = 0;
+        std::vector<KeyFrame*> latest_kfs;
+        latest_kfs.reserve(maps.size());
+        for(Map* pMap : maps)
         {
-            if(!kf)
+            if(!pMap)
                 continue;
-            if(!latest || kf->mnId > latest->mnId)
-                latest = kf;
+            const std::vector<KeyFrame*> kfs = pMap->GetAllKeyFrames();
+            KeyFrame* latest = nullptr;
+            for(KeyFrame* kf : kfs)
+            {
+                if(!kf)
+                    continue;
+                if(!latest || kf->mnId > latest->mnId)
+                    latest = kf;
+            }
+            if(latest)
+            {
+                latest_kfs.push_back(latest);
+                total_points += latest->GetVGGTDenseMapPoints().size();
+            }
         }
-        if(latest)
+
+        if(total_points > 0)
         {
-            latest_kfs.push_back(latest);
-            total_points += latest->GetVGGTDenseMapPoints().size();
+            const size_t stride = std::max<size_t>(1, total_points / maxPoints);
+            size_t idx = 0;
+            refreshed.reserve(std::min(maxPoints, total_points));
+            for(KeyFrame* kf : latest_kfs)
+            {
+                if(!kf)
+                    continue;
+                const std::vector<VGGTDensePointRGBXYZ> dense = kf->GetVGGTDenseMapPoints();
+                for(const auto& pt : dense)
+                {
+                    if((idx++ % stride) != 0)
+                        continue;
+                    if(refreshed.size() >= maxPoints)
+                        break;
+                    refreshed.push_back(pt);
+                }
+                if(refreshed.size() >= maxPoints)
+                    break;
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mMutexDenseCache);
+            mCachedDensePoints.swap(refreshed);
+            mLastDenseFetch = now;
         }
     }
 
-    if(total_points == 0)
+    std::lock_guard<std::mutex> lock(mMutexDenseCache);
+    if(mCachedDensePoints.empty())
         return;
 
-    const size_t stride = std::max<size_t>(1, total_points / maxPoints);
     const float point_size = pointSizeOverride > 0.0f ? pointSizeOverride : mPointSize;
 
     glPointSize(point_size);
     glBegin(GL_POINTS);
 
-    size_t emitted = 0;
-    size_t idx = 0;
-    for(KeyFrame* kf : latest_kfs)
+    for(const auto& pt : mCachedDensePoints)
     {
-        if(!kf)
-            continue;
-        const std::vector<VGGTDensePointRGBXYZ> dense = kf->GetVGGTDenseMapPoints();
-        for(const auto& pt : dense)
-        {
-            if((idx++ % stride) != 0)
-                continue;
-            if(emitted >= maxPoints)
-                break;
-
-            glColor3f(pt.rgb[2] / 255.f, pt.rgb[1] / 255.f, pt.rgb[0] / 255.f);
-            glVertex3f(pt.xyz.x(), pt.xyz.y(), pt.xyz.z());
-            ++emitted;
-        }
-        if(emitted >= maxPoints)
-            break;
+        glColor3f(pt.rgb[2] / 255.f, pt.rgb[1] / 255.f, pt.rgb[0] / 255.f);
+        glVertex3f(pt.xyz.x(), pt.xyz.y(), pt.xyz.z());
     }
 
     glEnd();
 }
 
-void MapDrawer::DrawTSDFMesh(bool wireframe, size_t maxFaces, float lineWidth, float faceAlpha)
+void MapDrawer::DrawTSDFMesh(bool wireframe, size_t maxFaces, float lineWidth, float faceAlpha, int refreshMs)
 {
     if(maxFaces == 0)
     {
         return;
     }
 
-    auto mesh_ptr = ExtractTSDFMeshCopy();
+    const auto now = std::chrono::steady_clock::now();
+    const bool need_refresh = (refreshMs <= 0) ||
+        (mLastTSDFFetch.time_since_epoch().count() == 0) ||
+        (std::chrono::duration_cast<std::chrono::milliseconds>(now - mLastTSDFFetch).count() >= refreshMs);
+
+    if(need_refresh)
+    {
+        auto mesh_ptr = ExtractTSDFMeshCopy();
+        if(mesh_ptr)
+        {
+            std::lock_guard<std::mutex> lock(mMutexTSDFCache);
+            mCachedTSDFMesh = mesh_ptr;
+            mLastTSDFFetch = now;
+        }
+    }
+
+    std::shared_ptr<open3d::geometry::TriangleMesh> mesh_ptr;
+    {
+        std::lock_guard<std::mutex> lock(mMutexTSDFCache);
+        mesh_ptr = mCachedTSDFMesh;
+    }
+
     if(!mesh_ptr)
     {
         return;

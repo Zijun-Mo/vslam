@@ -26,7 +26,10 @@
 #include "Settings.h"
 #include<pangolin/pangolin.h>
 
+#include<chrono>
 #include<mutex>
+
+namespace open3d { namespace geometry { class TriangleMesh; } }
 
 namespace ORB_SLAM3
 {
@@ -44,8 +47,8 @@ public:
     Atlas* mpAtlas;
 
     void DrawMapPoints();
-    void DrawVGGTDenseCloud(bool onlyActiveMap, size_t maxPoints, float pointSizeOverride);
-    void DrawTSDFMesh(bool wireframe, size_t maxFaces, float lineWidth, float faceAlpha);
+    void DrawVGGTDenseCloud(bool onlyActiveMap, size_t maxPoints, float pointSizeOverride, int refreshMs = 0);
+    void DrawTSDFMesh(bool wireframe, size_t maxFaces, float lineWidth, float faceAlpha, int refreshMs = 0);
     void DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const bool bDrawInertialGraph, const bool bDrawOptLba);
     void DrawCurrentCamera(pangolin::OpenGlMatrix &Twc);
     void SetCurrentCameraPose(const Sophus::SE3f &Tcw);
@@ -74,6 +77,15 @@ private:
     Sophus::SE3f mCameraPose;
 
     std::mutex mMutexCamera;
+
+    // Cached dense cloud / TSDF mesh for viewer throttling
+    std::vector<VGGTDensePointRGBXYZ> mCachedDensePoints;
+    std::chrono::steady_clock::time_point mLastDenseFetch;
+    std::mutex mMutexDenseCache;
+
+    std::shared_ptr<open3d::geometry::TriangleMesh> mCachedTSDFMesh;
+    std::chrono::steady_clock::time_point mLastTSDFFetch;
+    std::mutex mMutexTSDFCache;
 
     // Stored trajectory poses for non-keyframes (and optionally keyframes) in world coordinates Twc
     std::vector<Sophus::SE3f, Eigen::aligned_allocator<Sophus::SE3f>> mFrameTrajectory;

@@ -187,6 +187,8 @@ void Viewer::Run()
     pangolin::Var<bool> menuDenseActiveOnly("menu.Dense Active Map",true,true);
     pangolin::Var<int> menuDenseMaxPoints("menu.Dense Max Points",200000,1000,2000000);
     pangolin::Var<float> menuDensePointSize("menu.Dense Point Size",mpMapDrawer->GetPointSize(),0.1f,10.0f);
+    pangolin::Var<int> menuDenseRefreshMs("menu.Dense Refresh (ms)", 200, 0, 5000);
+    pangolin::Var<int> menuTSDFRefreshMs("menu.TSDF Refresh (ms)", 500, 0, 5000);
     pangolin::Var<bool> menuShowTSDF("menu.Show TSDF Mesh", false, true);
     pangolin::Var<bool> menuTSDFWireframe("menu.TSDF Wireframe", false, true);
     pangolin::Var<int> menuTSDFMaxFaces("menu.TSDF Max Faces", 200000, 1000, 2000000);
@@ -328,14 +330,16 @@ void Viewer::Run()
         {
             const size_t max_dense = static_cast<size_t>(std::max(0, static_cast<int>(menuDenseMaxPoints.Get())));
             const float dense_size = static_cast<float>(menuDensePointSize.Get());
-            mpMapDrawer->DrawVGGTDenseCloud(menuDenseActiveOnly, max_dense, dense_size);
+            const int dense_refresh_ms = std::max(0, static_cast<int>(menuDenseRefreshMs.Get()));
+            mpMapDrawer->DrawVGGTDenseCloud(menuDenseActiveOnly, max_dense, dense_size, dense_refresh_ms);
         }
         if(menuShowTSDF)
         {
             const size_t max_faces = static_cast<size_t>(std::max(0, static_cast<int>(menuTSDFMaxFaces.Get())));
             const float line_w = static_cast<float>(menuTSDFLineWidth.Get());
             const float alpha = static_cast<float>(menuTSDFAlpha.Get());
-            mpMapDrawer->DrawTSDFMesh(menuTSDFWireframe.Get(), max_faces, line_w, alpha);
+            const int tsdf_refresh_ms = std::max(0, static_cast<int>(menuTSDFRefreshMs.Get()));
+            mpMapDrawer->DrawTSDFMesh(menuTSDFWireframe.Get(), max_faces, line_w, alpha, tsdf_refresh_ms);
         }
         // Draw stored non-keyframe trajectory points (does not affect map points)
         mpMapDrawer->DrawFrameTrajectory();
@@ -364,7 +368,8 @@ void Viewer::Run()
         }
 
         cv::imshow("ORB-SLAM3: Current Frame",toShow);
-        cv::waitKey(mT);
+        // Keep UI responsive; dense/TSDF grabbing is throttled separately
+        cv::waitKey(static_cast<int>(mT));
 
         if(menuReset)
         {

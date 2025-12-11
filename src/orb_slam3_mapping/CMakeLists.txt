@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.10)
 project(orb_slam3_mapping)
+add_compile_definitions(_GLIBCXX_USE_CXX11_ABI=1)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -10,6 +11,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
+find_package(libstatistics_collector REQUIRED)
 find_package(orb_slam3_lib REQUIRED)
 find_package(vslam_msgs REQUIRED)
 find_package(OpenCV REQUIRED)
@@ -27,6 +29,7 @@ target_include_directories(mapping_component PUBLIC
 ament_target_dependencies(mapping_component
   rclcpp
   rclcpp_components
+  libstatistics_collector
   orb_slam3_lib
   vslam_msgs
   OpenCV

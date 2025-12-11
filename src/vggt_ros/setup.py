@@ -1,4 +1,28 @@
 from setuptools import setup
+from setuptools.command.develop import develop as _develop
+
+
+class develop_cmd(_develop):
+    """Ignore colcon's extra develop flags (uninstall/editable/build-directory/script-dir)."""
+
+    user_options = _develop.user_options + [
+        ('uninstall', None, "Ignore uninstall for develop installs"),
+        ('editable', None, "Ignore editable flag"),
+        ('build-directory=', None, "Ignore build directory"),
+        ('script-dir=', None, "Ignore script dir"),
+    ]
+
+    def initialize_options(self):
+        super().initialize_options()
+        self.uninstall = None
+        self.editable = None
+        self.build_directory = None
+        self.script_dir = None
+
+    def run(self):
+        if getattr(self, 'uninstall', None):
+            return
+        super().run()
 import os
 from glob import glob
 
@@ -42,6 +66,7 @@ setup(
     description='ROS2 package for VGGT',
     license='GPLv3 + VGGT specific (see LICENSE.txt)',
     tests_require=['pytest'],
+    cmdclass={'develop': develop_cmd},
     entry_points={
         'console_scripts': [
             'vggt_node = vggt_ros.vggt_node:main',

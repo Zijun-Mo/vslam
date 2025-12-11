@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.5)
 project(orb_slam3_vggt_frontend)
+# Force new libstdc++ ABI to match ROS Humble and dependencies
+add_compile_definitions(_GLIBCXX_USE_CXX11_ABI=1)
 
 # Default to C++17
 if(NOT CMAKE_CXX_STANDARD)
@@ -17,6 +19,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
+find_package(libstatistics_collector REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
@@ -46,6 +49,7 @@ target_compile_definitions(vggt_frontend_component PRIVATE "COMPOSITION_BUILD")
 ament_target_dependencies(vggt_frontend_component
   rclcpp
   rclcpp_components
+  libstatistics_collector
   sensor_msgs
   geometry_msgs
   visualization_msgs
@@ -61,6 +65,16 @@ target_link_libraries(vggt_frontend_component
   ${Pangolin_LIBRARIES}
   ${GLEW_LIBRARIES}
   ${orb_slam3_lib_LIBRARIES}
+)
+
+# Ensure runtime can locate our local libs without manual LD_LIBRARY_PATH
+set_target_properties(vggt_frontend_component PROPERTIES
+  SKIP_BUILD_RPATH FALSE
+  SKIP_INSTALL_RPATH FALSE
+  BUILD_WITH_INSTALL_RPATH FALSE
+  BUILD_RPATH "\$ORIGIN;\$ORIGIN/../../orb_slam3_lib/lib;\$ORIGIN/../../vslam_msgs/lib"
+  INSTALL_RPATH "\$ORIGIN;\$ORIGIN/../../orb_slam3_lib/lib;\$ORIGIN/../../vslam_msgs/lib"
+  INSTALL_RPATH_USE_LINK_PATH TRUE
 )
 
 # Register the component

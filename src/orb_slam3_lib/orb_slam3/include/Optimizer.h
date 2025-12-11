@@ -29,7 +29,7 @@
 #include <memory>
 
 namespace open3d { namespace geometry { class TriangleMesh; } }
-namespace open3d { namespace pipelines { namespace integration { class ScalableTSDFVolume; } } }
+namespace open3d { namespace t { namespace pipelines { namespace slam { class Model; } } } }
 
 #include <cmath>
 
@@ -117,9 +117,13 @@ public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW;
 };
 
-// TSDF accessors for visualization
-std::shared_ptr<open3d::pipelines::integration::ScalableTSDFVolume> GetOrCreateTSDFVolume();
+// TSDF accessors for visualization / reset
+std::shared_ptr<open3d::t::pipelines::slam::Model> GetOrCreateTSDFVolume();
 std::shared_ptr<open3d::geometry::TriangleMesh> ExtractTSDFMeshCopy();
+void ResetTSDFVolume();
+
+// VGGT dense initialization helper (phase2 fusion + TSDF)
+void InitializeVGGTDenseAndTSDF(KeyFrame* pKF, Map* pMap);
 
 } //namespace ORB_SLAM3
 
