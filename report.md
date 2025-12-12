@@ -1,3 +1,53 @@
+# VGGT-VSLAM demo
+## 引入
+
+VGGT 模型的滑窗推理帧数有限，场景放大时无法一次性建模；高速度依赖大型 GPU，普通设备难以保持实时。为在大场景下降低算力负担，我们基于 VGGT 前端与 ORB-SLAM3 后端，采用 ROS2（Python VGGT + C++ ORB-SLAM3）实现 VSLAM demo。VGGT 提供的三类信息——位姿、帧间稀疏对齐、稠密点云——作为前端强先验，后端再用 BA/ICP 精化。
+
+- 位姿：作为 BA 初值，加速收敛、提高稳定性。
+- 稀疏对齐：已知帧间配准降低跨窗口 BA 的计算量。
+- 稠密点云：在先验下用 ICP 做精细定位与地图优化。
+
+为让局部对齐信息在全局持久化，我们控制 track 空间分布与关键帧频率，使上一关键帧落在当前滑窗内，并按投影 cell 编码继承全局 Track ID；新出现区域则分配新全局 ID 保持连贯。关键帧策略上，只有相对上一关键帧超过约 30% 点未匹配时才插帧并引入对齐约束，否则仅用 VGGT 位姿估计以减少冗余与噪声。
+
+## VGGT-VSLAM 架构总览
+
+### 组件与职责
+- `orb_slam3_vggt_frontend/src/vggt_frontend_node.cpp`：ROS2 组件节点，订阅 `/vggt/output`（`VggtOutput`），解析滑窗 3D/2D track、相机姿态和融合点云，构造 ORB-SLAM3 前端可用的特征、Track ID、颜色、VGGT 估计位姿增量，并将关键帧指针发布给后端 Mapping。
+- `orb_slam3_tracking/src/tracking_node.cpp`：基础 Tracking-only 节点（Monocular/RGBD/IMU），初始化 `System` 并转发关键帧指针；VGGT 模式下主要逻辑在 `Tracking::GrabImageVGGT/TrackVGGT`。
+- `orb_slam3_lib/orb_slam3/src/Tracking.cc`：VGGT 专用前端逻辑（Track ID 关联、VGGT 位姿种子、区域覆盖判定、关键帧生成）和稠密缓存管理。
+- `orb_slam3_lib/orb_slam3/src/Optimizer.cc`：引入 VGGT 稠密/稀疏本地 BA，两阶段求解（Phase1 位姿+稀疏 MapPoint 先验，Phase2 可选的点到平面稠密 ICP），以及稠密点体素融合。
+
+### 关键数据流（时序）
+1. **VGGT 输出 → Frontend**：`VggtFrontendNode::VggtCallback` 将最新帧图像转灰度，解析 `tracks_3d/tracks_2d` 和 `tracks_mask`，恢复 stride 网格上的 `(u,v)`，生成 `KeyPoint`、全局 Track ID、对应 3D 点（VGGT 世界系）与颜色；从 `camera_poses` 构建滑窗 `PoseWindow` 并计算相邻窗口的 `delta_pose`（SE(3)）。
+2. **世界对齐与位姿增量**：节点维护 `world_from_vggt_`，若滑窗有重叠则用重叠帧求对齐矩阵并累计；将 VGGT 增量转换到 SLAM 世界系后传入 Tracking。
+3. **进入 Tracking**：`Tracking::GrabImageVGGT` 接收灰度图、特征/Track ID/3D 点、颜色、滑窗姿态、可见性遮罩、稠密点云等，记录 `mVGGTDeltaT`，创建 `Frame`（包含 `mvTrackIds`、`mvVGGT3Dpoints` 与稠密缓存），然后调用 `TrackVGGT`。
+4. **位姿种子与匹配**：`TrackVGGT` 先尝试用滑窗相对姿态对最后关键帧做种子，否则累积 `mVGGTDeltaT`；`MatchByTrackIds()` 用全局 Track ID 将上一帧 MapPoint 直接关联到当前帧，匹配分布再按 20×15 区域覆盖率筛选，避免局部退化。
+5. **关键帧策略**：`NeedNewKeyFrameVGGT` 结合帧间距、LocalMapping 状态、区域覆盖、新点比例、以及 VGGT delta 的运动幅度决定插帧；`CreateNewKeyFrameVGGT` 在插帧前调用 `PopulateFrameDenseStorage` 与 `FuseVGGTKeyframeDenseCache` 将稠密点体素融合后写入 KeyFrame 缓存，并通过回调发布给 Mapping。
+6. **稠密/稀疏优化**：Local Mapping 调用 `RunVGGTLBALocal`（`Optimizer.cc`）：
+	- **Phase1**（始终开启）：仅使用“可复用”的历史 MapPoint 先验，建立 `EdgeVGGTDistance`（MapPoint 固定，优化相机位姿）三维残差；若无先验则跳过。优化后将新先验写回世界系，并更新当前 KF 位姿。
+	- **Phase2**（可配，默认启用）：对稠密观测做 `phase2_max_edges` 限制；从现有 VGGT MapPoint 里按 1m 内均匀、1/r^3 加权重采样最多 `4×phase2_max_edges` 作为目标，调用 Open3D Colored ICP（不是 g2o 边）在相机系观测与世界系目标间求位姿。阈值由 `phase2_radius`（对应 ICP 最大对应距离）和 `phase2_voxel_size` 控制。ICP 结果用于：1）融合稠密观测+先验生成体素滤波后的彩色点云；2）更新/扩充 VGGT MapPoint、关键帧稠密缓存和位姿。
+	- 结果：KeyFrame 位姿与稠密彩色点云更新，稀疏先验 + 稠密 ICP 联合提升鲁棒性与尺度稳定性。
+
+## 主要算法
+- **Track ID 跨窗复用与网格编码**：前端滑窗为特征分配全局 Track ID；`Tracking` 以 `mVGGTTrackIdToMP` 持久化 ID→MapPoint，并用 20×15 网格编码（`LookupVGGTGridGlobalId/InsertVGGTGridMapping`）。`CreateNewKeyFrameVGGT` 重置消费状态、继承上一 KF 的全局 ID 与可见性，保证滑窗外仍能复用同一 MapPoint，减少重复建图。
+- **位姿种子链路与增量积累**：优先使用滑窗重叠帧相对姿态作为种子；否则累计 `mVGGTDeltaT` 左乘到上一 KF 世界位姿得到当前播种。`mAccumulatedVGGTMotion` 连续保存关键帧间运动，长期抑制漂移；无先验再退回速度模型。
+- **关键帧判定与继承**：`NeedNewKeyFrameVGGT` 以可见度和帧间隔双阈值（可见度<0.3 或间隔≥7 强触发；可见度<0.7 或间隔≥2 且 LocalMapping 空闲时软触发）。插帧前 `FuseVGGTKeyframeDenseCache` 体素融合当前稠密；插帧时继承上一 KF 的稠密点引用与全局 Track ID，并合并上一 KF 的稠密点云，保证后端 Phase1/Phase2 有可用先验。
+- **稠密体素融合（前后端一致）**：`FuseVGGTKeyframeDenseCache` 将稠密观测按体素聚类，聚合 RGB/空间均值生成压缩彩色点云；缓存到 KF 与 Tracking 一致的体素逻辑，既降噪又保持尺度一致，为 Phase2 与地图更新提供统一输入。
+- **Phase1 位姿优化（稀疏先验）**：`CollectVGGTPhase1Priors` 仅收集非新增（`isNew==0`）的 MapPoint 作为 reused 先验；构建三维残差 `EdgeVGGTDistance`，Huber 阈值 $\sqrt{7.815}$，仅优化相机位姿：
+	$\displaystyle \min_{R,t}\sum_i \rho\big(\|R P_i^{w}+t - p_i^{c}\|_2^2\big)$。
+无 reused 先验则直接跳过。`ApplyVGGTPhase1Result` 将新先验写回世界坐标并更新 KF 姿态。
+- **Phase2 彩色 ICP（稠密对齐）**：`CollectVGGTPhase2Priors` 先用缓存的相机系稠密样本（stride=6，含 RGB+xyz）作为观测，再补齐超出的稠密引用点并用当前姿态投到相机系；继承上一 KF 的稠密 refs 确保有目标。目标点从 VGGT MapPoint 中按 1m 内均匀、1/r³ 加权采样，源观测子采样并受 `phase2_max_edges` 限制（最多 4×目标）。`RunVGGTPhase2` 调用 Open3D Colored ICP（阈值受 `phase2_radius`、`phase2_voxel_size`）最小化
+	$\displaystyle E(T)=\sum_j w_g\|p_j - T q_j\|_2^2 + w_c\,\|I(p_j)-I(q_j)\|_2^2$，
+输出姿态用于 `ApplyVGGTPhaseResult` 更新 KF 位姿、融合稠密观测+先验、并扩充或更新 VGGT MapPoint。
+
+---
+
+## 问题与解决
+- **滑窗外对齐易失效**：用双阈值插帧（可见度<0.3 或间隔≥7 强触发；可见度<0.7 或间隔≥2 且 LocalMapping 空闲才触发）保证上一 KF 落在滑窗内；`CreateNewKeyFrameVGGT` 继承上一 KF 的稠密 refs 与全局 Track ID，并通过网格 cell→ID 映射维持跨窗可复用的 MapPoint，防止对齐信息在滑窗外丢失。
+- **稀疏先验不足导致 Phase1 跳过**：`CollectVGGTPhase1Priors` 仅收集 `isNew==0` 的 MapPoint 作为 reused 先验；当全是新增点时 Phase1 自动跳过以抑制噪声。通过全局 Track ID 继承与网格复用，提升“可复用”占比，减少 Phase1 被跳过的几率。
+- **稠密 ICP 缺样/过载**：继承上一 KF 的稠密 refs，先用缓存的相机系稠密样本作为观测，再补齐引用点投到相机系；目标点按 1m 内、1/r³ 加权采样并受 `phase2_max_edges` 上限（源观测 ≤4×目标）约束，既避免无对应又控制 ICP 计算量。
+- **算力与实时性冲突**：`RunVGGTLBALocal` 若无 Phase1/2 先验直接返回；Phase1 仅在有 reused 先验时运行，Phase2 可通过 `SetVGGTPhase2Enabled` 全局关闭。计时日志只在执行时输出，前端重计算与后端轻优化解耦，降低常态算力占用。
+
 # 面向 7-Scenes 数据集的 vSLAM 评估流水线
 
 ## 评估系统架构概览
