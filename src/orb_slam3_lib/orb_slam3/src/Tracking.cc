@@ -5428,7 +5428,7 @@ bool Tracking::NeedNewKeyFrameVGGT()
     }
 
     // Soft trigger: moderate visibility drop, only when local mapping is idle
-    if(last_visibility >= 0.0f && last_visibility < 0.7f && local_idle)
+    if(((last_visibility >= 0.0f && last_visibility < 0.7f) || frames_since_kf >= 2) && local_idle)
     {
         return true;
     }
