@@ -2,17 +2,20 @@ import cv2
 import numpy as np
 
 class KeyframeSelector:
-    def __init__(self, window_size=8, min_parallax=10.0):
+    def __init__(self, window_size=8, min_parallax=10.0, max_gap=10):
         """
         Args:
             window_size (int): Number of keyframes to keep in the window.
             min_parallax (float): Minimum average pixel displacement (optical flow) to select a new keyframe.
                                   Values <= 1 are treated as a fraction of the image diagonal (e.g. 0.1 = 10%).
+            max_gap (int): Force adding a keyframe if the gap exceeds this many frames.
         """
         self.window_size = window_size
         self.min_parallax = min_parallax
+        self.max_gap = max(1, int(max_gap))
         self.keyframes = [] # List of (cv_image, header)
         self.last_keyframe_gray = None
+        self.frames_since_last = 0
         
     def process_frame(self, cv_image, header):
         """
@@ -28,6 +31,12 @@ class KeyframeSelector:
         
         if not self.keyframes:
             # First frame is always a keyframe
+            self.add_keyframe(cv_image, header, gray)
+            return True
+        
+        # Enforce maximum gap between keyframes
+        self.frames_since_last += 1
+        if self.frames_since_last >= self.max_gap:
             self.add_keyframe(cv_image, header, gray)
             return True
             
@@ -51,6 +60,7 @@ class KeyframeSelector:
     def add_keyframe(self, cv_image, header, gray):
         self.keyframes.append((cv_image, header))
         self.last_keyframe_gray = gray
+        self.frames_since_last = 0
         
         # Maintain window size
         if len(self.keyframes) > self.window_size:

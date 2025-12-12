@@ -4893,7 +4893,7 @@ void Tracking::FuseVGGTKeyframeDenseCache(Frame &frame)
     const Eigen::Vector3f twc = Twc.translation();
 
     const float voxel_base = std::max(1e-4f, mVGGTDenseConfig.voxel_size);
-    const int min_points = std::max(1, mVGGTDenseConfig.min_points_per_voxel);
+    const int min_points = 8;
     const float max_range = (mVGGTDenseConfig.max_range > 0.0f) ? mVGGTDenseConfig.max_range : std::numeric_limits<float>::max();
 
     struct VoxelKey

@@ -9,7 +9,53 @@ VGGT 模型的滑窗推理帧数有限，场景放大时无法一次性建模；
 
 为让局部对齐信息在全局持久化，我们控制 track 空间分布与关键帧频率，使上一关键帧落在当前滑窗内，并按投影 cell 编码继承全局 Track ID；新出现区域则分配新全局 ID 保持连贯。关键帧策略上，只有相对上一关键帧超过约 30% 点未匹配时才插帧并引入对齐约束，否则仅用 VGGT 位姿估计以减少冗余与噪声。
 
-## VGGT-VSLAM 架构总览
+## 项目总览
+本仓库将 **ORB-SLAM3** 后端与 **VGGT（Visual Geometry Grounded Transformer）** 前端融合，在 ROS2（Humble）下提供可扩展的 VSLAM 原型：VGGT 提供快速几何先验（内外参/深度/点/跟踪/位姿窗口），ORB-SLAM3 负责关键帧管理、（可选）回环与地图维护，并在本地优化阶段引入“稀疏先验 + 稠密 ICP”的两阶段精修。
+
+### 核心特性
+- **VGGT 前端**：滑窗推理位姿/内参/深度/点图/轨迹，为 Tracking/Mapping 提供强先验。
+- **ORB-SLAM3 后端**：成熟的关键帧、地图与优化框架，承担持续建图与位姿输出。
+- **ROS2 原生解耦**：Frontend/Tracking/Mapping/Eval/Player 节点拆分，便于分布式或异构部署。
+- **评估链路**：提供 TUM 与 7-Scenes 在线 ATE 评估与 CSV 日志。
+
+### 代码结构速览
+```text
+src/
+	orb_slam3_driver/        # Python 驱动示例节点（单目 EuRoC 测试）
+	orb_slam3_lib/           # ORB-SLAM3 源码与第三方库 (DBoW2, g2o, Sophus)
+	orb_slam3_tracking/      # Tracking 节点 (C++)
+	orb_slam3_mapping/       # Mapping 节点 (C++)
+	orb_slam3_vggt_frontend/ # VGGT 前端集成 (C++)
+	vggt_ros/                # VGGT 在 ROS2 中的 Python 接口封装
+	video_reader/            # 视频读入与摄像头参数示例
+	vslam_bringup/           # 系统级 launch / 参数汇总
+	vslam_msgs/              # 自定义消息类型 (KeyFramePtr 等)
+	vslam_evals/             # 在线评估节点与 launch（TUM/7-Scenes，ATE 统计与日志）
+tools/                     # 数据与评估工具脚本
+vggt/                      # 原始 VGGT Python 包及训练/示例脚本
+```
+
+### 参数调优
+参数集中在 `vslam_bringup/config/vslam_params.yaml`，也可运行时用 `ros2 param set <node> <name> <value>` 在线覆盖。按消费点分组：
+- `vggt_ros/vggt_node.py`（Python 前端，滑窗/尺度守护）：`model_name/device` 决定权重与推理设备；`window_size/min_parallax` 传入 `KeyframeSelector` 控制滑窗长度与插帧阈值（`keyframe_selector.py`）；`track_visibility_threshold` 用于可见性掩码，低于阈值的 track 被丢弃；`scale_enable/scale_min_overlap_ratio/scale_jump_lower/scale_jump_upper` 约束尺度融合：需要至少 `ceil(window_size*scale_min_overlap_ratio)` 个重叠帧才融合，融合尺度若跳变超出上下限则拒绝（见 `vggt_node.py` 中 scale fuse 分支）。
+- `orb_slam3_vggt_frontend/vggt_frontend_node.cpp`（C++ Frontend → Tracking/Optimizer）：
+	- 稠密融合：`dense.voxel_size/dense.min_points_per_voxel/dense.max_range` 设成 `VGGTDenseConfig`，下发给 `Tracking::SetVGGTDenseConfig` 与 `Optimizer::SetVGGTDenseConfig`，用于前端 `FuseVGGTKeyframeDenseCache` 与后端 `FuseDenseObservations` 的体素分箱、半径裁剪与最少点数门槛。
+	- Phase2 ICP：`enable_vggt_phase2` 调用 `Optimizer::SetVGGTPhase2Enabled`，在 `RunVGGTLBALocal` 里直接跳过 Phase2；`dense.phase2_radius`/`dense.phase2_max_edges` 写入 `VGGTDenseBAConfig`，限制 `RunVGGTPhase2` 的搜索半径与采样上限（源最多 `phase2_max_edges`，refs 最多 4×）。Phase2 体素分辨率继承 `dense.voxel_size`。
+	- 动态内参：`override_intrinsics_from_vggt` 开启后，在回调中用 `/vggt/output` 的 `intrinsic_avg` 覆盖 ORB；若当前地图点数少于 `min_map_points_for_intrinsic_update` 或相对变化 <5% 则跳过，避免早期抖动；首次无内参时允许小幅更新。
+	- 基础 ORB 参数：`voc_file/settings_file/use_viewer` 仅在节点启动时构造 ORB-SLAM3 `System`。
+- `Optimizer.cc`（后端）：`enable_vggt_phase2` 通过全局原子 `g_enable_vggt_phase2` 控制 `RunVGGTLBALocal`；`dense.*`、`phase2_*` 在 Phase1/Phase2 融合与采样处打印和使用（体素、范围、采样上限）。
+- 视频输入：`video_reader` 节点消费 `video_path/camera_name/use_sensor_data_qos/camera_info_url`，用于打开视频、选择 QoS 与加载标定（仅影响数据源，不改算法）。
+
+
+## VGGT-VSLAM 架构解析
+
+### 核心节点（ROS2）
+- `vggt_ros/vggt_node`（Python）：滑窗选帧、VGGT 推理、尺度守护，发布 `/vggt/output`（含稠密轨迹/点云/内参均值等）；就绪时在 `/vggt/model_ready` 发布一次性通知。
+- `orb_slam3_vggt_frontend/vggt_frontend_node`（C++）：消费 `/vggt/output`，将 VGGT 轨迹/点云/姿态变为 ORB-SLAM3 `TrackVGGT` 输入，并发布关键帧指针给 Mapping。
+- `orb_slam3_tracking/tracking_node`（C++）：初始化 `System` 并驱动 Tracking；VGGT 模式主要逻辑位于 `Tracking::GrabImageVGGT/TrackVGGT`。
+- `orb_slam3_mapping/mapping_node`（C++）：接收 KeyFramePtr/SystemPtr 启动后端线程，发布 `/vslam/pose_optimized`。
+- `vslam_evals/eval_node`（Python）：订阅 `/vslam/pose_optimized`，在 `/dataset_done` 后计算 ATE 并写 CSV；等待 `/vggt/model_ready` 后触发 `/dataset_start`。
+- 播放器：`tum_player/tum_player_node`（TUM `rgb.txt`）与 `vslam_evals/seven_scenes_player_node`（7-Scenes `*.color.png`），结束均发布 `/dataset_done`。
 
 ### 组件与职责
 - `orb_slam3_vggt_frontend/src/vggt_frontend_node.cpp`：ROS2 组件节点，订阅 `/vggt/output`（`VggtOutput`），解析滑窗 3D/2D track、相机姿态和融合点云，构造 ORB-SLAM3 前端可用的特征、Track ID、颜色、VGGT 估计位姿增量，并将关键帧指针发布给后端 Mapping。
@@ -28,7 +74,7 @@ VGGT 模型的滑窗推理帧数有限，场景放大时无法一次性建模；
 	- **Phase2**（可配，默认启用）：对稠密观测做 `phase2_max_edges` 限制；从现有 VGGT MapPoint 里按 1m 内均匀、1/r^3 加权重采样最多 `4×phase2_max_edges` 作为目标，调用 Open3D Colored ICP（不是 g2o 边）在相机系观测与世界系目标间求位姿。阈值由 `phase2_radius`（对应 ICP 最大对应距离）和 `phase2_voxel_size` 控制。ICP 结果用于：1）融合稠密观测+先验生成体素滤波后的彩色点云；2）更新/扩充 VGGT MapPoint、关键帧稠密缓存和位姿。
 	- 结果：KeyFrame 位姿与稠密彩色点云更新，稀疏先验 + 稠密 ICP 联合提升鲁棒性与尺度稳定性。
 
-## 主要算法
+### 主要算法
 - **Track ID 跨窗复用与网格编码**：前端滑窗为特征分配全局 Track ID；`Tracking` 以 `mVGGTTrackIdToMP` 持久化 ID→MapPoint，并用 20×15 网格编码（`LookupVGGTGridGlobalId/InsertVGGTGridMapping`）。`CreateNewKeyFrameVGGT` 重置消费状态、继承上一 KF 的全局 ID 与可见性，保证滑窗外仍能复用同一 MapPoint，减少重复建图。
 - **位姿种子链路与增量积累**：优先使用滑窗重叠帧相对姿态作为种子；否则累计 `mVGGTDeltaT` 左乘到上一 KF 世界位姿得到当前播种。`mAccumulatedVGGTMotion` 连续保存关键帧间运动，长期抑制漂移；无先验再退回速度模型。
 - **关键帧判定与继承**：`NeedNewKeyFrameVGGT` 以可见度和帧间隔双阈值（可见度<0.3 或间隔≥7 强触发；可见度<0.7 或间隔≥2 且 LocalMapping 空闲时软触发）。插帧前 `FuseVGGTKeyframeDenseCache` 体素融合当前稠密；插帧时继承上一 KF 的稠密点引用与全局 Track ID，并合并上一 KF 的稠密点云，保证后端 Phase1/Phase2 有可用先验。
@@ -36,21 +82,21 @@ VGGT 模型的滑窗推理帧数有限，场景放大时无法一次性建模；
 - **Phase1 位姿优化（稀疏先验）**：`CollectVGGTPhase1Priors` 仅收集非新增（`isNew==0`）的 MapPoint 作为 reused 先验；构建三维残差 `EdgeVGGTDistance`，Huber 阈值 $\sqrt{7.815}$，仅优化相机位姿：
 	$\displaystyle \min_{R,t}\sum_i \rho\big(\|R P_i^{w}+t - p_i^{c}\|_2^2\big)$。
 无 reused 先验则直接跳过。`ApplyVGGTPhase1Result` 将新先验写回世界坐标并更新 KF 姿态。
-- **Phase2 彩色 ICP（稠密对齐）**：`CollectVGGTPhase2Priors` 先用缓存的相机系稠密样本（stride=6，含 RGB+xyz）作为观测，再补齐超出的稠密引用点并用当前姿态投到相机系；继承上一 KF 的稠密 refs 确保有目标。目标点从 VGGT MapPoint 中按 1m 内均匀、1/r³ 加权采样，源观测子采样并受 `phase2_max_edges` 限制（最多 4×目标）。`RunVGGTPhase2` 调用 Open3D Colored ICP（阈值受 `phase2_radius`、`phase2_voxel_size`）最小化
+- **Phase2 彩色 ICP（稠密对齐）**：`CollectVGGTPhase2Priors` 先用缓存的相机系稠密样本（stride=6，含 RGB+xyz）作为观测，再补齐超出的稠密引用点并用当前姿态投到相机系；继承上一 KF 的稠密 refs 确保有目标。目标点从 VGGT MapPoint 中按 **1m 内均匀、1/r³ 加权** 采样，源观测子采样并受 `phase2_max_edges` 限制（最多 4×目标）。`RunVGGTPhase2` 调用 Open3D Colored ICP（阈值受 `phase2_radius`、`phase2_voxel_size`）最小化
 	$\displaystyle E(T)=\sum_j w_g\|p_j - T q_j\|_2^2 + w_c\,\|I(p_j)-I(q_j)\|_2^2$，
 输出姿态用于 `ApplyVGGTPhaseResult` 更新 KF 位姿、融合稠密观测+先验、并扩充或更新 VGGT MapPoint。
 
 ---
 
-## 问题与解决
+### 问题与解决
 - **滑窗外对齐易失效**：用双阈值插帧（可见度<0.3 或间隔≥7 强触发；可见度<0.7 或间隔≥2 且 LocalMapping 空闲才触发）保证上一 KF 落在滑窗内；`CreateNewKeyFrameVGGT` 继承上一 KF 的稠密 refs 与全局 Track ID，并通过网格 cell→ID 映射维持跨窗可复用的 MapPoint，防止对齐信息在滑窗外丢失。
 - **稀疏先验不足导致 Phase1 跳过**：`CollectVGGTPhase1Priors` 仅收集 `isNew==0` 的 MapPoint 作为 reused 先验；当全是新增点时 Phase1 自动跳过以抑制噪声。通过全局 Track ID 继承与网格复用，提升“可复用”占比，减少 Phase1 被跳过的几率。
 - **稠密 ICP 缺样/过载**：继承上一 KF 的稠密 refs，先用缓存的相机系稠密样本作为观测，再补齐引用点投到相机系；目标点按 1m 内、1/r³ 加权采样并受 `phase2_max_edges` 上限（源观测 ≤4×目标）约束，既避免无对应又控制 ICP 计算量。
 - **算力与实时性冲突**：`RunVGGTLBALocal` 若无 Phase1/2 先验直接返回；Phase1 仅在有 reused 先验时运行，Phase2 可通过 `SetVGGTPhase2Enabled` 全局关闭。计时日志只在执行时输出，前端重计算与后端轻优化解耦，降低常态算力占用。
 
-# 面向 7-Scenes 数据集的 vSLAM 评估流水线
+## 面向 7-Scenes 数据集的 vSLAM 评估流水线
 
-## 评估系统架构概览
+### 评估系统架构概览
 
 `vslam_evals` 模块提供基于 ROS2 的评估框架，用于将视觉 SLAM 结果与真实轨迹对比评估，并为 TUM、7-Scenes 等已知数据集提供专门支持。系统由通过 launch 配置编排的模块化节点组成：
 
@@ -62,7 +108,7 @@ VGGT 模型的滑窗推理帧数有限，场景放大时无法一次性建模；
 
 上述组件一同启动。例如 `eval_7scenes_office.launch.py` 在一个 `LaunchDescription` 中包含数据集播放器、vSLAM 系统和评估节点，确保它们正确启动和通信。该架构将数据回放、SLAM 计算与评估清晰解耦，有利于基准测试与可重复性。
 
-## 评估流程
+### 评估流程
 
 端到端的 7-Scenes 序列评估通过 ROS2 主题与回调协同完成，流程可概括为以下几个阶段：
 
@@ -92,3 +138,22 @@ office/seq-01,run_001,1.0,500,0.142,0.120,0.106,0.045,0.203,0.057
 ```
 
 序列名来自参数或从真实轨迹路径推断，`run_id` 是用户设定的运行标识（默认为 `"run_001"`）。日志文件位置由评估节点确定：优先写入包的 `logs` 目录（如 `<vslam_evals_package>/logs/evals_7scenes.csv`），若失败（例如非安装环境运行），则退回当前工作目录下的 `logs` 文件夹。这样可以确保所有评估运行都被记录，便于后续分析。写入结果后，评估节点记录完成信息并关闭 ROS 节点（内部调用 `rclpy.shutdown()`）。
+
+## 许可证与引用
+- ORB-SLAM3 遵循 GPLv3（以仓库内对应许可为准）。
+- VGGT 权重/许可存在“商业可用版本”与“非商业版本”的差异（以 `vggt/LICENSE.txt` 与所用权重说明为准）。
+t
+```bibtex
+@article{ORBSLAM3_TRO,
+	title={{ORB-SLAM3}: An Accurate Open-Source Library for Visual, Visual-Inertial and Multi-Map {SLAM}},
+	author={Campos, Carlos AND Elvira, Richard AND Gómez, Juan J. AND Montiel, José M. M. AND Tardós, Juan D.},
+	journal={IEEE Transactions on Robotics},
+	volume={37}, number={6}, pages={1874-1890}, year={2021}
+}
+
+@inproceedings{wang2025vggt,
+	title={VGGT: Visual Geometry Grounded Transformer},
+	author={Wang, Jianyuan and Chen, Minghao and Karaev, Nikita and Vedaldi, Andrea and Rupprecht, Christian and Novotny, David},
+	booktitle={CVPR}, year={2025}
+}
+```

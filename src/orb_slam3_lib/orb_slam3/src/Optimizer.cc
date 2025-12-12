@@ -735,7 +735,10 @@ Sophus::SE3f RunVGGTPhase2(KeyFrame* pKF,
               << " source_ms=" << ms_source
               << " normals_ms=" << ms_normals
               << " icp_ms=" << ms_icp
-              << std::endl;
+              << std::endl; 
+    if (rot_delta_deg >= 20.0f){
+        return initialPose; 
+    }
 
     return Tcw_opt;
 }

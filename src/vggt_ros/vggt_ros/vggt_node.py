@@ -45,6 +45,7 @@ class VGGTNode(Node):
         self.declare_parameter('scale_min_overlap_ratio', 0.8)
         self.declare_parameter('scale_jump_lower', 0.5)
         self.declare_parameter('scale_jump_upper', 2.0)
+        self.declare_parameter('max_keyframe_gap', 10)
         
         self.model_name = self.get_parameter('model_name').get_parameter_value().string_value
         self.device = self.get_parameter('device').get_parameter_value().string_value
@@ -56,6 +57,7 @@ class VGGTNode(Node):
         self.scale_min_overlap_ratio = self.get_parameter('scale_min_overlap_ratio').get_parameter_value().double_value
         self.scale_jump_lower = self.get_parameter('scale_jump_lower').get_parameter_value().double_value
         self.scale_jump_upper = self.get_parameter('scale_jump_upper').get_parameter_value().double_value
+        self.max_keyframe_gap = int(self.get_parameter('max_keyframe_gap').get_parameter_value().integer_value)
         
         if self.device == 'cuda' and not torch.cuda.is_available():
             self.get_logger().warn('CUDA not available, using CPU')
@@ -64,7 +66,11 @@ class VGGTNode(Node):
         self.bridge = CvBridge()
         
         # Keyframe Selector
-        self.keyframe_selector = KeyframeSelector(window_size=self.window_size, min_parallax=self.min_parallax)
+        self.keyframe_selector = KeyframeSelector(
+            window_size=self.window_size,
+            min_parallax=self.min_parallax,
+            max_gap=self.max_keyframe_gap
+        )
         
         # Track keyframe IDs that have been inferred
         self.keyframe_id_counter = 0
@@ -78,6 +84,11 @@ class VGGTNode(Node):
         self.last_scale_traj_ratio = 1.0
         self.last_scale_depth_ratio = 1.0
         self.last_scale_overlap = 0
+        # 光度归一参数
+        self.prev_luma_mean = None
+        self.prev_luma_std = None
+        self.photometric_momentum = 0.9
+        self.photometric_eps = 1e-4
         
         # Publishers
         # Use absolute topic to avoid namespace confusion when launched in containers
@@ -239,6 +250,12 @@ class VGGTNode(Node):
                 img_tensor, transform = self.preprocess_image(img)
                 processed_images.append(img_tensor)
                 transforms.append(transform)
+
+            # 光度归一：对当前窗口图片做亮度均衡，使其均值/方差与上一窗口对齐
+            processed_images = [
+                self.photometric_normalize(img_tensor) for img_tensor in processed_images
+            ]
+
             preprocessed_images_np = [
                 self.tensor_to_uint8_image(img_tensor)
                 for img_tensor in processed_images
@@ -393,6 +410,9 @@ class VGGTNode(Node):
             self.last_scale_traj_ratio = scale_result["traj_ratio"]
             self.last_scale_depth_ratio = scale_result["depth_ratio"]
             self.last_scale_overlap = scale_result["overlap_count"]
+
+            # 更新光度参考：使用当前窗口的平均亮度统计
+            self.update_photometric_reference(processed_images)
 
             self.publish_results(
                 points_np,
@@ -782,6 +802,56 @@ class VGGTNode(Node):
         arr = np.clip(arr, 0.0, 1.0)
         arr = np.transpose(arr, (1, 2, 0))
         return (arr * 255.0).astype(np.uint8)
+
+    def photometric_normalize(self, img_tensor):
+        """匹配上一窗口的亮度均值/方差，减少曝光变化影响。"""
+        if not torch.is_tensor(img_tensor):
+            return img_tensor
+
+        # 计算当前图像亮度统计（灰度加权）
+        luma = 0.299 * img_tensor[0] + 0.587 * img_tensor[1] + 0.114 * img_tensor[2]
+        cur_mean = float(luma.mean())
+        cur_std = float(luma.std())
+
+        # 无历史则直接返回
+        if self.prev_luma_mean is None or self.prev_luma_std is None:
+            return img_tensor
+
+        # 计算增益与偏置（仅使用增益，防止偏置引入色偏）
+        gain = self.prev_luma_std / max(cur_std, self.photometric_eps)
+        bias = self.prev_luma_mean - cur_mean * gain
+
+        # 应用到 RGB 通道并裁剪到 [0,1]
+        img_tensor = img_tensor * gain + bias
+        img_tensor = torch.clamp(img_tensor, 0.0, 1.0)
+        return img_tensor
+
+    def update_photometric_reference(self, processed_images):
+        """使用当前窗口的亮度均值/方差更新历史参考，动量平滑。"""
+        if not processed_images:
+            return
+
+        lumas = []
+        for img in processed_images:
+            if not torch.is_tensor(img):
+                continue
+            luma = 0.299 * img[0] + 0.587 * img[1] + 0.114 * img[2]
+            lumas.append(luma)
+
+        if not lumas:
+            return
+
+        luma_cat = torch.stack(lumas)
+        mean = float(luma_cat.mean())
+        std = float(luma_cat.std())
+
+        if self.prev_luma_mean is None:
+            self.prev_luma_mean = mean
+            self.prev_luma_std = max(std, self.photometric_eps)
+        else:
+            mom = self.photometric_momentum
+            self.prev_luma_mean = mom * self.prev_luma_mean + (1 - mom) * mean
+            self.prev_luma_std = mom * self.prev_luma_std + (1 - mom) * max(std, self.photometric_eps)
 
     def build_window_point_cloud(self, world_points, depth_tensor, preprocessed_images, extrinsic_last):
         """Flatten (S,H,W,3) world coordinates into (N,6) [rgbxyz], then express positions in the latest frame's camera.
