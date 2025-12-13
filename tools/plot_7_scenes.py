@@ -17,22 +17,37 @@ SCENES = ["chess", "fire", "heads", "office", "pumpkin", "kitchen", "stairs"]
 DATA: List[Dict] = [
     {
         "group": "Uncalib.",
-        "method": "DROID-SLAM* [65]",
+        "method": "DROID-SLAM* [5]",
         "values": [0.047, 0.038, 0.034, 0.136, 0.166, 0.080, 0.044, 0.078],
     },
     {
         "group": "Uncalib.",
-        "method": "MAS3R-SLAM* [44]",
+        "method": "MAS3R-SLAM* [4]",
         "values": [0.063, 0.046, 0.029, 0.103, 0.114, 0.074, 0.032, 0.066],
     },
     {
         "group": "Uncalib.",
-        "method": "MIT (SL(4), w = 8)",
+        "method": "ORB-SLAM3* [1]",
+        # 从 vslam/src/vslam_evals/logs/summary_ape_7scenes.csv 计算得到的场景均值 + 平均
+        "values": [
+            0.07653927514960998,
+            0.05480031536362068,
+            0.043645735049858934,
+            0.1602452911899668,
+            0.15407334234493694,
+            0.13888709295891308,  # redkitchen 映射到 kitchen
+            0.12017775218616497,
+            0.10690982917758163,
+        ],
+    },
+    {
+        "group": "Uncalib.",
+        "method": "MIT (SL(4), w = 8)* [3]",
         "values": [0.041, 0.060, 0.043, 0.106, 0.206, 0.054, 0.078, 0.084],
     },
     {
         "group": "Uncalib.",
-        "method": "MIT (SL(4), w = 32)",
+        "method": "MIT (SL(4), w = 32)* [3]",
         "values": [0.036, 0.028, 0.018, 0.103, 0.133, 0.058, 0.093, 0.067],
     },
     {
@@ -135,7 +150,7 @@ def draw_table(outfile: str = "7scenes_ate.png") -> None:
         cellText=cell_text,
         loc="center",
         cellLoc="center",
-        colWidths=[0.1, 0.16] + [0.09] * len(SCENES) + [0.09],  # 扩大分组列，避免文字被截断
+        colWidths=[0.1, 0.2] + [0.09] * len(SCENES) + [0.09],  # 稍微加宽 Method 列
     )
 
     table.auto_set_font_size(False)
