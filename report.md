@@ -15,7 +15,11 @@ VGGT 的滑窗推理帧数有限：场景放大后无法一次性覆盖全局；
 ## 项目总览
 
 <a id="overview"></a>
-本仓库将 **ORB-SLAM3** 后端与 **VGGT（Visual Geometry Grounded Transformer）** 前端融合，在 ROS2（Humble）下提供可扩展的 VSLAM 原型：VGGT 提供快速几何先验（内外参/深度/点/跟踪/位姿窗口），ORB-SLAM3 负责关键帧管理、（可选）回环与地图维护，并在本地优化阶段引入“稀疏先验 + 稠密 ICP”的两阶段精修。
+本项目仓库见 [Zijun-Mo/vslam][repo]，将 **[ORB-SLAM3][orb]** 后端与 **[VGGT（Visual Geometry Grounded Transformer）][vggt]** 前端融合，在 **ROS2（Humble）** 下提供可扩展的 VSLAM 原型：VGGT 提供快速几何先验（内外参/深度/点/跟踪/位姿窗口），ORB-SLAM3 负责关键帧管理、（可选）回环与地图维护，并在本地优化阶段引入“稀疏先验 + 稠密 ICP”的两阶段精修。
+
+[repo]: https://github.com/Zijun-Mo/vslam
+[orb]: https://github.com/UZ-SLAMLab/ORB_SLAM3
+[vggt]: https://github.com/facebookresearch/vggt
 
 > “三类先验”的定义见 [引入](#intro)；两阶段精修（Phase1/Phase2）的具体做法见 [架构解析/主要算法](#arch-algo)。
 
@@ -48,8 +52,8 @@ src/
 	vslam_bringup/           # 系统级 launch / 参数汇总
 	vslam_msgs/              # 自定义消息类型 (KeyFramePtr 等)
 	vslam_evals/             # 在线评估节点与 launch（TUM/7-Scenes，ATE 统计与日志）
-tools/                     # 数据与评估工具脚本
-vggt/                      # 原始 VGGT Python 包及训练/示例脚本
+tools/                       # 数据与评估工具脚本
+vggt/                        # 原始 VGGT Python 包及训练/示例脚本
 ```
 
 ### 参数调优
