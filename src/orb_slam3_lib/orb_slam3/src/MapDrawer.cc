@@ -409,47 +409,22 @@ void MapDrawer::DrawKeyFrames(const bool bDrawKF, const bool bDrawGraph, const b
 
     if(bDrawGraph)
     {
-        glLineWidth(mGraphLineWidth);
+        glLineWidth(mGraphLineWidth * 3.0f);
         glColor4f(0.0f,1.0f,0.0f,0.6f);
         glBegin(GL_LINES);
-
-        // cout << "-----------------Draw graph-----------------" << endl;
-        for(size_t i=0; i<vpKFs.size(); i++)
+        // 仅连接相邻帧（按 mnId 排序）
+        std::vector<KeyFrame*> sortedKFs = vpKFs;
+        std::sort(sortedKFs.begin(), sortedKFs.end(), [](KeyFrame* a, KeyFrame* b){ return a->mnId < b->mnId; });
+        for(size_t i=1; i<sortedKFs.size(); ++i)
         {
-            // Covisibility Graph
-            const vector<KeyFrame*> vCovKFs = vpKFs[i]->GetCovisiblesByWeight(100);
-            Eigen::Vector3f Ow = vpKFs[i]->GetCameraCenter();
-            if(!vCovKFs.empty())
-            {
-                for(vector<KeyFrame*>::const_iterator vit=vCovKFs.begin(), vend=vCovKFs.end(); vit!=vend; vit++)
-                {
-                    if((*vit)->mnId<vpKFs[i]->mnId)
-                        continue;
-                    Eigen::Vector3f Ow2 = (*vit)->GetCameraCenter();
-                    glVertex3f(Ow(0),Ow(1),Ow(2));
-                    glVertex3f(Ow2(0),Ow2(1),Ow2(2));
-                }
-            }
-
-            // Spanning tree
-            KeyFrame* pParent = vpKFs[i]->GetParent();
-            if(pParent)
-            {
-                Eigen::Vector3f Owp = pParent->GetCameraCenter();
-                glVertex3f(Ow(0),Ow(1),Ow(2));
-                glVertex3f(Owp(0),Owp(1),Owp(2));
-            }
-
-            // Loops
-            set<KeyFrame*> sLoopKFs = vpKFs[i]->GetLoopEdges();
-            for(set<KeyFrame*>::iterator sit=sLoopKFs.begin(), send=sLoopKFs.end(); sit!=send; sit++)
-            {
-                if((*sit)->mnId<vpKFs[i]->mnId)
-                    continue;
-                Eigen::Vector3f Owl = (*sit)->GetCameraCenter();
-                glVertex3f(Ow(0),Ow(1),Ow(2));
-                glVertex3f(Owl(0),Owl(1),Owl(2));
-            }
+            KeyFrame* prev = sortedKFs[i-1];
+            KeyFrame* curr = sortedKFs[i];
+            if(!prev || !curr)
+                continue;
+            Eigen::Vector3f Ow_prev = prev->GetCameraCenter();
+            Eigen::Vector3f Ow_curr = curr->GetCameraCenter();
+            glVertex3f(Ow_prev(0), Ow_prev(1), Ow_prev(2));
+            glVertex3f(Ow_curr(0), Ow_curr(1), Ow_curr(2));
         }
 
         glEnd();

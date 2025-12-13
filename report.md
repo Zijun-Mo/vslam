@@ -19,6 +19,16 @@ VGGT 的滑窗推理帧数有限：场景放大后无法一次性覆盖全局；
 
 > “三类先验”的定义见 [引入](#intro)；两阶段精修（Phase1/Phase2）的具体做法见 [架构解析/主要算法](#arch-algo)。
 
+### 运行效果示意
+
+**轨迹示意图**
+
+![Trajectory](figures/traj.png)
+
+**地图示意图**
+
+![Map](figures/map.png)
+
 ### 核心特性
 - **VGGT 前端**：滑窗推理并发布几何先验（见 [引入](#intro)），为 Tracking/Mapping 提供强约束。
 - **ORB-SLAM3 后端**：成熟的关键帧、地图与优化框架，承担持续建图与位姿输出。
