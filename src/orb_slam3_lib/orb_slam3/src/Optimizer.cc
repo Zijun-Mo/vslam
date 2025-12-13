@@ -716,6 +716,71 @@ Sophus::SE3f RunVGGTPhase2(KeyFrame* pKF,
     Eigen::Matrix4d Twc_icp = result.transformation_;
     Eigen::Matrix3d R = Twc_icp.block<3,3>(0,0);
     Eigen::Vector3d t = Twc_icp.block<3,1>(0,3);
+    double sim3_scale = 1.0;
+
+    // 使用对应点对通过 Umeyama 求 Sim3，随后仅输出去尺度的 SE3，将尺度直接作用到观测
+    const auto& corr = result.correspondence_set_;
+    if(!corr.empty() && source && target && source->points_.size() > 0 && target->points_.size() > 0)
+    {
+        const size_t N = corr.size();
+        if(N >= 4)
+        {
+            Eigen::MatrixXd src(3, N);
+            Eigen::MatrixXd dst(3, N);
+            size_t valid = 0;
+            for(size_t k = 0; k < N; ++k)
+            {
+                const int si = corr[k][0];
+                const int ti = corr[k][1];
+                if(si < 0 || ti < 0 || static_cast<size_t>(si) >= source->points_.size() || static_cast<size_t>(ti) >= target->points_.size())
+                    continue;
+                const Eigen::Vector3d& ps = source->points_[si];
+                const Eigen::Vector3d& pt = target->points_[ti];
+                if(!ps.allFinite() || !pt.allFinite())
+                    continue;
+                src.col(valid) = ps;
+                dst.col(valid) = pt;
+                ++valid;
+            }
+
+            if(valid >= 4)
+            {
+                src.conservativeResize(Eigen::NoChange, static_cast<int>(valid));
+                dst.conservativeResize(Eigen::NoChange, static_cast<int>(valid));
+
+                Eigen::Matrix4d T_um = Eigen::umeyama(src, dst, true); // src -> dst with scale
+                double s = T_um.block<3,3>(0,0).col(0).norm();
+                if(std::isfinite(s) && s > 1e-6)
+                {
+                    Eigen::Matrix3d R_raw = T_um.block<3,3>(0,0) / s;
+                    // 重新正交化确保纯旋转
+                    Eigen::JacobiSVD<Eigen::Matrix3d> svd(R_raw, Eigen::ComputeFullU | Eigen::ComputeFullV);
+                    Eigen::Matrix3d R_ortho = svd.matrixU() * svd.matrixV().transpose();
+                    if(R_ortho.determinant() < 0)
+                    {
+                        R_ortho = -R_ortho;
+                        s = -s;
+                    }
+
+                    // 用 Umeyama 的结果替换 ICP 旋转和平移；尺度单独应用到观测
+                    R = R_ortho;
+                    t = T_um.block<3,1>(0,3);
+                    sim3_scale = s;
+                }
+            }
+        }
+    }
+
+    // 将尺度直接作用到采样观测（相机系点），下游仅消费去尺度 SE3
+    if(std::isfinite(sim3_scale) && std::abs(sim3_scale - 1.0) > 1e-6)
+    {
+        auto& obs_mut = const_cast<std::vector<VGGTPhase2Samples::Observation>&>(samples.observations);
+        for(auto& ob : obs_mut)
+        {
+            ob.first *= sim3_scale;
+        }
+    }
+
     Sophus::SE3f Twc_icp_f(R.cast<float>(), t.cast<float>());
     const Sophus::SE3f Tcw_opt = Twc_icp_f.inverse();
 
