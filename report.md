@@ -436,7 +436,8 @@ launch 将播放 `office/seq-02` 图像、运行 SLAM、自动评估轨迹误差
 ## 许可证与引用
 - ORB-SLAM3 遵循 GPLv3（以仓库内对应许可为准）。
 - VGGT 权重/许可存在“商业可用版本”与“非商业版本”的差异（以 `vggt/LICENSE.txt` 与所用权重说明为准）。
-t
+- VGGT-SLAM（MIT-SPARK）代码仓库采用 BSD-2-Clause License（以其仓库 `LICENSE` / GitHub License 标识为准）。
+- VGGT-SLAM 安装脚本会自动下载 VGGT 等第三方包；其中 **VGGT 本身使用独立的 VGGT License v1（含 Acceptable Use Policy）**，应以 `facebookresearch/vggt` 仓库的 `LICENSE.txt` 为准。
 ```bibtex
 @article{ORBSLAM3_TRO,
 	title={{ORB-SLAM3}: An Accurate Open-Source Library for Visual, Visual-Inertial and Multi-Map {SLAM}},
@@ -449,5 +450,12 @@ t
 	title={VGGT: Visual Geometry Grounded Transformer},
 	author={Wang, Jianyuan and Chen, Minghao and Karaev, Nikita and Vedaldi, Andrea and Rupprecht, Christian and Novotny, David},
 	booktitle={CVPR}, year={2025}
+}
+@article{maggio2025vggt-slam,
+  title={VGGT-SLAM: Dense RGB SLAM Optimized on the SL (4) Manifold},
+  author={Maggio, Dominic and Lim, Hyungtae and Carlone, Luca},
+  journal={Advances in Neural Information Processing Systems},
+  volume={39},
+  year={2025}
 }
 ```
