@@ -341,24 +341,7 @@ office/seq-01,run_001,1.0,500,0.142,0.120,0.106,0.045,0.203,0.057
 
 序列名来自参数或从真实轨迹路径推断，`run_id` 是用户设定的运行标识（默认为 `"run_001"`）。日志文件位置由评估节点确定：优先写入包的 `logs` 目录（如 `<vslam_evals_package>/logs/evals_7scenes.csv`），若失败（例如非安装环境运行），则退回当前工作目录下的 `logs` 文件夹。这样可以确保所有评估运行都被记录，便于后续分析。写入结果后，评估节点记录完成信息并关闭 ROS 节点（内部调用 `rclpy.shutdown()`）。
 
-## 许可证与引用
-- ORB-SLAM3 遵循 GPLv3（以仓库内对应许可为准）。
-- VGGT 权重/许可存在“商业可用版本”与“非商业版本”的差异（以 `vggt/LICENSE.txt` 与所用权重说明为准）。
-t
-```bibtex
-@article{ORBSLAM3_TRO,
-	title={{ORB-SLAM3}: An Accurate Open-Source Library for Visual, Visual-Inertial and Multi-Map {SLAM}},
-	author={Campos, Carlos AND Elvira, Richard AND Gómez, Juan J. AND Montiel, José M. M. AND Tardós, Juan D.},
-	journal={IEEE Transactions on Robotics},
-	volume={37}, number={6}, pages={1874-1890}, year={2021}
-}
 
-@inproceedings{wang2025vggt,
-	title={VGGT: Visual Geometry Grounded Transformer},
-	author={Wang, Jianyuan and Chen, Minghao and Karaev, Nikita and Vedaldi, Andrea and Rupprecht, Christian and Novotny, David},
-	booktitle={CVPR}, year={2025}
-}
-```
 ## 评估指标
 
 主要计算的指标是**绝对轨迹误差（ATE）**的平移部分。所有指标均来源于逐帧 ATE 的分布：
@@ -412,3 +395,21 @@ launch 将播放 `office/seq-02` 图像、运行 SLAM、自动评估轨迹误差
 
 整体集成实现无缝自动评估：启动后等待 SLAM 就绪，播放数据集，自动计算误差并停止。该设计最小化人工干预并确保各次运行时序一致，对公平基准尤为重要。节点解耦也使评估逻辑（如 ATE 计算方式）独立于 SLAM 算法，只要按约定主题发布位姿即可评估不同实现。
 
+## 许可证与引用
+- ORB-SLAM3 遵循 GPLv3（以仓库内对应许可为准）。
+- VGGT 权重/许可存在“商业可用版本”与“非商业版本”的差异（以 `vggt/LICENSE.txt` 与所用权重说明为准）。
+t
+```bibtex
+@article{ORBSLAM3_TRO,
+	title={{ORB-SLAM3}: An Accurate Open-Source Library for Visual, Visual-Inertial and Multi-Map {SLAM}},
+	author={Campos, Carlos AND Elvira, Richard AND Gómez, Juan J. AND Montiel, José M. M. AND Tardós, Juan D.},
+	journal={IEEE Transactions on Robotics},
+	volume={37}, number={6}, pages={1874-1890}, year={2021}
+}
+
+@inproceedings{wang2025vggt,
+	title={VGGT: Visual Geometry Grounded Transformer},
+	author={Wang, Jianyuan and Chen, Minghao and Karaev, Nikita and Vedaldi, Andrea and Rupprecht, Christian and Novotny, David},
+	booktitle={CVPR}, year={2025}
+}
+```
